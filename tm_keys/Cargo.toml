@@ -1,0 +1,11 @@
+[package]
+name = "tm_keys"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+x25519-dalek = { workspace = true, features = ["getrandom", "static_secrets"] }
+rand      = { version = "0.8", features = ["getrandom"] }
+rand_core = "0.6"
+heapless  = { workspace = true }
+serde     = { workspace = true }

@@ -1,0 +1,14 @@
+[package]
+name = "tm_runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tm_control.workspace = true
+tm_derp.workspace    = true
+tm_disco.workspace   = true
+tm_wg.workspace      = true
+tm_keys.workspace    = true
+heapless  = { workspace = true }
+tokio     = { workspace = true, features = ["sync", "rt", "macros"] }
+tracing   = { workspace = true }

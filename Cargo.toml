@@ -1,0 +1,106 @@
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "tm_control",
+    "tm_derp",
+    "tm_h2",
+    "tm_keys",
+    "tm_disco",
+    "tm_wg",
+    "tm_runtime",
+    "tm_netstack",
+]
+
+[workspace.package]
+edition = "2021"
+license = "BSD-3-Clause"
+version = "0.1.0"
+repository = "https://github.com/your-org/tailmicro-rs"
+
+# ── Shared dependency versions ────────────────────────────────────────────────
+[workspace.dependencies]
+# Async — ALWAYS current_thread on embedded, multi_thread on host
+tokio = { version = "1", default-features = false }
+
+# Crypto — same primitives as tailscale-rs, no_std friendly
+x25519-dalek  = { version = "2", default-features = false, features = ["static_secrets"] }
+chacha20poly1305 = { version = "0.10", default-features = false }
+blake2   = { version = "0.10", default-features = false }
+hkdf     = { version = "0.12", default-features = false }
+sha2     = { version = "0.10", default-features = false }
+rand     = { version = "0.8", default-features = false }
+# Noise IK (control plane)
+snow = { version = "0.9", default-features = false, features = ["default-resolver"] }
+
+# Serialization — minimal; serde_json in streaming mode
+serde      = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+# Fixed-capacity collections — no heap surprises
+arrayvec  = { version = "0.7", default-features = false }
+heapless  = { version = "0.8", default-features = false }
+
+# Minimal HTTP parsing (no full http crate needed)
+httparse = { version = "1", default-features = false }
+
+# Error handling
+thiserror = { version = "1", default-features = false }
+
+# Tracing — same interface as tailscale-rs
+tracing = { version = "0.1", default-features = false }
+
+# Local crates
+tailmicro    = { path = "." }
+tm_control   = { path = "tm_control" }
+tm_derp      = { path = "tm_derp" }
+tm_h2        = { path = "tm_h2" }
+tm_keys      = { path = "tm_keys" }
+tm_disco     = { path = "tm_disco" }
+tm_wg        = { path = "tm_wg" }
+tm_runtime   = { path = "tm_runtime" }
+tm_netstack  = { path = "tm_netstack" }
+
+# ── Root crate (mirrors tailscale crate in tailscale-rs) ──────────────────────
+[package]
+name = "tailmicro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tailscale client optimised for ESP32-C3 (400KB SRAM, no PSRAM)"
+
+[dependencies]
+tm_runtime.workspace   = true
+tm_keys.workspace      = true
+tm_netstack.workspace  = true
+thiserror.workspace    = true
+tokio   = { workspace = true, features = ["sync", "rt"] }
+tracing.workspace      = true
+serde.workspace        = true
+serde_json.workspace   = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time", "net"] }
+tracing-subscriber = "0.3"
+
+[[example]]
+name = "peer_ping"
+
+[[example]]
+name = "tcp_echo"
+
+[[example]]
+name = "udp_echo"
+
+# ── Build profiles ────────────────────────────────────────────────────────────
+[profile.release]
+opt-level = "s"   # size over speed
+lto       = true
+strip     = true
+codegen-units = 1
+
+# ESP-IDF specific — use in .cargo/config.toml target override
+[profile.esp]
+inherits   = "release"
+opt-level  = "z"
+panic      = "abort"

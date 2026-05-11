@@ -1,0 +1,22 @@
+[package]
+name = "tm_control"
+version.workspace = true
+edition.workspace = true
+description = "Tailscale control plane: Noise IK, ts2021, streaming MapResponse"
+
+[dependencies]
+tm_h2.workspace   = true
+tm_keys.workspace = true
+arrayvec  = { workspace = true }
+heapless  = { workspace = true }
+httparse  = { workspace = true }
+serde     = { workspace = true }
+serde_json = { workspace = true }
+snow      = { workspace = true }
+tokio     = { workspace = true, features = ["sync", "io-util"] }
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+
+[features]
+# Enable blanket IoStream impl for tokio types (host testing / non-embedded)
+tokio-io = []

@@ -1,0 +1,12 @@
+[package]
+name = "tm_wg"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tm_keys.workspace    = true
+tm_control.workspace = true
+arrayvec  = { workspace = true }
+heapless  = { workspace = true }
+tokio     = { workspace = true, features = ["sync"] }
+tracing   = { workspace = true }

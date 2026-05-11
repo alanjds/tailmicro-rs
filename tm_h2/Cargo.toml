@@ -1,0 +1,8 @@
+[package]
+name = "tm_h2"
+version.workspace = true
+edition.workspace = true
+description = "Minimal HTTP/2 frame parser for a single long-lived stream (MapResponse)"
+
+[dependencies]
+# No heap-allocating dependencies — this crate is intentionally self-contained
