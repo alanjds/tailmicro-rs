@@ -58,6 +58,7 @@
 //! ```
 
 pub mod error;
+pub mod io;
 
 #[cfg(feature = "mbedtls")]
 mod backend_mbedtls;
@@ -162,19 +163,11 @@ impl TlsStream {
 }
 
 // Make TlsStream usable as an IoStream (for tm_control / tm_derp)
-impl crate::IoStream for TlsStream {
+impl crate::io::IoStream for TlsStream {
     async fn read_exact<'a>(&'a mut self, buf: &'a mut [u8]) -> Result<(), ()> {
         self.read_exact(buf).await.map_err(|_| ())
     }
     async fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Result<(), ()> {
         self.write_all(buf).await.map_err(|_| ())
     }
-}
-
-/// IoStream trait — defined here so tm_tls doesn't depend on tm_control.
-pub trait IoStream: Send {
-    fn read_exact<'a>(&'a mut self, buf: &'a mut [u8])
-        -> impl core::future::Future<Output = Result<(), ()>> + 'a;
-    fn write_all<'a>(&'a mut self, buf: &'a [u8])
-        -> impl core::future::Future<Output = Result<(), ()>> + 'a;
 }

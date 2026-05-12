@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 tm_keys.workspace = true
 heapless  = { workspace = true }
+arrayvec  = { workspace = true }
 tokio     = { workspace = true, features = ["sync"] }
 tracing   = { workspace = true }
 thiserror = { workspace = true }

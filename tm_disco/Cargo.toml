@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 tm_keys.workspace   = true
-chacha20poly1305    = { version = "0.10", features = ["xchacha20"] }
+chacha20poly1305    = "0.11.0-rc.3"
 x25519-dalek        = { version = "2", default-features = false }
 heapless            = { workspace = true }
 arrayvec            = { workspace = true }

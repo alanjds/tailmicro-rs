@@ -90,6 +90,8 @@ impl Runtime {
         // On ESP32-C3 this is just another cooperatively-scheduled future —
         // no extra OS stack.
 
+        let ctrl_tx3 = ctrl_tx.clone();
+        let ctrl_tx4 = ctrl_tx.clone();
         let derp_tx2  = derp_tx.clone();
         let wg_tx2    = wg_tx.clone();
         let disco_tx2 = disco_tx.clone();
@@ -108,7 +110,7 @@ impl Runtime {
                                 tracing::info!("Tailnet IP: {:?}", ip.0);
                             }
                             ControlEvent::KeyExpiry => {
-                                let _ = ctrl_tx.clone(); // trigger reauth
+                                let _ = ctrl_tx3.send(ControlCmd::Reauth).await; // trigger reauth
                             }
                             ControlEvent::Error(e) => {
                                 tracing::error!("Control error: {:?}", e);
@@ -149,12 +151,8 @@ impl Runtime {
             }
         });
 
-        // Start the control actor
-        let _ = derp_tx.send(DerpCmd::Connect {
-            host: heapless::String::try_from("login.tailscale.com").unwrap(),
-            port: 443,
-            cert_fingerprint: None,
-        }).await;
+        // Start the control actor by sending a Start command (via clone)
+        let _ = ctrl_tx4.send(ControlCmd::Start { auth_key: config.auth_key.clone() }).await;
 
         Runtime { control_tx: ctrl_tx, derp_tx, disco_tx, wg_tx }
     }

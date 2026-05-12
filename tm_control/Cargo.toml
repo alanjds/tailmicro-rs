@@ -7,6 +7,7 @@ description = "Tailscale control plane: Noise IK, ts2021, streaming MapResponse"
 [dependencies]
 tm_h2.workspace   = true
 tm_keys.workspace = true
+tm_tls.workspace  = true
 arrayvec  = { workspace = true }
 heapless  = { workspace = true }
 httparse  = { workspace = true }

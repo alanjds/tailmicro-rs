@@ -12,6 +12,7 @@ use tm_h2::{
 use tm_keys::NodeState;
 use map_parser::MapParser;
 use noise::{NoiseChannel, do_noise_handshake, fetch_server_key};
+use tm_tls::io::IoStream;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -117,24 +118,7 @@ struct MapRequest<'a> {
     node_key: &'a str, endpoints: &'a [&'a str], stream: bool,
 }
 
-// ── IoStream trait ────────────────────────────────────────────────────────────
-
-pub trait IoStream: Send {
-    fn read_exact<'a>(&'a mut self, buf: &'a mut [u8])
-        -> impl core::future::Future<Output = Result<(), ()>> + 'a;
-    fn write_all<'a>(&'a mut self, buf: &'a [u8])
-        -> impl core::future::Future<Output = Result<(), ()>> + 'a;
-}
-
-#[cfg(feature = "tokio-io")]
-impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> IoStream for T {
-    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), ()> {
-        tokio::io::AsyncReadExt::read_exact(self, buf).await.map(|_|()).map_err(|_|())
-    }
-    async fn write_all(&mut self, buf: &[u8]) -> Result<(), ()> {
-        tokio::io::AsyncWriteExt::write_all(self, buf).await.map_err(|_|())
-    }
-}
+// Use tm_tls::io::IoStream instead of defining our own
 
 // ── ControlActor ─────────────────────────────────────────────────────────────
 

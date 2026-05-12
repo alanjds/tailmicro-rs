@@ -247,11 +247,9 @@ impl DerpActor {
     }
 }
 
-// Re-export IoStream so platform code can impl it for their TLS type
-pub use crate::IoStream;
-
 // ── IoStream (same trait as tm_control) ──────────────────────────────────────
-// Defined here too so tm_derp doesn't depend on tm_control.
+// Defined here so tm_derp doesn't depend on tm_control.
+// Platform code should implement this trait for their TLS type.
 
 pub trait IoStream: Send {
     fn read_exact<'a>(&'a mut self, buf: &'a mut [u8])

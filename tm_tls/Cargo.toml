@@ -32,7 +32,7 @@ sha2 = { version = "0.10", default-features = false }     # fingerprint
 tokio = { version = "1", default-features = false, features = ["io-util", "net"] }
 
 # mbedtls backend (ESP32-C3)
-esp-idf-svc = { version = "0.51", optional = true, default-features = false, features = ["experimental", "std"] }
+esp-idf-svc = { workspace = true, optional = true }
 
 # rustls backend (host)
 tokio-rustls = { version = "0.26", optional = true }

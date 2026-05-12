@@ -3,7 +3,7 @@
 //! ## Scope
 //!
 //! Phase 1 implements only what is needed for peers to reach *us*:
-//! - Decrypt incoming DISCO messages (ChaCha20-Poly1305 with disco key).
+//! - Decrypt incoming DISCO messages (XChaCha20-Poly1305 with disco key).
 //! - Respond to `Ping` with `Pong` (mandatory — without this, peers cannot
 //!   confirm we are alive and will not complete the WireGuard handshake).
 //!
@@ -21,9 +21,10 @@
 //! ## Memory
 //!
 //! No heap allocation.  All state is in fixed-size arrays on the struct.
-
+ 
 use arrayvec::ArrayVec;
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit, AeadInPlace};
+use chacha20poly1305::{XChaCha20Poly1305, KeyInit};
+use chacha20poly1305::aead::{Aead, AeadCore, Key};
 use tm_keys::{DiscoPrivateKey, DiscoPublicKey};
 
 // ── DISCO wire format ─────────────────────────────────────────────────────────
@@ -152,19 +153,16 @@ impl DiscoActor {
 
         // Derive shared secret: our private disco key × sender's public disco key
         let sender_pk = x25519_dalek::PublicKey::from(sender_key);
-        let shared = self.our_disco_key.0.diffie_hellman(&sender_pk);
+        let shared = self.our_disco_key.as_static_secret().diffie_hellman(&sender_pk);
 
-        // Decrypt with ChaCha20-Poly1305
+        // Decrypt with XChaCha20-Poly1305 (24-byte nonce)
         let nonce_bytes: [u8; 24] = data[PUBKEY_LEN..PUBKEY_LEN + NONCE_LEN]
             .try_into().ok()?;
         let mut ciphertext = heapless::Vec::<u8, 256>::new();
         ciphertext.extend_from_slice(&data[PUBKEY_LEN + NONCE_LEN..]).ok()?;
 
-        // Note: DISCO uses XChaCha20-Poly1305 (24-byte nonce).
-        // chacha20poly1305 crate's XChaCha20Poly1305 handles this.
-        use chacha20poly1305::XChaCha20Poly1305;
-        use chacha20poly1305::aead::Aead;
-        let key = chacha20poly1305::Key::from_slice(shared.as_bytes());
+        let shared_bytes: [u8; 32] = *shared.as_bytes();
+        let key = chacha20poly1305::Key::from_slice(&shared_bytes);
         let cipher = XChaCha20Poly1305::new(key);
         let nonce = chacha20poly1305::XNonce::from_slice(&nonce_bytes);
         let plaintext = cipher.decrypt(nonce, ciphertext.as_ref()).ok()?;

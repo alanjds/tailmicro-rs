@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 // ── Node key ─────────────────────────────────────────────────────────────────
 
 /// The long-lived identity key of a Tailscale node.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NodePrivateKey(pub(crate) StaticSecret);
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,10 +50,10 @@ impl NodePublicKey {
 
 // ── Machine key (Noise IK) ────────────────────────────────────────────────────
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MachinePrivateKey(pub(crate) StaticSecret);
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachinePublicKey(pub(crate) [u8; 32]);
 
 impl MachinePrivateKey {
@@ -82,10 +82,10 @@ impl MachinePublicKey {
 
 // ── Disco key ─────────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DiscoPrivateKey(pub(crate) StaticSecret);
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoPublicKey(pub(crate) [u8; 32]);
 
 impl DiscoPrivateKey {
@@ -97,6 +97,11 @@ impl DiscoPrivateKey {
         DiscoPublicKey(*pk.as_bytes())
     }
     pub fn as_bytes(&self) -> &[u8; 32] { self.0.as_bytes() }
+    
+    /// Returns a reference to the inner x25519 private key for Diffie-Hellman
+    pub fn as_static_secret(&self) -> &StaticSecret {
+        &self.0
+    }
 }
 
 impl DiscoPublicKey {
@@ -113,9 +118,10 @@ impl DiscoPublicKey {
 }
 
 // ── Persistent state (stored in NVS on ESP32) ─────────────────────────────────
-
-/// All keys that should survive a reboot.
-/// On ESP32-C3 these are written to NVS flash (~512 bytes total).
+//
+// All keys that should survive a reboot.
+// On ESP32-C3 these are written to NVS flash (~512 bytes total).
+#[derive(Serialize, Deserialize)]
 pub struct NodeState {
     pub node_key:    NodePrivateKey,
     pub machine_key: MachinePrivateKey,

@@ -35,23 +35,38 @@ pub struct WgPeerState {
 // ── FFI declarations (wireguard-lwip) ─────────────────────────────────────────
 //
 // On ESP32-C3 these link against the wireguard-lwip ESP-IDF component.
-// On the host they are stubbed out via cfg(not(target_os = "espidf")).
+// If wireguard-lwip is not available (wireguard_stub cfg), use no-op stubs.
+//
+// The build.rs sets wireguard_stub when wireguard-lwip is not available.
 
-#[cfg(target_os = "espidf")]
+
+// Stub implementation when wireguard-lwip is not available
+#[cfg(all(target_os = "espidf", wireguard_stub))]
+mod ffi {
+    #[repr(C)]
+    pub struct WgPeerC {
+        pub public_key:    [u8; 32],
+        pub preshared_key: [u8; 32],
+        pub allowed_ip:    u32,
+        pub allowed_mask:  u32,
+        pub endpoint_ip:   u32,
+        pub endpoint_port: u16,
+    }
+
+    pub fn wireguard_setup(_: *const ()) -> i32 { 0 }
+    pub fn wireguard_add_peer(peer: *const WgPeerC) -> i32 { 0 }
+    pub fn wireguard_remove_peer(pubkey: *const u8) -> i32 { 0 }
+    pub fn wireguard_is_peer_active(pubkey: *const u8) -> bool { false }
+}
+
+// Real FFI when wireguard-lwip IS available (not stubbed)
+#[cfg(all(target_os = "espidf", not(wireguard_stub)))]
 mod ffi {
     extern "C" {
-        pub fn wireguard_setup(config: *const WgConfig) -> i32;
+        pub fn wireguard_setup(config: *const ()) -> i32;
         pub fn wireguard_add_peer(peer: *const WgPeerC) -> i32;
         pub fn wireguard_remove_peer(pubkey: *const u8) -> i32;
         pub fn wireguard_is_peer_active(pubkey: *const u8) -> bool;
-    }
-
-    #[repr(C)]
-    pub struct WgConfig {
-        pub private_key:   [u8; 32],
-        pub listen_port:   u16,
-        pub our_ip:        u32,     // big-endian IPv4
-        pub netmask:       u32,
     }
 
     #[repr(C)]
@@ -63,15 +78,6 @@ mod ffi {
         pub endpoint_ip:   u32,
         pub endpoint_port: u16,
     }
-}
-
-#[cfg(not(target_os = "espidf"))]
-mod ffi {
-    // Host stubs for cargo test
-    pub fn wireguard_setup(_: *const ()) -> i32 { 0 }
-    pub fn wireguard_add_peer(_: *const ()) -> i32 { 0 }
-    pub fn wireguard_remove_peer(_: *const u8) -> i32 { 0 }
-    pub fn wireguard_is_peer_active(_: *const u8) -> bool { false }
 }
 
 // ── Message types ─────────────────────────────────────────────────────────────
