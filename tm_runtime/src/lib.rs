@@ -48,10 +48,107 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Spawn all actors as separate Tokio tasks.
+    /// Run all actors within a single task using `tokio::join!`.
     ///
-    /// On ESP32-C3 with `current_thread` runtime, tasks are cooperatively
-    /// scheduled within a single OS thread — no additional FreeRTOS tasks.
+    /// This avoids per-task heap allocations that `tokio::spawn` incurs.
+    /// All actors run cooperatively on the same stack.
+    ///
+    /// This is the recommended method for ESP32-C3.
+    pub async fn join(config: RuntimeConfig) -> Self {
+        let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<ControlCmd>(CHAN_CAP);
+        let (ctrl_ev_tx, mut ctrl_ev_rx) = mpsc::channel::<ControlEvent>(CHAN_CAP);
+
+        let (derp_tx,  derp_rx)  = mpsc::channel::<DerpCmd>(CHAN_CAP);
+        let (derp_ev_tx, mut derp_ev_rx) = mpsc::channel::<DerpEvent>(CHAN_CAP);
+
+        let (disco_tx, disco_rx) = mpsc::channel::<DiscoCmd>(CHAN_CAP);
+        let (_disco_ev_tx, mut _disco_ev_rx) = mpsc::channel::<DiscoEvent>(CHAN_CAP);
+
+        let (wg_tx,    wg_rx)    = mpsc::channel::<WgCmd>(CHAN_CAP);
+        let (_wg_ev_tx, mut _wg_ev_rx) = mpsc::channel::<WgEvent>(CHAN_CAP);
+
+        let our_pub = config.node_state.node_key.public();
+        let disco_key = config.node_state.disco_key.clone();
+
+        let control_actor = ControlActor::new(config.control, config.node_state);
+        let derp_actor = DerpActor::new(our_pub);
+        let disco_actor = DiscoActor::new(disco_key);
+        let wg_actor = WgActor::new(config.priority_peer);
+
+        let ctrl_tx3 = ctrl_tx.clone();
+        let ctrl_tx4 = ctrl_tx.clone();
+        let derp_tx2  = derp_tx.clone();
+        let wg_tx2    = wg_tx.clone();
+        let disco_tx2 = disco_tx.clone();
+
+        let event_router = async move {
+            loop {
+                tokio::select! {
+                    Some(evt) = ctrl_ev_rx.recv() => {
+                        match evt {
+                            ControlEvent::MapUpdate(map) => {
+                                let _ = wg_tx2.send(WgCmd::ApplyMap(map)).await;
+                            }
+                            ControlEvent::OurIpAssigned(ip) => {
+                                tracing::info!("Tailnet IP: {:?}", ip.0);
+                            }
+                            ControlEvent::KeyExpiry => {
+                                let _ = ctrl_tx3.send(ControlCmd::Reauth).await;
+                            }
+                            ControlEvent::Error(e) => {
+                                tracing::error!("Control error: {:?}", e);
+                            }
+                        }
+                    }
+                    Some(evt) = derp_ev_rx.recv() => {
+                        match evt {
+                            DerpEvent::PacketReceived { src_key, payload } => {
+                                if !payload.is_empty() && payload[0] == 0x6d {
+                                    let mut data = heapless::Vec::new();
+                                    let _ = data.extend_from_slice(&payload);
+                                    let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
+                                        src_ip:   [0; 4],
+                                        src_port: 0,
+                                        data,
+                                    }).await;
+                                } else {
+                                    let mut pkt = heapless::Vec::new();
+                                    let _ = pkt.extend_from_slice(&payload);
+                                    let _ = wg_tx2.send(WgCmd::InboundPacket {
+                                        src_key: *src_key.as_bytes(),
+                                        payload: pkt,
+                                    }).await;
+                                }
+                            }
+                            DerpEvent::Connected => {
+                                tracing::info!("DERP connected");
+                            }
+                            _ => {}
+                        }
+                    }
+                    else => break,
+                }
+            }
+        };
+
+        let control_task = control_actor.run(ctrl_rx, ctrl_ev_tx);
+        let derp_task = derp_actor.run(derp_rx, derp_ev_tx);
+        let disco_task = disco_actor.run(disco_rx, _disco_ev_tx);
+        let wg_task = wg_actor.run(wg_rx, _wg_ev_tx);
+
+        // Run all tasks concurrently within a single task
+        tokio::join!(control_task, derp_task, disco_task, wg_task, event_router);
+
+        let _ = ctrl_tx4.send(ControlCmd::Start { auth_key: config.auth_key.clone() }).await;
+
+        Runtime { control_tx: ctrl_tx, derp_tx, disco_tx, wg_tx }
+    }
+
+    /// Deprecated: use Runtime::join instead for ESP32-C3.
+    ///
+    /// This method uses tokio::spawn which allocates heap for each task.
+    /// For memory-constrained ESP32-C3, use Runtime::join instead.
+    #[deprecated(note = "Use Runtime::join for ESP32-C3 to avoid task heap allocations")]
     pub async fn spawn(config: RuntimeConfig) -> Self {
         let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<ControlCmd>(CHAN_CAP);
         let (ctrl_ev_tx, mut ctrl_ev_rx) = mpsc::channel::<ControlEvent>(CHAN_CAP);

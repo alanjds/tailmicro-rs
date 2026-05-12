@@ -180,9 +180,12 @@ impl NoiseChannel {
         stream.read_exact(&mut self.read_buf[..msg_len]).await
             .map_err(|_| ControlError::Io)?;
 
-        // Decrypt in place
+        // Decrypt: read_message takes immutable input, mutable output
+        // We need to copy input to a temporary buffer first to avoid borrow conflict
+        let mut temp = [0u8; 4114];
+        temp[..msg_len].copy_from_slice(&self.read_buf[..msg_len]);
         let plaintext_len = self.state
-            .read_message(&self.read_buf[..msg_len].to_vec(), &mut self.read_buf)
+            .read_message(&temp[..msg_len], &mut self.read_buf)
             .map_err(|_| ControlError::Noise(NoiseError::Decrypt))?;
 
         self.read_avail = plaintext_len;
@@ -319,19 +322,22 @@ pub async fn do_noise_handshake<S: crate::IoStream>(
 
 // ── Helper: build the HTTP/1.1 Upgrade request string ─────────────────────────
 
-fn build_upgrade_request(host: &str, cap_version: u16, body_len: usize) -> String {
-    // Using a heapless::String would be cleaner but the format! output here
-    // is only allocated once during connection setup (not in steady state).
-    format!(
-        "POST /ts2021 HTTP/1.1\r\n\
-         Host: {host}\r\n\
-         Upgrade: tailscale-control-protocol\r\n\
-         Connection: Upgrade\r\n\
-         Content-Type: application/octet-stream\r\n\
-         Content-Length: {body_len}\r\n\
-         Tailscale-Cap-Version: {cap_version}\r\n\
-         \r\n"
-    )
+fn build_upgrade_request(host: &str, cap_version: u16, body_len: usize) -> heapless::String<512> {
+    let mut s = heapless::String::new();
+    let _ = s.push_str("POST /ts2021 HTTP/1.1\r\n");
+    let _ = s.push_str("Host: ");
+    let _ = s.push_str(host);
+    let _ = s.push_str("\r\n");
+    let _ = s.push_str("Upgrade: tailscale-control-protocol\r\n");
+    let _ = s.push_str("Connection: Upgrade\r\n");
+    let _ = s.push_str("Content-Type: application/octet-stream\r\n");
+    let _ = s.push_str("Content-Length: ");
+    let _ = s.push_str(&body_len.to_string());
+    let _ = s.push_str("\r\n");
+    let _ = s.push_str("Tailscale-Cap-Version: ");
+    let _ = s.push_str(&cap_version.to_string());
+    let _ = s.push_str("\r\n\r\n");
+    s
 }
 
 // ── Helper: read and validate the 101 Switching Protocols response ─────────────
@@ -398,12 +404,15 @@ pub async fn fetch_server_key<S: crate::IoStream>(
     cap_version: u16,
 ) -> Result<[u8; 32], ControlError> {
     // Send GET /key?v=<cap_version>
-    let req = format!(
-        "GET /key?v={cap_version} HTTP/1.1\r\n\
-         Host: {host}\r\n\
-         Connection: close\r\n\
-         \r\n"
-    );
+    let mut req: heapless::String<256> = heapless::String::new();
+    let _ = req.push_str("GET /key?v=");
+    let _ = req.push_str(&cap_version.to_string());
+    let _ = req.push_str(" HTTP/1.1\r\n");
+    let _ = req.push_str("Host: ");
+    let _ = req.push_str(host);
+    let _ = req.push_str("\r\n");
+    let _ = req.push_str("Connection: close\r\n");
+    let _ = req.push_str("\r\n");
     stream.write_all(req.as_bytes()).await.map_err(|_| ControlError::Io)?;
 
     // Read response — short, fits in 512 bytes
@@ -444,8 +453,16 @@ pub async fn fetch_server_key<S: crate::IoStream>(
 /// Minimal implementation — no alloc, no recursion, no escape handling.
 /// Sufficient for the /key response which is a flat JSON object.
 fn extract_json_string<'a>(json: &'a str, key: &str) -> Option<&'a str> {
-    let needle = format!("\"{}\":\"", key); // e.g. "PublicKey":"
-    let start = json.find(&needle)? + needle.len();
+    // Build needle on stack (max key length is reasonable)
+    let mut needle = [0u8; 64];
+    let mut pos = 0;
+    needle[pos] = b'"'; pos += 1;
+    for &c in key.as_bytes() { needle[pos] = c; pos += 1; }
+    needle[pos] = b'"'; pos += 1;
+    needle[pos] = b':'; pos += 1;
+    needle[pos] = b'"'; pos += 1;
+    let needle_str = core::str::from_utf8(&needle[..pos]).unwrap();
+    let start = json.find(needle_str)? + needle_str.len();
     let end = json[start..].find('"')? + start;
     Some(&json[start..end])
 }

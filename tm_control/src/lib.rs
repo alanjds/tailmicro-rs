@@ -1,4 +1,15 @@
 //! Tailscale control plane client (full implementation).
+//!
+//! # Memory usage notes
+//!
+//! The ControlActor uses approximately 30KB of heap memory:
+//! - TLS connection: ~24KB (esp-idf-svc EspTls internal state)
+//! - NoiseChannel buffers: ~8KB (2x 4114-byte arrays)
+//! - H/2 state and buffers: ~1KB
+//!
+//! On ESP32-C3 with 320KB RAM total, this leaves ~290KB for other operations.
+//! The actor is designed to run with Runtime::join() which avoids per-task heap
+//! allocations, keeping the total memory footprint reasonable.
 pub mod noise;
 pub mod map_parser;
 
@@ -13,6 +24,9 @@ use tm_keys::NodeState;
 use map_parser::MapParser;
 use noise::{NoiseChannel, do_noise_handshake, fetch_server_key};
 use tm_tls::io::IoStream;
+
+// Max request size: body + headers (headers ~256 bytes)
+const MAX_REQUEST_SIZE: usize = 4096 + 256;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -206,7 +220,7 @@ impl ControlActor {
         &self, stream: &mut S, noise: &mut NoiseChannel,
         h2: &mut H2State, events: &tokio::sync::mpsc::Sender<ControlEvent>,
     ) -> Result<(), ControlError> {
-        let mut frame_buf = [0u8; MAX_FRAME_SIZE as usize + 9];
+        let mut frame_buf: heapless::Vec<u8, 4105> = heapless::Vec::new();
         let mut parser: MapParser<8, 4> = MapParser::new();
         let mut our_ip_sent = false;
 
@@ -219,6 +233,7 @@ impl ControlActor {
                 return Err(ControlError::H2(H2Error::FrameTooLarge(hdr.length)));
             }
             let blen = hdr.length as usize;
+            frame_buf.resize(blen, 0);
             noise.read_exact(stream, &mut frame_buf[..blen]).await?;
 
             match tm_h2::parse_frame(&hdr, &frame_buf[..blen], h2)? {
@@ -269,37 +284,42 @@ async fn open_tls(host: &str, port: u16, config: &Config) -> Result<tm_tls::TlsS
 
 // ── H/2 request builder ───────────────────────────────────────────────────────
 
-fn build_h2_post(path: &str, host: &str, stream_id: u32, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len() + 256);
+fn build_h2_post(path: &str, host: &str, stream_id: u32, body: &[u8]) -> ArrayVec<u8, MAX_REQUEST_SIZE> {
+    let mut out = ArrayVec::new();
     let mut hbuf = [0u8; 256];
     let hlen = write_map_request_headers(&mut hbuf, stream_id, b"", host.as_bytes());
-    out.extend_from_slice(&hbuf[..hlen]);
+    for b in &hbuf[..hlen] { let _ = out.push(*b); }
     let blen = body.len() as u32;
-    out.push(((blen>>16)&0xFF) as u8);
-    out.push(((blen>>8)&0xFF) as u8);
-    out.push((blen&0xFF) as u8);
-    out.push(0x0); // DATA
-    out.push(0x1); // END_STREAM
-    out.extend_from_slice(&stream_id.to_be_bytes());
-    out.extend_from_slice(body);
+    let _ = out.push(((blen>>16)&0xFF) as u8);
+    let _ = out.push(((blen>>8)&0xFF) as u8);
+    let _ = out.push((blen&0xFF) as u8);
+    let _ = out.push(0x0); // DATA
+    let _ = out.push(0x1); // END_STREAM
+    let sb = stream_id.to_be_bytes();
+    let _ = out.push(sb[0]);
+    let _ = out.push(sb[1]);
+    let _ = out.push(sb[2]);
+    let _ = out.push(sb[3]);
+    for b in body { let _ = out.push(*b); }
     out
 }
 
 async fn read_one_h2_body<S: IoStream>(
     stream: &mut S, noise: &mut NoiseChannel, h2: &mut H2State,
-) -> Result<Vec<u8>, ControlError> {
-    let mut body = Vec::new();
-    let mut fb = [0u8; MAX_FRAME_SIZE as usize + 9];
+) -> Result<ArrayVec<u8, 4096>, ControlError> {
+    let mut body: ArrayVec<u8, 4096> = ArrayVec::new();
+    let mut fb: heapless::Vec<u8, 4105> = heapless::Vec::new();
     loop {
         let mut hb = [0u8; 9];
         noise.read_exact(stream, &mut hb).await?;
         let hdr = FrameHeader::from_bytes(&hb);
         if hdr.length > MAX_FRAME_SIZE { return Err(ControlError::H2(H2Error::FrameTooLarge(hdr.length))); }
         let blen = hdr.length as usize;
+        fb.resize(blen, 0);
         noise.read_exact(stream, &mut fb[..blen]).await?;
         match tm_h2::parse_frame(&hdr, &fb[..blen], h2)? {
             FrameAction::Data { payload, end_stream } => {
-                body.extend_from_slice(payload);
+                for b in payload { let _ = body.push(*b); }
                 if end_stream { return Ok(body); }
             }
             FrameAction::SendSettingsAck => { let mut a=[0u8;9]; write_settings_ack(&mut a); noise.write_all(stream,&a).await?; }

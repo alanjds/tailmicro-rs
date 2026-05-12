@@ -79,7 +79,7 @@ impl Device {
             priority_peer: None,
         };
 
-        let runtime = tm_runtime::Runtime::spawn(rt_config).await;
+        let runtime = tm_runtime::Runtime::join(rt_config).await;
         let our_ip  = std::sync::Arc::new(tokio::sync::RwLock::new(None));
 
         Ok(Self { runtime, our_ip })
