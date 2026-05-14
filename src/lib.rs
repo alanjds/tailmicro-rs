@@ -47,6 +47,12 @@
 //!
 //! The `#[tokio::main]` macro defaults to `multi_thread` which spawns a
 //! thread pool — fatal on a 400 KB SRAM device.
+//!
+//! ## Tracing to ESP-IDF logging
+//!
+//! On ESP-IDF, `tracing` crate with `features = ["log"]` bridges to the `log` crate.
+//! The bridge is initialized by `EspLogger::initialize_default()` which is called
+//! in the main application before any tailmicro code runs.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -80,37 +86,20 @@ impl Device {
     /// For ESP32-C3, you can pass a cached TLS instance to reuse it across connections,
     /// avoiding memory fragmentation. The TLS instance should be created early (e.g., in wifi.rs)
     /// and passed to this function.
-    #[cfg(target_os = "espidf")]
-    pub async fn new_with_tls(config: &Config, auth_key: Option<String>, cached_tls: EspTls<InternalSocket>) -> Result<Self, Error> {
-        let node_state = config.load_or_generate_keys().await?;
-
-        let rt_config = tm_runtime::RuntimeConfig {
-            control:       config.control_config(),
-            auth_key:      auth_key
-                .as_deref()
-                .and_then(|s| heapless::String::try_from(s).ok())
-                .unwrap_or_default(),
-            node_state,
-            priority_peer: None,
-            cached_tls: Some(cached_tls),
-        };
-
-        let runtime = tm_runtime::Runtime::join(rt_config).await;
-        let our_ip  = std::sync::Arc::new(tokio::sync::RwLock::new(None));
-
-        Ok(Self { runtime, our_ip })
-    }
-
-    /// For non-ESP32 targets (or when cached TLS is not available)
-    #[cfg(not(target_os = "espidf"))]
-    pub async fn new_with_tls(config: &Config, auth_key: Option<String>, _cached_tls: EspTls<InternalSocket>) -> Result<Self, Error> {
-        // On non-ESP32, we don't use cached TLS
-        Self::new(config, auth_key).await
-    }
-
-    /// Default constructor for ESP32-C3 without cached TLS
     pub async fn new(config: &Config, auth_key: Option<String>) -> Result<Self, Error> {
+        Self::new_with_tls(config, auth_key, None).await
+    }
+    
+    /// Constructor for ESP32-C3 with cached TLS instance
+    ///
+    /// On ESP32-C3, you can pass a cached TLS instance to reuse it across connections,
+    /// avoiding memory fragmentation. The TLS instance should be created early (e.g., in wifi.rs)
+    /// and passed to this function.
+    pub async fn new_with_tls(config: &Config, auth_key: Option<String>, cached_tls: Option<EspTls<InternalSocket>>) -> Result<Self, Error> {
+        tracing::info!("Device::new_with_tls() - starting device initialization");
+        
         let node_state = config.load_or_generate_keys().await?;
+        tracing::debug!("Device::new_with_tls() - keys loaded, node_state generated");
 
         let rt_config = tm_runtime::RuntimeConfig {
             control:       config.control_config(),
@@ -121,7 +110,7 @@ impl Device {
             node_state,
             priority_peer: None,
             #[cfg(target_os = "espidf")]
-            cached_tls: None,
+            cached_tls,
         };
 
         let runtime = tm_runtime::Runtime::join(rt_config).await;

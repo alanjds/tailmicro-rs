@@ -20,7 +20,7 @@ default = []
 #
 # Exactly one must be active at build time. The build script enforces this.
 
-mbedtls = ["dep:esp-idf-svc"]
+mbedtls = ["dep:esp-idf-svc", "dep:esp-idf-sys"]
 rustls   = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
 
 [dependencies]
@@ -33,6 +33,7 @@ tokio = { version = "1", default-features = false, features = ["io-util", "net"]
 
 # mbedtls backend (ESP32-C3)
 esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc", rev = "dd794331a3c", optional = true }
+esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys", rev = "2749423ff0", optional = true }
 
 # rustls backend (host)
 tokio-rustls = { version = "0.26", optional = true }

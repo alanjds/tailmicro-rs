@@ -175,7 +175,13 @@ pub async fn connect(config: &TlsConfig<'_>) -> Result<MbedTlsStream, TlsError> 
 
     #[cfg(target_os = "espidf")]
     {
-        do_tls_connect(config).await
+        tracing::info!("connect() - starting TLS connection to {}:{} with verification={:?}", 
+            config.host, config.port, config.verification);
+        let result = do_tls_connect(config).await;
+        if result.is_ok() {
+            tracing::info!("connect() - TLS connection established successfully");
+        }
+        result
     }
 }
 
@@ -218,6 +224,17 @@ async fn do_tls_connect(config: &TlsConfig<'_>) -> Result<MbedTlsStream, TlsErro
     let mut tls = get_tls(None);
 
     // EspTls::connect() returns Result<CompletedHandshake, EspError>
+    
+    #[cfg(target_os = "espidf")]
+    {
+        unsafe {
+            let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+            let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+            let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+            tracing::info!("do_tls_connect() - heap before EspTls::connect(): {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+        }
+    }
+    
     match tls.connect(&host, port, &tls_cfg) {
         Ok(_) => {}
         Err(e) => {
@@ -252,6 +269,8 @@ async fn do_tls_connect(config: &TlsConfig<'_>) -> Result<MbedTlsStream, TlsErro
 /// that was created early in the program lifecycle.
 #[cfg(target_os = "espidf")]
 pub async fn connect_with_cached(config: &TlsConfig<'_>, cached_tls: EspTls<InternalSocket>) -> Result<MbedTlsStream, TlsError> {
+    tracing::info!("connect_with_cached() - using cached TLS instance for {}:{} with verification={:?}", 
+        config.host, config.port, config.verification);
     do_tls_connect_with_tls(config, cached_tls).await
 }
 
@@ -287,6 +306,17 @@ async fn do_tls_connect_with_tls(config: &TlsConfig<'_>, mut tls: EspTls<Interna
     };
 
     // EspTls::connect() returns Result<CompletedHandshake, EspError>
+    
+    #[cfg(target_os = "espidf")]
+    {
+        unsafe {
+            let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+            let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+            let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+            tracing::info!("do_tls_connect_with_tls() - heap before EspTls::connect(): {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+        }
+    }
+    
     match tls.connect(&host, port, &tls_cfg) {
         Ok(_) => {}
         Err(e) => {

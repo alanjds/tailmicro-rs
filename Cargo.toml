@@ -54,13 +54,18 @@ httparse = { version = "1", default-features = false }
 thiserror = { version = "1", default-features = false }
 
 # Tracing — same interface as tailscale-rs
-tracing = { version = "0.1", default-features = false }
+# Use 'std' and 'log' features to enable log compatibility and stdlib support
+tracing = { version = "0.1", default-features = false, features = ["std", "log"] }
+
+# log crate for direct logging (bypasses tracing-log bridge issues)
+log = { version = "0.4", default-features = false }
 
 # ESP-IDF specific (overridden via patch to match tasmolike-rs)
 esp-idf-svc = { version = "0.51.0", default-features = false, features = ["experimental", "std"] }
 esp-idf-hal   = { version = "0.45.0", default-features = false }
 esp-idf-sys   = { version = "0.36.0", default-features = false }
 embedded-svc  = { version = "0.28.0", default-features = false }
+crossbeam-channel = { version = "0.5.15" }
 
 # Local crates
 tailmicro    = { path = "." }
@@ -91,6 +96,7 @@ tm_tls.workspace       = true
 thiserror.workspace    = true
 tokio   = { workspace = true, features = ["sync", "rt"] }
 tracing.workspace      = true
+log.workspace          = true
 serde.workspace        = true
 serde_json.workspace   = true
 heapless.workspace     = true

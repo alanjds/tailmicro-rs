@@ -207,21 +207,23 @@ impl NoiseChannel {
 /// 4. Handle optional EarlyNoise payload
 /// 5. Read and process the Noise response message
 /// 6. Transition to transport mode
-pub async fn do_noise_handshake<S: crate::IoStream>(
-    stream:      &mut S,
-    machine_key: &MachinePrivateKey,
-    server_key:  &[u8; 32],   // from /key?v=<n> pre-fetch
-    host:        &str,
-    cap_version: u16,
-) -> Result<NoiseChannel, ControlError> {
+    pub async fn do_noise_handshake<S: crate::IoStream>(
+        stream:      &mut S,
+        machine_key: &MachinePrivateKey,
+        server_key:  &[u8; 32],   // from /key?v=<n> pre-fetch
+        host:        &str,
+        cap_version: u16,
+    ) -> Result<NoiseChannel, ControlError> {
+        tracing::info!("do_noise_handshake() - starting Noise IK handshake with {}", host);
 
-    // ── Step 1: Build Noise init message ──────────────────────────────────────
+        // ── Step 1: Build Noise init message ──────────────────────────────────────
 
-    let mut handshake = NoiseBuilder::new(NOISE_PATTERN.parse().unwrap())
-        .local_private_key(machine_key.as_bytes())
-        .remote_public_key(server_key)
-        .build_initiator()
-        .map_err(|_| ControlError::Noise(NoiseError::Handshake))?;
+        tracing::debug!("do_noise_handshake() - Step 1: Building Noise IK init message");
+        let mut handshake = NoiseBuilder::new(NOISE_PATTERN.parse().unwrap())
+            .local_private_key(machine_key.as_bytes())
+            .remote_public_key(server_key)
+            .build_initiator()
+            .map_err(|_| ControlError::Noise(NoiseError::Handshake))?;
 
     let mut init_msg = [0u8; NOISE_INIT_MSG_LEN];
     let init_len = handshake.write_message(&[], &mut init_msg)
@@ -311,11 +313,12 @@ pub async fn do_noise_handshake<S: crate::IoStream>(
     let transport = handshake.into_transport_mode()
         .map_err(|_| ControlError::Noise(NoiseError::Handshake))?;
 
-    Ok(NoiseChannel {
-        state:      transport,
-        write_buf:  [0u8; 4114],
-        read_buf:   [0u8; 4114],
-        read_avail: 0,
+        tracing::debug!("do_noise_handshake() - NoiseChannel created with buffers (3 x 4114 bytes = 12342 bytes)");
+        Ok(NoiseChannel {
+            state:      transport,
+            write_buf:  [0u8; 4114],
+            read_buf:   [0u8; 4114],
+            read_avail: 0,
         read_pos:   0,
     })
 }

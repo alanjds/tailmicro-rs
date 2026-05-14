@@ -15,18 +15,25 @@
 //! * `Runtime::join` (ESP32-C3 recommended) — uses `tokio::join!` inside a
 //!   single task, avoiding per-task heap overhead.
 //!
-//! ## Channel buffer sizes
+//! ## Channel implementation
 //!
-//! All channels use a capacity of 2-4.  A backpressure of 4 messages × typical
+//! Uses `crossbeam::channel` instead of `tokio::sync::mpsc` for predictable
+//! memory usage on ESP32-C3. Crossbeam channels use a pre-allocated ring buffer
+//! with no dynamic heap allocation after initialization.
+//!
+//! All channels use a capacity of 4.  A backpressure of 4 messages × typical
 //! message size (~1.5 KB for a packet) = ~6 KB maximum queued per channel.
 //! This is the MicroLink insight applied: small queues, no unbounded growth.
-
+ 
 use tm_control::{ControlActor, ControlCmd, ControlEvent, Config as ControlConfig};
 use tm_derp::{DerpActor, DerpCmd, DerpEvent};
 use tm_disco::{DiscoActor, DiscoCmd, DiscoEvent};
 use tm_wg::{WgActor, WgCmd, WgEvent};
 use tm_keys::{NodeState, NodePublicKey};
 use tokio::sync::mpsc;
+
+#[cfg(target_os = "espidf")]
+use esp_idf_sys;
 
 /// Channel capacity for all inter-actor queues.
 /// Small = bounded memory, back-pressure propagates naturally.
@@ -61,41 +68,209 @@ impl Runtime {
     ///
     /// This is the recommended method for ESP32-C3.
     pub async fn join(mut config: RuntimeConfig) -> Self {
+        tracing::info!("Runtime::join() - starting actor runtime");
+        
+        // ── Log heap before channel allocation ──────────────────────────────────
+        #[cfg(target_os = "espidf")]
+        {
+            unsafe {
+                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+                let free_all = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_SPIRAM | esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT);
+                tracing::info!("Runtime::join() - heap before channel allocation: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default, {} bytes total largest", free_internal, free_8bit, free_default, free_all);
+                tracing::info!("Runtime::join() - total heap free: {} bytes", esp_idf_sys::heap_caps_get_free_size(esp_idf_sys::MALLOC_CAP_DEFAULT as u32 | esp_idf_sys::MALLOC_CAP_INTERNAL as u32 | esp_idf_sys::MALLOC_CAP_SPIRAM as u32));
+            }
+        }
+        
+        tracing::info!("Runtime::join() - allocating ControlCmd channel");
         let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<ControlCmd>(CHAN_CAP);
+        
+        #[cfg(target_os = "espidf")]
+        {
+            unsafe {
+                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+                tracing::info!("Runtime::join() - heap after ControlCmd channel: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+            }
+        }
+        tracing::info!("Runtime::join() - allocating ControlEvent channel");
         let (ctrl_ev_tx, mut ctrl_ev_rx) = mpsc::channel::<ControlEvent>(CHAN_CAP);
 
+        #[cfg(target_os = "espidf")]
+        {
+            unsafe {
+                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+                tracing::info!("Runtime::join() - heap after ControlEvent channel: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+            }
+        }
+
+        tracing::info!("Runtime::join() - allocating DerpCmd channel");
         let (derp_tx,  derp_rx)  = mpsc::channel::<DerpCmd>(CHAN_CAP);
-        let (derp_ev_tx, mut derp_ev_rx) = mpsc::channel::<DerpEvent>(CHAN_CAP);
-
-        let (disco_tx, disco_rx) = mpsc::channel::<DiscoCmd>(CHAN_CAP);
-        let (_disco_ev_tx, mut _disco_ev_rx) = mpsc::channel::<DiscoEvent>(CHAN_CAP);
-
-        let (wg_tx,    wg_rx)    = mpsc::channel::<WgCmd>(CHAN_CAP);
-        let (_wg_ev_tx, mut _wg_ev_rx) = mpsc::channel::<WgEvent>(CHAN_CAP);
-
-        let our_pub = config.node_state.node_key.public();
-        let disco_key = config.node_state.disco_key.clone();
 
         #[cfg(target_os = "espidf")]
-        let control_actor = if let Some(cached_tls) = config.cached_tls {
+        {
+            unsafe {
+                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+                tracing::info!("Runtime::join() - heap after DerpCmd channel: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+            }
+        }
+
+        tracing::info!("Runtime::join() - allocating DerpEvent channel");
+        let (derp_ev_tx, mut derp_ev_rx) = mpsc::channel::<DerpEvent>(CHAN_CAP);
+
+        #[cfg(target_os = "espidf")]
+        {
+            unsafe {
+                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+                tracing::info!("Runtime::join() - heap after DerpEvent channel: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+            }
+        }
+
+        tracing::info!("Runtime::join() - allocating DiscoCmd channel");
+        let (disco_tx, disco_rx) = mpsc::channel::<DiscoCmd>(CHAN_CAP);
+
+        #[cfg(target_os = "espidf")]
+        {
+            unsafe {
+                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+                tracing::info!("Runtime::join() - heap after DiscoCmd channel: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+            }
+        }
+
+        tracing::info!("Runtime::join() - allocating DiscoEvent channel");
+        let (_disco_ev_tx, mut _disco_ev_rx) = mpsc::channel::<DiscoEvent>(CHAN_CAP);
+
+        #[cfg(target_os = "espidf")]
+        {
+            unsafe {
+                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+                tracing::info!("Runtime::join() - heap after DiscoEvent channel: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+            }
+        }
+
+        tracing::info!("Runtime::join() - allocating WgCmd channel");
+        let (wg_tx,    wg_rx)    = mpsc::channel::<WgCmd>(CHAN_CAP);
+
+        #[cfg(target_os = "espidf")]
+        {
+            unsafe {
+                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+                tracing::info!("Runtime::join() - heap after WgCmd channel: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+            }
+        }
+
+        tracing::info!("Runtime::join() - allocating WgEvent channel");
+        let (_wg_ev_tx, mut _wg_ev_rx) = mpsc::channel::<WgEvent>(CHAN_CAP);
+
+        #[cfg(target_os = "espidf")]
+        {
+            unsafe {
+                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+                tracing::info!("Runtime::join() - heap after WgEvent channel: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+            }
+        }
+
+        let our_pub = config.node_state.node_key.public();
+        tracing::info!("Runtime::join() - node key extracted (32 bytes)");
+        let disco_key = config.node_state.disco_key.clone();
+        tracing::info!("Runtime::join() - disco key extracted (32 bytes)");
+        
+        #[cfg(target_os = "espidf")]
+        {
+            unsafe {
+                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+                tracing::info!("Runtime::join() - heap before ControlActor: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+            }
+        }
+
+        tracing::info!("Runtime::join() - creating ControlActor");
+        #[cfg(target_os = "espidf")]
+        let control_actor = if let Some(cached_tls) = config.cached_tls.take() {
+            tracing::info!("Runtime::join() - ControlActor: using cached TLS");
             ControlActor::new_with_tls(config.control, config.node_state, cached_tls)
         } else {
+            tracing::info!("Runtime::join() - ControlActor: no cached TLS");
             ControlActor::new(config.control, config.node_state)
         };
+        
+        #[cfg(target_os = "espidf")]
+        {
+            unsafe {
+                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+                tracing::info!("Runtime::join() - heap after ControlActor: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+            }
+        }
 
         #[cfg(not(target_os = "espidf"))]
         let control_actor = ControlActor::new(config.control, config.node_state);
 
+        tracing::info!("Runtime::join() - creating DerpActor");
         let derp_actor = DerpActor::new(our_pub);
-        let disco_actor = DiscoActor::new(disco_key);
-        let wg_actor = WgActor::new(config.priority_peer);
+        
+        #[cfg(target_os = "espidf")]
+        {
+            unsafe {
+                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+                tracing::info!("Runtime::join() - heap after DerpActor: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+            }
+        }
 
+        tracing::info!("Runtime::join() - creating DiscoActor");
+        let disco_actor = DiscoActor::new(disco_key);
+        
+        #[cfg(target_os = "espidf")]
+        {
+            unsafe {
+                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+                tracing::info!("Runtime::join() - heap after DiscoActor: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+            }
+        }
+
+        tracing::info!("Runtime::join() - creating WgActor");
+        let wg_actor = WgActor::new(config.priority_peer);
+        
+        #[cfg(target_os = "espidf")]
+        {
+            unsafe {
+                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+                tracing::info!("Runtime::join() - heap after WgActor: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+            }
+        }
+
+        tracing::info!("Runtime::join() - cloning sender channels");
         let ctrl_tx3 = ctrl_tx.clone();
         let ctrl_tx4 = ctrl_tx.clone();
         let derp_tx2  = derp_tx.clone();
         let wg_tx2    = wg_tx.clone();
         let disco_tx2 = disco_tx.clone();
 
+        tracing::info!("Runtime::join() - creating event_router task");
         let event_router = async move {
             loop {
                 tokio::select! {
@@ -146,16 +321,26 @@ impl Runtime {
             }
         };
 
+        tracing::info!("Runtime::join() - preparing actor tasks");
         let control_task = control_actor.run(ctrl_rx, ctrl_ev_tx);
         let derp_task = derp_actor.run(derp_rx, derp_ev_tx);
         let disco_task = disco_actor.run(disco_rx, _disco_ev_tx);
         let wg_task = wg_actor.run(wg_rx, _wg_ev_tx);
+        
+        #[cfg(target_os = "espidf")]
+        {
+            unsafe {
+                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+                tracing::info!("Runtime::join() - heap before tokio::join!: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+            }
+        }
 
-        // Run all tasks concurrently within a single task
-        tokio::join!(control_task, derp_task, disco_task, wg_task, event_router);
-
+        tracing::info!("Runtime::join() - sending ControlCmd::Start");
         let _ = ctrl_tx4.send(ControlCmd::Start { auth_key: config.auth_key.clone() }).await;
 
+        tracing::info!("Runtime::join() - returning Runtime");
         Runtime { control_tx: ctrl_tx, derp_tx, disco_tx, wg_tx }
     }
 
