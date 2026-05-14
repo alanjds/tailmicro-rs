@@ -8,6 +8,7 @@ description = "Tailscale control plane: Noise IK, ts2021, streaming MapResponse"
 tm_h2.workspace   = true
 tm_keys.workspace = true
 tm_tls.workspace  = true
+esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc", rev = "dd794331a3c" }
 arrayvec  = { workspace = true }
 heapless  = { workspace = true }
 httparse  = { workspace = true }

@@ -68,6 +68,10 @@ mod backend_rustls;
 
 pub use error::TlsError;
 
+// ESP-IDF types needed for connect_with_cached (mbedtls feature only)
+#[cfg(feature = "mbedtls")]
+use esp_idf_svc::tls::{EspTls, InternalSocket};
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// How to verify the server's TLS certificate.
@@ -126,6 +130,15 @@ impl TlsStream {
 
         #[cfg(not(any(feature = "mbedtls", feature = "rustls")))]
         compile_error!("Enable either the `mbedtls` or `rustls` feature in tm_tls");
+    }
+    
+    /// Open a TLS connection to `host:port` using a cached TLS instance.
+    ///
+    /// This is used to avoid memory fragmentation by reusing a TLS instance
+    /// that was created early in the program lifecycle.
+    #[cfg(feature = "mbedtls")]
+    pub async fn connect_with_cached(config: &TlsConfig<'_>, cached_tls: EspTls<InternalSocket>) -> Result<Self, TlsError> {
+        backend_mbedtls::connect_with_cached(config, cached_tls).await.map(|s| Self(Inner::Mbedtls(s)))
     }
 
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TlsError> {

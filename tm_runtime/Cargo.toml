@@ -10,5 +10,6 @@ tm_disco.workspace   = true
 tm_wg.workspace      = true
 tm_keys.workspace    = true
 heapless  = { workspace = true }
+esp-idf-svc = { version = "0.51", features = [] }
 tokio     = { workspace = true, features = ["sync", "rt", "macros"] }
 tracing   = { workspace = true }

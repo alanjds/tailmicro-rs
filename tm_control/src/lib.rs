@@ -24,6 +24,7 @@ use tm_keys::NodeState;
 use map_parser::MapParser;
 use noise::{NoiseChannel, do_noise_handshake, fetch_server_key};
 use tm_tls::io::IoStream;
+use esp_idf_svc::tls::{EspTls, InternalSocket};
 
 // Max request size: body + headers (headers ~256 bytes)
 const MAX_REQUEST_SIZE: usize = 4096 + 256;
@@ -136,12 +137,34 @@ struct MapRequest<'a> {
 
 // ── ControlActor ─────────────────────────────────────────────────────────────
 
-pub struct ControlActor { config: Config, node_state: NodeState }
+pub struct ControlActor { 
+    config: Config, 
+    node_state: NodeState,
+    #[cfg(target_os = "espidf")]
+    cached_tls: Option<EspTls<InternalSocket>>,
+}
 
 impl ControlActor {
-    pub fn new(config: Config, node_state: NodeState) -> Self { Self { config, node_state } }
+    pub fn new(config: Config, node_state: NodeState) -> Self { 
+        Self { 
+            config, 
+            node_state,
+            #[cfg(target_os = "espidf")]
+            cached_tls: None
+        }
+    }
+    
+    #[cfg(target_os = "espidf")]
+    pub fn new_with_tls(config: Config, node_state: NodeState, cached_tls: EspTls<InternalSocket>) -> Self { 
+        Self { config, node_state, cached_tls: Some(cached_tls) }
+    }
+    
+    #[cfg(not(target_os = "espidf"))]
+    pub fn new_with_tls(config: Config, node_state: NodeState, _cached_tls:EspTls<InternalSocket>) -> Self { 
+        Self { config, node_state }
+    }
 
-    pub async fn run(self, mut cmds: tokio::sync::mpsc::Receiver<ControlCmd>,
+    pub async fn run(mut self, mut cmds: tokio::sync::mpsc::Receiver<ControlCmd>,
                      events: tokio::sync::mpsc::Sender<ControlEvent>) {
         loop {
             match cmds.recv().await {
@@ -157,7 +180,7 @@ impl ControlActor {
         }
     }
 
-    async fn connect_and_poll(&self, auth_key: &str,
+    async fn connect_and_poll(&mut self, auth_key: &str,
                                events: &tokio::sync::mpsc::Sender<ControlEvent>)
         -> Result<(), ControlError>
     {
@@ -165,12 +188,17 @@ impl ControlActor {
         let port = self.config.control_port;
 
         // Step 1 & 2: fetch server Noise key over HTTPS
-        let mut key_conn = open_tls(host, port, &self.config).await?;
+        // Use the cached TLS if available
+        let mut key_conn = self.open_tls(host, port).await?;
         let server_noise_key = fetch_server_key(&mut key_conn, host, CAPABILITY_VERSION).await?;
         drop(key_conn);
 
         // Step 3 & 4: open long-lived connection + Noise IK
-        let mut main_conn = open_tls(host, port, &self.config).await?;
+        // Use the cached TLS if available (but it's already taken by key_conn)
+        // For ESP32-C3 with TLS caching, we need to handle this differently:
+        // Either we create a new TLS for each connection, or we need to cache
+        // multiple TLS instances.
+        let mut main_conn = self.open_tls(host, port).await?;
         let mut noise = do_noise_handshake(
             &mut main_conn, &self.node_state.machine_key, &server_noise_key,
             host, CAPABILITY_VERSION,
@@ -271,15 +299,38 @@ impl ControlActor {
 
 // ── TLS opener ────────────────────────────────────────────────────────────────
 
-async fn open_tls(host: &str, port: u16, config: &Config) -> Result<tm_tls::TlsStream, ControlError> {
-    let fp = config.cert_fingerprints.first().copied().unwrap_or([0u8; 32]);
-    let verification = if fp == [0u8; 32] {
-        tm_tls::CertVerification::FullChain
-    } else {
-        tm_tls::CertVerification::Fingerprint(fp)
-    };
-    tm_tls::TlsStream::connect(&tm_tls::TlsConfig { host, port, verification, alpn: &[] })
-        .await.map_err(|_| ControlError::Tls)
+impl ControlActor {
+    async fn open_tls<'a>(&mut self, host: &str, port: u16) -> Result<tm_tls::TlsStream, ControlError> {
+        #[cfg(target_os = "espidf")]
+        {
+            // Try to take the cached TLS from the Option
+            // If None, create a new TLS using get_tls(None)
+            match self.cached_tls.take() {
+                Some(cached_tls) => {
+                    // Use the cached TLS instance
+                    let config = tm_tls::TlsConfig { 
+                        host, 
+                        port, 
+                        verification: tm_tls::CertVerification::FullChain, 
+                        alpn: &[] 
+                    };
+                    tm_tls::TlsStream::connect_with_cached(&config, cached_tls)
+                        .await.map_err(|_| ControlError::Tls)
+                }
+                None => {
+                    // Create a new TLS connection
+                    tm_tls::TlsStream::connect(&tm_tls::TlsConfig { host, port, verification: tm_tls::CertVerification::FullChain, alpn: &[] })
+                        .await.map_err(|_| ControlError::Tls)
+                }
+            }
+        }
+        
+        #[cfg(not(target_os = "espidf"))]
+        {
+            tm_tls::TlsStream::connect(&tm_tls::TlsConfig { host, port, verification: tm_tls::CertVerification::FullChain, alpn: &[] })
+                .await.map_err(|_| ControlError::Tls)
+        }
+    }
 }
 
 // ── H/2 request builder ───────────────────────────────────────────────────────

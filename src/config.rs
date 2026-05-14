@@ -1,6 +1,9 @@
 use tm_keys::NodeState;
 use crate::Error;
 
+#[cfg(target_os = "espidf")]
+use esp_idf_svc::tls::{EspTls, InternalSocket};
+
 /// Configuration for a `Device`.
 ///
 /// Mirrors `tailscale::Config` so examples are source-compatible.
@@ -9,6 +12,10 @@ pub struct Config {
     pub(crate) control_port: u16,
     /// Path to key file (host only; on ESP32-C3 use NVS directly).
     pub(crate) key_file: Option<&'static str>,
+    /// Cached TLS instance for reuse (ESP32-C3 only).
+    /// This is used to avoid memory fragmentation when creating TLS too late.
+    #[cfg(target_os = "espidf")]
+    pub(crate) cached_tls: Option<EspTls<InternalSocket>>,
 }
 
 impl Config {
@@ -44,6 +51,8 @@ impl Default for Config {
             control_host: "login.tailscale.com",
             control_port: 443,
             key_file:     None,
+            #[cfg(target_os = "espidf")]
+            cached_tls: None,
         }
     }
 }

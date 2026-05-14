@@ -32,11 +32,17 @@ use tokio::sync::mpsc;
 /// Small = bounded memory, back-pressure propagates naturally.
 const CHAN_CAP: usize = 4;
 
+#[cfg(target_os = "espidf")]
+use esp_idf_svc::tls::{EspTls, InternalSocket};
+
 pub struct RuntimeConfig {
     pub control:       ControlConfig,
     pub auth_key:      heapless::String<128>,
     pub node_state:    NodeState,
     pub priority_peer: Option<[u8; 32]>,
+    /// Cached TLS instance for reuse (ESP32-C3 only).
+    #[cfg(target_os = "espidf")]
+    pub cached_tls:    Option<EspTls<InternalSocket>>,
 }
 
 pub struct Runtime {
@@ -54,7 +60,7 @@ impl Runtime {
     /// All actors run cooperatively on the same stack.
     ///
     /// This is the recommended method for ESP32-C3.
-    pub async fn join(config: RuntimeConfig) -> Self {
+    pub async fn join(mut config: RuntimeConfig) -> Self {
         let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<ControlCmd>(CHAN_CAP);
         let (ctrl_ev_tx, mut ctrl_ev_rx) = mpsc::channel::<ControlEvent>(CHAN_CAP);
 
@@ -70,7 +76,16 @@ impl Runtime {
         let our_pub = config.node_state.node_key.public();
         let disco_key = config.node_state.disco_key.clone();
 
+        #[cfg(target_os = "espidf")]
+        let control_actor = if let Some(cached_tls) = config.cached_tls {
+            ControlActor::new_with_tls(config.control, config.node_state, cached_tls)
+        } else {
+            ControlActor::new(config.control, config.node_state)
+        };
+
+        #[cfg(not(target_os = "espidf"))]
         let control_actor = ControlActor::new(config.control, config.node_state);
+
         let derp_actor = DerpActor::new(our_pub);
         let disco_actor = DiscoActor::new(disco_key);
         let wg_actor = WgActor::new(config.priority_peer);
@@ -148,6 +163,7 @@ impl Runtime {
     ///
     /// This method uses tokio::spawn which allocates heap for each task.
     /// For memory-constrained ESP32-C3, use Runtime::join instead.
+    #[cfg(not(target_os = "espidf"))]
     #[deprecated(note = "Use Runtime::join for ESP32-C3 to avoid task heap allocations")]
     pub async fn spawn(config: RuntimeConfig) -> Self {
         let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<ControlCmd>(CHAN_CAP);

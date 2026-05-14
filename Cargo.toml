@@ -59,6 +59,8 @@ tracing = { version = "0.1", default-features = false }
 # ESP-IDF specific (overridden via patch to match tasmolike-rs)
 esp-idf-svc = { version = "0.51.0", default-features = false, features = ["experimental", "std"] }
 esp-idf-hal   = { version = "0.45.0", default-features = false }
+esp-idf-sys   = { version = "0.36.0", default-features = false }
+embedded-svc  = { version = "0.28.0", default-features = false }
 
 # Local crates
 tailmicro    = { path = "." }
@@ -85,12 +87,17 @@ tm_runtime.workspace   = true
 tm_keys.workspace      = true
 tm_netstack.workspace  = true
 tm_control.workspace   = true
+tm_tls.workspace       = true
 thiserror.workspace    = true
 tokio   = { workspace = true, features = ["sync", "rt"] }
 tracing.workspace      = true
 serde.workspace        = true
 serde_json.workspace   = true
 heapless.workspace     = true
+esp-idf-svc = { workspace = true }
+esp-idf-hal = { workspace = true }
+esp-idf-sys = { workspace = true }
+embedded-svc = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time", "net"] }
