@@ -30,7 +30,7 @@ use tm_derp::{DerpActor, DerpCmd, DerpEvent};
 use tm_disco::{DiscoActor, DiscoCmd, DiscoEvent};
 use tm_wg::{WgActor, WgCmd, WgEvent};
 use tm_keys::{NodeState, NodePublicKey};
-use tokio::sync::mpsc;
+use async_channel;
 
 #[cfg(target_os = "espidf")]
 use esp_idf_sys;
@@ -54,10 +54,10 @@ pub struct RuntimeConfig {
 
 pub struct Runtime {
     // Senders — held by Runtime so callers can send commands
-    pub control_tx: mpsc::Sender<ControlCmd>,
-    pub derp_tx:    mpsc::Sender<DerpCmd>,
-    pub disco_tx:   mpsc::Sender<DiscoCmd>,
-    pub wg_tx:      mpsc::Sender<WgCmd>,
+    pub control_tx: async_channel::Sender<ControlCmd>,
+    pub derp_tx:    async_channel::Sender<DerpCmd>,
+    pub disco_tx:   async_channel::Sender<DiscoCmd>,
+    pub wg_tx:      async_channel::Sender<WgCmd>,
 }
 
 impl Runtime {
@@ -84,7 +84,7 @@ impl Runtime {
         }
         
         tracing::info!("Runtime::join() - allocating ControlCmd channel");
-        let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<ControlCmd>(CHAN_CAP);
+        let (ctrl_tx,  ctrl_rx)  = async_channel::bounded::<ControlCmd>(CHAN_CAP);
         
         #[cfg(target_os = "espidf")]
         {
@@ -96,7 +96,7 @@ impl Runtime {
             }
         }
         tracing::info!("Runtime::join() - allocating ControlEvent channel");
-        let (ctrl_ev_tx, mut ctrl_ev_rx) = mpsc::channel::<ControlEvent>(CHAN_CAP);
+        let (ctrl_ev_tx, mut ctrl_ev_rx) = async_channel::bounded::<ControlEvent>(CHAN_CAP);
 
         #[cfg(target_os = "espidf")]
         {
@@ -109,7 +109,7 @@ impl Runtime {
         }
 
         tracing::info!("Runtime::join() - allocating DerpCmd channel");
-        let (derp_tx,  derp_rx)  = mpsc::channel::<DerpCmd>(CHAN_CAP);
+        let (derp_tx,  derp_rx)  = async_channel::bounded::<DerpCmd>(CHAN_CAP);
 
         #[cfg(target_os = "espidf")]
         {
@@ -122,7 +122,7 @@ impl Runtime {
         }
 
         tracing::info!("Runtime::join() - allocating DerpEvent channel");
-        let (derp_ev_tx, mut derp_ev_rx) = mpsc::channel::<DerpEvent>(CHAN_CAP);
+        let (derp_ev_tx, mut derp_ev_rx) = async_channel::bounded::<DerpEvent>(CHAN_CAP);
 
         #[cfg(target_os = "espidf")]
         {
@@ -135,7 +135,7 @@ impl Runtime {
         }
 
         tracing::info!("Runtime::join() - allocating DiscoCmd channel");
-        let (disco_tx, disco_rx) = mpsc::channel::<DiscoCmd>(CHAN_CAP);
+        let (disco_tx, disco_rx) = async_channel::bounded::<DiscoCmd>(CHAN_CAP);
 
         #[cfg(target_os = "espidf")]
         {
@@ -148,7 +148,7 @@ impl Runtime {
         }
 
         tracing::info!("Runtime::join() - allocating DiscoEvent channel");
-        let (_disco_ev_tx, mut _disco_ev_rx) = mpsc::channel::<DiscoEvent>(CHAN_CAP);
+        let (_disco_ev_tx, mut _disco_ev_rx) = async_channel::bounded::<DiscoEvent>(CHAN_CAP);
 
         #[cfg(target_os = "espidf")]
         {
@@ -161,7 +161,7 @@ impl Runtime {
         }
 
         tracing::info!("Runtime::join() - allocating WgCmd channel");
-        let (wg_tx,    wg_rx)    = mpsc::channel::<WgCmd>(CHAN_CAP);
+        let (wg_tx,    wg_rx)    = async_channel::bounded::<WgCmd>(CHAN_CAP);
 
         #[cfg(target_os = "espidf")]
         {
@@ -174,7 +174,7 @@ impl Runtime {
         }
 
         tracing::info!("Runtime::join() - allocating WgEvent channel");
-        let (_wg_ev_tx, mut _wg_ev_rx) = mpsc::channel::<WgEvent>(CHAN_CAP);
+        let (_wg_ev_tx, mut _wg_ev_rx) = async_channel::bounded::<WgEvent>(CHAN_CAP);
 
         #[cfg(target_os = "espidf")]
         {
@@ -274,49 +274,60 @@ impl Runtime {
         let event_router = async move {
             loop {
                 tokio::select! {
-                    Some(evt) = ctrl_ev_rx.recv() => {
+                    evt = ctrl_ev_rx.recv() => {
                         match evt {
-                            ControlEvent::MapUpdate(map) => {
-                                let _ = wg_tx2.send(WgCmd::ApplyMap(map)).await;
-                            }
-                            ControlEvent::OurIpAssigned(ip) => {
-                                tracing::info!("Tailnet IP: {:?}", ip.0);
-                            }
-                            ControlEvent::KeyExpiry => {
-                                let _ = ctrl_tx3.send(ControlCmd::Reauth).await;
-                            }
-                            ControlEvent::Error(e) => {
-                                tracing::error!("Control error: {:?}", e);
-                            }
-                        }
-                    }
-                    Some(evt) = derp_ev_rx.recv() => {
-                        match evt {
-                            DerpEvent::PacketReceived { src_key, payload } => {
-                                if !payload.is_empty() && payload[0] == 0x6d {
-                                    let mut data = heapless::Vec::new();
-                                    let _ = data.extend_from_slice(&payload);
-                                    let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
-                                        src_ip:   [0; 4],
-                                        src_port: 0,
-                                        data,
-                                    }).await;
-                                } else {
-                                    let mut pkt = heapless::Vec::new();
-                                    let _ = pkt.extend_from_slice(&payload);
-                                    let _ = wg_tx2.send(WgCmd::InboundPacket {
-                                        src_key: *src_key.as_bytes(),
-                                        payload: pkt,
-                                    }).await;
+                            Ok(evt) => match evt {
+                                ControlEvent::MapUpdate(map) => {
+                                    let _ = wg_tx2.send(WgCmd::ApplyMap(map)).await;
+                                }
+                                ControlEvent::OurIpAssigned(ip) => {
+                                    tracing::info!("Tailnet IP: {:?}", ip.0);
+                                }
+                                ControlEvent::KeyExpiry => {
+                                    let _ = ctrl_tx3.send(ControlCmd::Reauth).await;
+                                }
+                                ControlEvent::Error(e) => {
+                                    tracing::error!("Control error: {:?}", e);
                                 }
                             }
-                            DerpEvent::Connected => {
-                                tracing::info!("DERP connected");
-                            }
-                            _ => {}
+                            Err(_) => break,
                         }
                     }
-                    else => break,
+                    evt = derp_ev_rx.recv() => {
+                        match evt {
+                            Ok(evt) => match evt {
+                                DerpEvent::PacketReceived { src_key, payload } => {
+                                    if !payload.is_empty() && payload[0] == 0x6d {
+                                        let mut data = heapless::Vec::new();
+                                        let _ = data.extend_from_slice(&payload);
+                                        let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
+                                            src_ip:   [0; 4],
+                                            src_port: 0,
+                                            data,
+                                        }).await;
+                                    } else {
+                                        let mut pkt = heapless::Vec::new();
+                                        let _ = pkt.extend_from_slice(&payload);
+                                        let _ = wg_tx2.send(WgCmd::InboundPacket {
+                                            src_key: *src_key.as_bytes(),
+                                            payload: pkt,
+                                        }).await;
+                                    }
+                                }
+                                DerpEvent::Connected => {
+                                    tracing::info!("DERP connected");
+                                }
+                                DerpEvent::PingReceived => {}
+                                DerpEvent::Disconnected => {
+                                    tracing::info!("DERP disconnected");
+                                }
+                                DerpEvent::Error(e) => {
+                                    tracing::error!("DERP error: {:?}", e);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
                 }
             }
         };
@@ -351,17 +362,17 @@ impl Runtime {
     #[cfg(not(target_os = "espidf"))]
     #[deprecated(note = "Use Runtime::join for ESP32-C3 to avoid task heap allocations")]
     pub async fn spawn(config: RuntimeConfig) -> Self {
-        let (ctrl_tx,  ctrl_rx)  = mpsc::channel::<ControlCmd>(CHAN_CAP);
-        let (ctrl_ev_tx, mut ctrl_ev_rx) = mpsc::channel::<ControlEvent>(CHAN_CAP);
+        let (ctrl_tx,  ctrl_rx)  = async_channel::bounded::<ControlCmd>(CHAN_CAP);
+        let (ctrl_ev_tx, mut ctrl_ev_rx) = async_channel::bounded::<ControlEvent>(CHAN_CAP);
 
-        let (derp_tx,  derp_rx)  = mpsc::channel::<DerpCmd>(CHAN_CAP);
-        let (derp_ev_tx, mut derp_ev_rx) = mpsc::channel::<DerpEvent>(CHAN_CAP);
+        let (derp_tx,  derp_rx)  = async_channel::bounded::<DerpCmd>(CHAN_CAP);
+        let (derp_ev_tx, mut derp_ev_rx) = async_channel::bounded::<DerpEvent>(CHAN_CAP);
 
-        let (disco_tx, disco_rx) = mpsc::channel::<DiscoCmd>(CHAN_CAP);
-        let (_disco_ev_tx, mut _disco_ev_rx) = mpsc::channel::<DiscoEvent>(CHAN_CAP);
+        let (disco_tx, disco_rx) = async_channel::bounded::<DiscoCmd>(CHAN_CAP);
+        let (_disco_ev_tx, mut _disco_ev_rx) = async_channel::bounded::<DiscoEvent>(CHAN_CAP);
 
-        let (wg_tx,    wg_rx)    = mpsc::channel::<WgCmd>(CHAN_CAP);
-        let (_wg_ev_tx, mut _wg_ev_rx) = mpsc::channel::<WgEvent>(CHAN_CAP);
+        let (wg_tx,    wg_rx)    = async_channel::bounded::<WgCmd>(CHAN_CAP);
+        let (_wg_ev_tx, mut _wg_ev_rx) = async_channel::bounded::<WgEvent>(CHAN_CAP);
 
         // ── Spawn actors ──────────────────────────────────────────────────────
 
@@ -397,7 +408,7 @@ impl Runtime {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    Some(evt) = ctrl_ev_rx.recv() => {
+                    evt = ctrl_ev_rx.recv() => {
                         match evt {
                             ControlEvent::MapUpdate(map) => {
                                 // Update WireGuard peers
@@ -415,7 +426,7 @@ impl Runtime {
                             }
                         }
                     }
-                    Some(evt) = derp_ev_rx.recv() => {
+                    evt = derp_ev_rx.recv() => {
                         match evt {
                             DerpEvent::PacketReceived { src_key, payload } => {
                                 // Distinguish DISCO vs WireGuard by first byte
@@ -444,7 +455,7 @@ impl Runtime {
                             _ => {}
                         }
                     }
-                    else => break,
+                    Err(_) => break,
                 }
             }
         });

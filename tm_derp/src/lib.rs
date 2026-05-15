@@ -18,7 +18,7 @@
 
 use arrayvec::ArrayVec;
 use tm_keys::NodePublicKey;
-use tokio::sync::mpsc;
+use async_channel;
 
 // ── DERP frame types (from Tailscale DERP spec) ───────────────────────────────
 
@@ -150,19 +150,19 @@ impl DerpActor {
 
     pub async fn run(
         self,
-        mut cmds:  mpsc::Receiver<DerpCmd>,
-        events:    mpsc::Sender<DerpEvent>,
+        mut cmds:  async_channel::Receiver<DerpCmd>,
+        events:    async_channel::Sender<DerpEvent>,
     ) {
         loop {
             match cmds.recv().await {
-                Some(DerpCmd::Connect { host, port, cert_fingerprint }) => {
+                Ok(DerpCmd::Connect { host, port, cert_fingerprint }) => {
                     let _ = self.run_connection(
                         &host, port, cert_fingerprint, &mut cmds, &events,
                     ).await;
                     let _ = events.send(DerpEvent::Disconnected).await;
                 }
-                Some(DerpCmd::Shutdown) | None => break,
-                _ => {}
+                Ok(DerpCmd::Shutdown) | Err(_) => break,
+                Ok(_) => {}
             }
         }
     }
@@ -172,8 +172,8 @@ impl DerpActor {
         host:             &str,
         port:             u16,
         fingerprint:      Option<[u8; 32]>,
-        cmds:             &mut mpsc::Receiver<DerpCmd>,
-        events:           &mpsc::Sender<DerpEvent>,
+        cmds:             &mut async_channel::Receiver<DerpCmd>,
+        events:           &async_channel::Sender<DerpEvent>,
     ) -> Result<(), DerpError> {
         // Platform TLS connection injected here.
         // On host: tokio + rustls/native-tls
@@ -194,11 +194,11 @@ impl DerpActor {
             tokio::select! {
                 cmd = cmds.recv() => {
                     match cmd {
-                        Some(DerpCmd::SendPacket { dst_key, payload }) => {
+                        Ok(DerpCmd::SendPacket { dst_key, payload }) => {
                             // self.send_packet(stream, &dst_key, &payload).await?;
                         }
-                        Some(DerpCmd::Disconnect) | None => return Ok(()),
-                        _ => {}
+                        Ok(DerpCmd::Disconnect) | Err(_) => return Ok(()),
+                        Ok(_) => {}
                     }
                 }
                 // recv = self.recv_frame(stream) => {

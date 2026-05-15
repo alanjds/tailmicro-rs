@@ -16,7 +16,7 @@
 use arrayvec::ArrayVec;
 use tm_control::{MapState, PeerInfo, TailnetIp};
 use tm_keys::NodePublicKey;
-use tokio::sync::mpsc;
+use async_channel;
 
 pub const MAX_PEERS: usize = 8;
 
@@ -121,20 +121,20 @@ impl WgActor {
 
     pub async fn run(
         mut self,
-        mut cmds:  mpsc::Receiver<WgCmd>,
-        events:    mpsc::Sender<WgEvent>,
+        mut cmds:  async_channel::Receiver<WgCmd>,
+        events:    async_channel::Sender<WgEvent>,
     ) {
         loop {
             match cmds.recv().await {
-                Some(WgCmd::ApplyMap(map)) => {
+                Ok(WgCmd::ApplyMap(map)) => {
                     self.apply_map(&map);
                 }
-                Some(WgCmd::InboundPacket { src_key, payload }) => {
+                Ok(WgCmd::InboundPacket { src_key, payload }) => {
                     // Route to wireguard-lwip (lwIP handles the actual packet)
                     // wireguard-lwip injects the decrypted packet into lwIP's
                     // packet processing pipeline directly.
                 }
-                Some(WgCmd::Shutdown) | None => break,
+                Ok(WgCmd::Shutdown) | Err(_) => break,
             }
         }
     }

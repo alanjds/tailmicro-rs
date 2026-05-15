@@ -8,5 +8,6 @@ tm_keys.workspace = true
 heapless  = { workspace = true }
 arrayvec  = { workspace = true }
 tokio     = { workspace = true, features = ["sync"] }
+async-channel = { workspace = true }
 tracing   = { workspace = true }
 thiserror = { workspace = true }

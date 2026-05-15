@@ -10,3 +10,4 @@ x25519-dalek        = { version = "2", default-features = false }
 heapless            = { workspace = true }
 arrayvec            = { workspace = true }
 tokio               = { workspace = true, features = ["sync"] }
+async-channel = { workspace = true }

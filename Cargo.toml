@@ -65,7 +65,7 @@ esp-idf-svc = { version = "0.51.0", default-features = false, features = ["exper
 esp-idf-hal   = { version = "0.45.0", default-features = false }
 esp-idf-sys   = { version = "0.36.0", default-features = false }
 embedded-svc  = { version = "0.28.0", default-features = false }
-crossbeam-channel = { version = "0.5.15" }
+async-channel = { version = "2" }
 
 # Local crates
 tailmicro    = { path = "." }

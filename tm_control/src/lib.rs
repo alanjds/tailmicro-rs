@@ -164,24 +164,24 @@ impl ControlActor {
         Self { config, node_state }
     }
 
-    pub async fn run(mut self, mut cmds: tokio::sync::mpsc::Receiver<ControlCmd>,
-                     events: tokio::sync::mpsc::Sender<ControlEvent>) {
+    pub async fn run(mut self, mut cmds: async_channel::Receiver<ControlCmd>,
+                     events: async_channel::Sender<ControlEvent>) {
         loop {
             match cmds.recv().await {
-                Some(ControlCmd::Start { ref auth_key }) => {
+                Ok(ControlCmd::Start { ref auth_key }) => {
                     if let Err(e) = self.connect_and_poll(auth_key.as_str(), &events).await {
                         tracing::error!("Control error: {:?}", e);
                         let _ = events.send(ControlEvent::Error(e)).await;
                     }
                 }
-                Some(ControlCmd::Shutdown) | None => break,
-                _ => {}
+                Ok(ControlCmd::Shutdown) | Err(_) => break,
+                Ok(_) => {}
             }
         }
     }
 
     async fn connect_and_poll(&mut self, auth_key: &str,
-                               events: &tokio::sync::mpsc::Sender<ControlEvent>)
+                               events: &async_channel::Sender<ControlEvent>)
         -> Result<(), ControlError>
     {
         let host = self.config.control_host;
@@ -246,7 +246,7 @@ impl ControlActor {
 
     async fn stream_map_response<S: IoStream>(
         &self, stream: &mut S, noise: &mut NoiseChannel,
-        h2: &mut H2State, events: &tokio::sync::mpsc::Sender<ControlEvent>,
+        h2: &mut H2State, events: &async_channel::Sender<ControlEvent>,
     ) -> Result<(), ControlError> {
         let mut frame_buf: heapless::Vec<u8, 4105> = heapless::Vec::new();
         let mut parser: MapParser<8, 4> = MapParser::new();

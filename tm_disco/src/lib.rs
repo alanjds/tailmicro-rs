@@ -100,23 +100,23 @@ impl DiscoActor {
 
     pub async fn run(
         mut self,
-        mut cmds:  tokio::sync::mpsc::Receiver<DiscoCmd>,
-        events:    tokio::sync::mpsc::Sender<DiscoEvent>,
+        mut cmds:  async_channel::Receiver<DiscoCmd>,
+        events:    async_channel::Sender<DiscoEvent>,
     ) {
         loop {
             match cmds.recv().await {
-                Some(DiscoCmd::MaybeDisco { src_ip, src_port, data }) => {
+                Ok(DiscoCmd::MaybeDisco { src_ip, src_port, data }) => {
                     if let Some(evt) = self.process(&src_ip, src_port, &data) {
                         let _ = events.send(evt).await;
                     }
                 }
-                Some(DiscoCmd::AllowPeer(key)) => {
+                Ok(DiscoCmd::AllowPeer(key)) => {
                     self.add_peer(key);
                 }
-                Some(DiscoCmd::RemovePeer(key)) => {
+                Ok(DiscoCmd::RemovePeer(key)) => {
                     self.remove_peer(&key);
                 }
-                Some(DiscoCmd::Shutdown) | None => break,
+                Ok(DiscoCmd::Shutdown) | Err(_) => break,
             }
         }
     }

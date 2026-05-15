@@ -9,4 +9,5 @@ tm_control.workspace = true
 arrayvec  = { workspace = true }
 heapless  = { workspace = true }
 tokio     = { workspace = true, features = ["sync"] }
+async-channel.workspace = true
 tracing   = { workspace = true }
