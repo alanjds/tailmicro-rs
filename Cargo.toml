@@ -104,6 +104,7 @@ esp-idf-svc = { workspace = true }
 esp-idf-hal = { workspace = true }
 esp-idf-sys = { workspace = true }
 embedded-svc = { workspace = true }
+async-channel = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time", "net"] }

@@ -214,7 +214,7 @@ impl NoiseChannel {
         host:        &str,
         cap_version: u16,
     ) -> Result<NoiseChannel, ControlError> {
-        tracing::info!("do_noise_handshake() - starting Noise IK handshake with {}", host);
+        tracing::debug!("do_noise_handshake() - starting Noise IK handshake with {}", host);
 
         // ── Step 1: Build Noise init message ──────────────────────────────────────
 

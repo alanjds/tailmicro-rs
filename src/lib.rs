@@ -60,6 +60,7 @@ use std::time::Duration;
 pub use config::Config;
 pub use error::Error;
 pub use tm_keys::NodeState;
+pub use tm_runtime::{freertos_yield, OurIpReceiver, OurIpSender};
 
 pub mod config;
 mod error;
@@ -70,7 +71,7 @@ use esp_idf_svc::tls::{EspTls, InternalSocket};
 /// Mirrors `tailscale::Device` exactly.
 pub struct Device {
     runtime: tm_runtime::Runtime,
-    our_ip:  std::sync::Arc<tokio::sync::RwLock<Option<Ipv4Addr>>>,
+    our_ip_rx: Option<tm_runtime::OurIpReceiver>,
 }
 
 impl Device {
@@ -96,10 +97,13 @@ impl Device {
     /// avoiding memory fragmentation. The TLS instance should be created early (e.g., in wifi.rs)
     /// and passed to this function.
     pub async fn new_with_tls(config: &Config, auth_key: Option<String>, cached_tls: Option<EspTls<InternalSocket>>) -> Result<Self, Error> {
-        tracing::info!("Device::new_with_tls() - starting device initialization");
+        tracing::debug!("Device::new_with_tls() - starting device initialization");
         
         let node_state = config.load_or_generate_keys().await?;
         tracing::debug!("Device::new_with_tls() - keys loaded, node_state generated");
+
+        // Create channel for receiving the IP address
+        let (our_ip_tx, our_ip_rx) = async_channel::bounded::<Ipv4Addr>(1);
 
         let rt_config = tm_runtime::RuntimeConfig {
             control:       config.control_config(),
@@ -111,21 +115,27 @@ impl Device {
             priority_peer: None,
             #[cfg(target_os = "espidf")]
             cached_tls,
+            #[cfg(target_os = "espidf")]
+            our_ip_tx: Some(our_ip_tx),
         };
 
         let runtime = tm_runtime::Runtime::join(rt_config).await;
-        let our_ip  = std::sync::Arc::new(tokio::sync::RwLock::new(None));
 
-        Ok(Self { runtime, our_ip })
+        Ok(Self { runtime, our_ip_rx: Some(our_ip_rx) })
     }
 
     /// Get this device's IPv4 tailnet address.
     ///
     /// Waits until the control plane assigns one (up to ~30 s on first boot).
     pub async fn ipv4_addr(&self) -> Result<Ipv4Addr, Error> {
-        // In the real implementation, this would wait on a oneshot channel
-        // populated by the ControlEvent::OurIpAssigned handler in tm_runtime.
-        self.our_ip.read().await.ok_or(Error::NotConnected)
+        // Wait for the IP to be assigned by the control plane
+        // Timeout after 30 seconds to avoid hanging forever
+        let our_ip_rx = self.our_ip_rx.as_ref().ok_or(Error::NotConnected)?;
+        match tokio::time::timeout(std::time::Duration::from_secs(30), our_ip_rx.recv()).await {
+            Ok(Ok(ip)) => Ok(ip),
+            Ok(Err(_)) => Err(Error::NotConnected), // Channel closed
+            Err(_) => Err(Error::NotConnected), // Timeout
+        }
     }
 
     /// Bind a UDP socket to `addr` on the tailnet.

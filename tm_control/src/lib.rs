@@ -15,6 +15,7 @@ pub mod map_parser;
 
 use arrayvec::ArrayVec;
 use serde::{Deserialize, Serialize};
+use log::info;
 use tm_h2::{
     FrameAction, FrameHeader, H2Error, H2State, MAX_FRAME_SIZE,
     write_settings, write_settings_ack, write_window_update,
@@ -184,13 +185,18 @@ impl ControlActor {
                                events: &async_channel::Sender<ControlEvent>)
         -> Result<(), ControlError>
     {
+        info!("Tailscale connect_and_poll starting");
         let host = self.config.control_host;
         let port = self.config.control_port;
+        info!("Tailscale connecting to {}:{}", host, port);
 
         // Step 1 & 2: fetch server Noise key over HTTPS
+        info!("Tailscale Step 1: fetching server Noise key");
         // Use the cached TLS if available
         let mut key_conn = self.open_tls(host, port).await?;
+        info!("Tailscale Step 1: TLS connection established");
         let server_noise_key = fetch_server_key(&mut key_conn, host, CAPABILITY_VERSION).await?;
+        info!("Tailscale Step 1: server Noise key received");
         drop(key_conn);
 
         // Step 3 & 4: open long-lived connection + Noise IK
@@ -198,12 +204,15 @@ impl ControlActor {
         // For ESP32-C3 with TLS caching, we need to handle this differently:
         // Either we create a new TLS for each connection, or we need to cache
         // multiple TLS instances.
+        info!("Tailscale Step 2: opening main connection");
         let mut main_conn = self.open_tls(host, port).await?;
+        info!("Tailscale Step 2: main TLS connection established");
+        info!("Tailscale Step 3: doing Noise IK handshake");
         let mut noise = do_noise_handshake(
             &mut main_conn, &self.node_state.machine_key, &server_noise_key,
             host, CAPABILITY_VERSION,
         ).await?;
-        tracing::info!("Noise IK handshake complete");
+        info!("Tailscale Step 3: Noise IK handshake complete");
 
         // Step 5: H/2 preface + SETTINGS
         noise.write_all(&mut main_conn, CLIENT_PREFACE).await?;
@@ -220,17 +229,19 @@ impl ControlActor {
             hostinfo: HostInfo { os: "embedded", hostname: "esp32c3" },
         }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
 
+        info!("Tailscale Step 4: registering node");
         let reg_req = build_h2_post("/machine/register", host, 1, &reg_body);
         noise.write_all(&mut main_conn, &reg_req).await?;
 
         let mut h2 = H2State::new();
+        info!("Tailscale Step 4: reading registration response");
         let reg_bytes = read_one_h2_body(&mut main_conn, &mut noise, &mut h2).await?;
         let reg: RegisterResponse = serde_json::from_slice(&reg_bytes)
             .map_err(|_| ControlError::Json(JsonError::ParseError))?;
 
         if reg.node_key_expired { return Err(ControlError::RegistrationFailed); }
         if let Some(url) = &reg.auth_url { tracing::warn!("Auth URL: {}", url); }
-        tracing::info!("Registered. Authorized: {}", reg.machine_authorized);
+        info!("Tailscale Step 4: registration complete, node_key_expired={}, machine_authorized={}", reg.node_key_expired, reg.machine_authorized);
 
         // Step 8 & 9: MapRequest + streaming response
         let map_body = serde_json::to_vec(&MapRequest {
@@ -248,6 +259,7 @@ impl ControlActor {
         &self, stream: &mut S, noise: &mut NoiseChannel,
         h2: &mut H2State, events: &async_channel::Sender<ControlEvent>,
     ) -> Result<(), ControlError> {
+        info!("Tailscale stream_map_response starting");
         let mut frame_buf: heapless::Vec<u8, 4105> = heapless::Vec::new();
         let mut parser: MapParser<8, 4> = MapParser::new();
         let mut our_ip_sent = false;
@@ -263,10 +275,13 @@ impl ControlActor {
             let blen = hdr.length as usize;
             frame_buf.resize(blen, 0);
             noise.read_exact(stream, &mut frame_buf[..blen]).await?;
+            info!("Tailscale frame received: length={}, type={}", hdr.length, hdr.frame_type);
 
             match tm_h2::parse_frame(&hdr, &frame_buf[..blen], h2)? {
                 FrameAction::Data { payload, end_stream } => {
+                    info!("Tailscale Data frame: payload_len={}, end_stream={}", payload.len(), end_stream);
                     let done = parser.feed(payload).map_err(ControlError::Json)?;
+                    info!("Tailscale parser.feed done={}", done);
 
                     // Proactive WINDOW_UPDATE (MicroLink technique)
                     let (cwu, swu) = h2.consumed(payload.len() as u32);
@@ -274,14 +289,21 @@ impl ControlActor {
                     if swu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,1,swu); noise.write_all(stream,&b).await?; }
 
                     if done || end_stream {
+                        info!("Tailscale parser.finish called, our_ip_sent={}", our_ip_sent);
                         parser.finish();
                         if !our_ip_sent && parser.out.our_ip.0 != [0u8;4] {
                             our_ip_sent = true;
+                            info!("Tailscale OurIpAssigned event sent: {}.{}.{}.{}", parser.out.our_ip.0[0], parser.out.our_ip.0[1], parser.out.our_ip.0[2], parser.out.our_ip.0[3]);
                             let _ = events.send(ControlEvent::OurIpAssigned(parser.out.our_ip.clone())).await;
+                        } else if our_ip_sent {
+                            info!("Tailscale IP already sent");
+                        } else {
+                            info!("Tailscale IP not assigned yet: {}.{}.{}.{}", parser.out.our_ip.0[0], parser.out.our_ip.0[1], parser.out.our_ip.0[2], parser.out.our_ip.0[3]);
                         }
                         let old = core::mem::replace(&mut parser, MapParser::new());
+                        info!("Tailscale MapUpdate event sent");
                         let _ = events.send(ControlEvent::MapUpdate(old.out)).await;
-                        if end_stream { return Ok(()); }
+                        if end_stream { info!("Tailscale stream ended"); return Ok(()); }
                     }
                 }
                 FrameAction::SendSettingsAck => {

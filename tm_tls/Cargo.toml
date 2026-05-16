@@ -32,8 +32,8 @@ sha2 = { version = "0.10", default-features = false }     # fingerprint
 tokio = { version = "1", default-features = false, features = ["io-util", "net"] }
 
 # mbedtls backend (ESP32-C3)
-esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc", rev = "dd794331a3c", optional = true }
-esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys", rev = "2749423ff0", optional = true }
+esp-idf-svc = { workspace = true, optional = true }
+esp-idf-sys = { workspace = true, optional = true }
 
 # rustls backend (host)
 tokio-rustls = { version = "0.26", optional = true }
@@ -43,6 +43,6 @@ webpki-roots = { version = "0.26", optional = true }
 [build-dependencies]
 # nothing needed — feature enforcement is in build.rs
 
-[[example]]
-name = "tls_connect"
-required-features = ["rustls"]
+# [[example]]
+# name = "tls_connect"
+# required-features = ["rustls"]
