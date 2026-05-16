@@ -36,8 +36,9 @@ use async_channel;
 /// FreeRTOS yield function for ESP32-C3 watchdog servicing.
 /// Calls `vTaskDelay(50)` to yield the CPU and service the watchdog timer.
 #[cfg(target_os = "espidf")]
-pub fn freertos_yield() {
+pub async fn tokio_freertos_yield() {
     unsafe { esp_idf_sys::vTaskDelay(50) };
+    tokio::task::yield_now().await;
 }
 
 #[cfg(target_os = "espidf")]
@@ -67,8 +68,6 @@ pub struct RuntimeConfig {
     /// Cached TLS instance for reuse (ESP32-C3 only).
     #[cfg(target_os = "espidf")]
     pub cached_tls:    Option<EspTls<InternalSocket>>,
-    /// Channel to receive the assigned Tailnet IP address.
-    #[cfg(target_os = "espidf")]
     pub our_ip_tx:     Option<OurIpSender>,
 }
 
@@ -102,12 +101,10 @@ impl Runtime {
             }
         }
         
+        tokio_freertos_yield().await;
         tracing::debug!("Runtime::join() - allocating ControlCmd channel");
-        #[cfg(target_os = "espidf")]
-        freertos_yield();
         let (ctrl_tx,  ctrl_rx)  = async_channel::bounded::<ControlCmd>(CHAN_CAP);
-        #[cfg(target_os = "espidf")]
-        freertos_yield();
+        tokio_freertos_yield().await;
         
         #[cfg(target_os = "espidf")]
         {
@@ -120,8 +117,7 @@ impl Runtime {
         }
         tracing::debug!("Runtime::join() - allocating ControlEvent channel");
         let (ctrl_ev_tx, mut ctrl_ev_rx) = async_channel::bounded::<ControlEvent>(CHAN_CAP);
-        #[cfg(target_os = "espidf")]
-        freertos_yield();
+        tokio_freertos_yield().await;
 
         #[cfg(target_os = "espidf")]
         {
@@ -135,8 +131,7 @@ impl Runtime {
 
         tracing::debug!("Runtime::join() - allocating DerpCmd channel");
         let (derp_tx,  derp_rx)  = async_channel::bounded::<DerpCmd>(CHAN_CAP);
-        #[cfg(target_os = "espidf")]
-        freertos_yield();
+        tokio_freertos_yield().await;
 
         #[cfg(target_os = "espidf")]
         {
@@ -150,8 +145,7 @@ impl Runtime {
 
         tracing::debug!("Runtime::join() - allocating DerpEvent channel");
         let (derp_ev_tx, mut derp_ev_rx) = async_channel::bounded::<DerpEvent>(CHAN_CAP);
-        #[cfg(target_os = "espidf")]
-        freertos_yield();
+        tokio_freertos_yield().await;
 
         #[cfg(target_os = "espidf")]
         {
@@ -165,8 +159,7 @@ impl Runtime {
 
         tracing::debug!("Runtime::join() - allocating DiscoCmd channel");
         let (disco_tx, disco_rx) = async_channel::bounded::<DiscoCmd>(CHAN_CAP);
-        #[cfg(target_os = "espidf")]
-        freertos_yield();
+        tokio_freertos_yield().await;
 
         #[cfg(target_os = "espidf")]
         {
@@ -180,8 +173,7 @@ impl Runtime {
 
         tracing::debug!("Runtime::join() - allocating DiscoEvent channel");
         let (_disco_ev_tx, mut _disco_ev_rx) = async_channel::bounded::<DiscoEvent>(CHAN_CAP);
-        #[cfg(target_os = "espidf")]
-        freertos_yield();
+        tokio_freertos_yield().await;
 
         #[cfg(target_os = "espidf")]
         {
@@ -195,8 +187,7 @@ impl Runtime {
 
         tracing::debug!("Runtime::join() - allocating WgCmd channel");
         let (wg_tx,    wg_rx)    = async_channel::bounded::<WgCmd>(CHAN_CAP);
-        #[cfg(target_os = "espidf")]
-        freertos_yield();
+        tokio_freertos_yield().await;
 
         #[cfg(target_os = "espidf")]
         {
@@ -210,8 +201,7 @@ impl Runtime {
 
         tracing::debug!("Runtime::join() - allocating WgEvent channel");
         let (_wg_ev_tx, mut _wg_ev_rx) = async_channel::bounded::<WgEvent>(CHAN_CAP);
-        #[cfg(target_os = "espidf")]
-        freertos_yield();
+        tokio_freertos_yield().await;
 
         #[cfg(target_os = "espidf")]
         {
@@ -247,6 +237,10 @@ impl Runtime {
             tracing::debug!("Runtime::join() - ControlActor: no cached TLS");
             ControlActor::new(config.control, config.node_state)
         };
+
+        #[cfg(not(target_os = "espidf"))]
+        let control_actor = ControlActor::new(config.control, config.node_state);
+
         
         #[cfg(target_os = "espidf")]
         {
@@ -257,9 +251,6 @@ impl Runtime {
                 tracing::debug!("Runtime::join() - heap after ControlActor: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
             }
         }
-
-        #[cfg(not(target_os = "espidf"))]
-        let control_actor = ControlActor::new(config.control, config.node_state);
 
         tracing::debug!("Runtime::join() - creating DerpActor");
         let derp_actor = DerpActor::new(our_pub);
@@ -312,7 +303,7 @@ impl Runtime {
             info!("Runtime::join() - event_router task started");
             loop {
                 #[cfg(target_os = "espidf")]
-                freertos_yield();
+                tokio_freertos_yield().await;
                 tokio::select! {
                     evt = ctrl_ev_rx.recv() => {
                         match evt {
@@ -326,14 +317,14 @@ impl Runtime {
                                     #[cfg(target_os = "espidf")]
                                     if let Some(ref tx) = config.our_ip_tx {
                                         #[cfg(target_os = "espidf")]
-                                        freertos_yield();
+                                        tokio_freertos_yield().await;
                                         let _ = tx.send(ip.to_ipv4()).await;
                                     }
                                 }
                                 ControlEvent::KeyExpiry => {
                                     let _ = ctrl_tx3.send(ControlCmd::Reauth).await;
                                     #[cfg(target_os = "espidf")]
-                                    freertos_yield();
+                                    tokio_freertos_yield().await;
                                 }
                                 ControlEvent::Error(e) => {
                                     error!("Runtime::join() - received ControlEvent::Error: {:?}", e);
@@ -358,7 +349,7 @@ impl Runtime {
                                             data,
                                         }).await;
                                         #[cfg(target_os = "espidf")]
-                                        freertos_yield();
+                                        tokio_freertos_yield().await;
                                     } else {
                                         let mut pkt = heapless::Vec::new();
                                         let _ = pkt.extend_from_slice(&payload);
@@ -367,7 +358,7 @@ impl Runtime {
                                             payload: pkt,
                                         }).await;
                                         #[cfg(target_os = "espidf")]
-                                        freertos_yield();
+                                        tokio_freertos_yield().await;
                                     }
                                 }
                                 DerpEvent::Connected => {
@@ -394,23 +385,23 @@ impl Runtime {
 
         tracing::debug!("Runtime::join() - preparing actor tasks");
         #[cfg(target_os = "espidf")]
-        freertos_yield();
+        tokio_freertos_yield().await;
         
         let control_task = control_actor.run(ctrl_rx, ctrl_ev_tx);
         #[cfg(target_os = "espidf")]
-        freertos_yield();
+        tokio_freertos_yield().await;
         
         let derp_task = derp_actor.run(derp_rx, derp_ev_tx);
         #[cfg(target_os = "espidf")]
-        freertos_yield();
+        tokio_freertos_yield().await;
         
         let disco_task = disco_actor.run(disco_rx, _disco_ev_tx);
         #[cfg(target_os = "espidf")]
-        freertos_yield();
+        tokio_freertos_yield().await;
         
         let wg_task = wg_actor.run(wg_rx, _wg_ev_tx);
         #[cfg(target_os = "espidf")]
-        freertos_yield();
+        tokio_freertos_yield().await;
         
         #[cfg(target_os = "espidf")]
         {
@@ -424,10 +415,10 @@ impl Runtime {
 
         tracing::debug!("Runtime::join() - sending ControlCmd::Start");
         #[cfg(target_os = "espidf")]
-        freertos_yield();
+        tokio_freertos_yield().await;
         let _ = ctrl_tx4.send(ControlCmd::Start { auth_key: config.auth_key.clone() }).await;
         #[cfg(target_os = "espidf")]
-        freertos_yield();
+        tokio_freertos_yield().await;
 
         tracing::debug!("Runtime::join() - joining actor tasks with tokio::join!");
         // Run all actors together. The event_router loop runs indefinitely until a channel error occurs.

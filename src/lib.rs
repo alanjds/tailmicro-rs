@@ -60,7 +60,7 @@ use std::time::Duration;
 pub use config::Config;
 pub use error::Error;
 pub use tm_keys::NodeState;
-pub use tm_runtime::{freertos_yield, OurIpReceiver, OurIpSender};
+pub use tm_runtime::{tokio_freertos_yield, OurIpReceiver, OurIpSender};
 
 pub mod config;
 mod error;
