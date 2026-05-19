@@ -435,12 +435,9 @@ impl Runtime {
         Runtime { control_tx: ctrl_tx, derp_tx, disco_tx, wg_tx }
     }
 
-    /// Deprecated: use Runtime::join instead for ESP32-C3.
-    ///
-    /// This method uses tokio::spawn which allocates heap for each task.
-    /// For memory-constrained ESP32-C3, use Runtime::join instead.
+    /// Use tokio::spawn to run actors in separate tasks.
+    /// This is the recommended method for ESP32-C3 when Runtime::join causes memory issues.
     #[cfg(not(target_os = "espidf"))]
-    #[deprecated(note = "Use Runtime::join for ESP32-C3 to avoid task heap allocations")]
     pub async fn spawn(config: RuntimeConfig) -> Self {
         let (ctrl_tx,  ctrl_rx)  = async_channel::bounded::<ControlCmd>(CHAN_CAP);
         let (ctrl_ev_tx, mut ctrl_ev_rx) = async_channel::bounded::<ControlEvent>(CHAN_CAP);
@@ -490,52 +487,69 @@ impl Runtime {
                 tokio::select! {
                     evt = ctrl_ev_rx.recv() => {
                         match evt {
-                            ControlEvent::MapUpdate(map) => {
-                                // Update WireGuard peers
-                                let _ = wg_tx2.send(WgCmd::ApplyMap(map)).await;
-                                // TODO: update DERP preferred region
+                            Ok(evt) => match evt {
+                                ControlEvent::MapUpdate(map) => {
+                                    // Update WireGuard peers
+                                    let _ = wg_tx2.send(WgCmd::ApplyMap(map)).await;
+                                    // TODO: update DERP preferred region
+                                }
+                                ControlEvent::OurIpAssigned(ip) => {
+                                    tracing::debug!("Tailnet IP: {:?}", ip.0);
+                                }
+                                ControlEvent::KeyExpiry => {
+                                    let _ = ctrl_tx3.send(ControlCmd::Reauth).await; // trigger reauth
+                                }
+                                ControlEvent::Error(e) => {
+                                    tracing::error!("Control error: {:?}", e);
+                                }
                             }
-                            ControlEvent::OurIpAssigned(ip) => {
-                                tracing::debug!("Tailnet IP: {:?}", ip.0);
-                            }
-                            ControlEvent::KeyExpiry => {
-                                let _ = ctrl_tx3.send(ControlCmd::Reauth).await; // trigger reauth
-                            }
-                            ControlEvent::Error(e) => {
-                                tracing::error!("Control error: {:?}", e);
+                            Err(_) => {
+                                tracing::debug!("Control event channel closed, breaking");
+                                break;
                             }
                         }
                     }
                     evt = derp_ev_rx.recv() => {
                         match evt {
-                            DerpEvent::PacketReceived { src_key, payload } => {
-                                // Distinguish DISCO vs WireGuard by first byte
-                                if !payload.is_empty() && payload[0] == 0x6d {
-                                    // DISCO magic prefix (simplified check)
-                                    let mut data = heapless::Vec::new();
-                                    let _ = data.extend_from_slice(&payload);
-                                    let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
-                                        src_ip:   [0; 4],  // from DERP src
-                                        src_port: 0,
-                                        data,
-                                    }).await;
-                                } else {
-                                    // WireGuard packet
-                                    let mut pkt = heapless::Vec::new();
-                                    let _ = pkt.extend_from_slice(&payload);
-                                    let _ = wg_tx2.send(WgCmd::InboundPacket {
-                                        src_key: *src_key.as_bytes(),
-                                        payload: pkt,
-                                    }).await;
+                            Ok(evt) => match evt {
+                                DerpEvent::PacketReceived { src_key, payload } => {
+                                    // Distinguish DISCO vs WireGuard by first byte
+                                    if !payload.is_empty() && payload[0] == 0x6d {
+                                        // DISCO magic prefix (simplified check)
+                                        let mut data = heapless::Vec::new();
+                                        let _ = data.extend_from_slice(&payload);
+                                        let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
+                                            src_ip:   [0; 4],  // from DERP src
+                                            src_port: 0,
+                                            data,
+                                        }).await;
+                                    } else {
+                                        // WireGuard packet
+                                        let mut pkt = heapless::Vec::new();
+                                        let _ = pkt.extend_from_slice(&payload);
+                                        let _ = wg_tx2.send(WgCmd::InboundPacket {
+                                            src_key: *src_key.as_bytes(),
+                                            payload: pkt,
+                                        }).await;
+                                    }
+                                }
+                                DerpEvent::Connected => {
+                                    tracing::debug!("DERP connected");
+                                }
+                                DerpEvent::PingReceived => {}
+                                DerpEvent::Disconnected => {
+                                    tracing::debug!("DERP disconnected");
+                                }
+                                DerpEvent::Error(e) => {
+                                    tracing::error!("DERP error: {:?}", e);
                                 }
                             }
-                            DerpEvent::Connected => {
-                                tracing::debug!("DERP connected");
+                            Err(_) => {
+                                tracing::debug!("DERP event channel closed, breaking");
+                                break;
                             }
-                            _ => {}
                         }
                     }
-                    Err(_) => break,
                 }
             }
         });

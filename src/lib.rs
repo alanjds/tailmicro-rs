@@ -119,7 +119,11 @@ impl Device {
             our_ip_tx: Some(our_ip_tx),
         };
 
+        #[cfg(target_os = "espidf")]
         let runtime = tm_runtime::Runtime::join(rt_config).await;
+
+        #[cfg(not(target_os = "espidf"))]
+        let runtime = tm_runtime::Runtime::spawn(rt_config).await;
 
         Ok(Self { runtime, our_ip_rx: Some(our_ip_rx) })
     }

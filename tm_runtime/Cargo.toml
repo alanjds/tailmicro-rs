@@ -12,7 +12,7 @@ tm_keys.workspace    = true
 heapless  = { workspace = true }
 async-channel.workspace = true
 log.workspace = true
-esp-idf-svc = { version = "0.51", features = [] }
-esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys", rev = "2749423ff0" }
+esp-idf-svc = { workspace = true }
+esp-idf-sys = { workspace = true }
 tokio     = { workspace = true, features = ["sync", "rt", "macros"] }
 tracing   = { workspace = true }

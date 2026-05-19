@@ -22,6 +22,7 @@ repository = "https://github.com/your-org/tailmicro-rs"
 # ── Patched dependencies (override to match tasmolike-rs) ─────────────────────
 [patch.crates-io]
 esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc", rev = "dd794331a3c" }
+esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys", rev = "2749423ff0" }
 esp-idf-hal = { git = "https://github.com/esp-rs/esp-idf-hal", rev = "69371e75be" }
 
 # ── Shared dependency versions ────────────────────────────────────────────────
@@ -60,10 +61,12 @@ tracing = { version = "0.1", default-features = false, features = ["std", "log"]
 # log crate for direct logging (bypasses tracing-log bridge issues)
 log = { version = "0.4", default-features = false }
 
-# ESP-IDF specific (overridden via patch to match tasmolike-rs)
-esp-idf-svc = { version = "0.51.0", default-features = false, features = ["experimental", "std"] }
-esp-idf-hal   = { version = "0.45.0", default-features = false }
-esp-idf-sys   = { version = "0.36.0", default-features = false }
+# ESP-IDF specific
+# Note: These are also in patch.crates-io below, which ensures crates.io versions
+# resolve to the same git versions. Both are needed for proper dependency resolution.
+esp-idf-svc = { version = "0.51", git = "https://github.com/esp-rs/esp-idf-svc", rev = "dd794331a3c", default-features = false, features = ["experimental", "std"] }
+esp-idf-hal   = { version = "0.45", git = "https://github.com/esp-rs/esp-idf-hal", rev = "69371e75be", default-features = false }
+esp-idf-sys   = { version = "0.36", git = "https://github.com/esp-rs/esp-idf-sys", rev = "2749423ff0", default-features = false }
 embedded-svc  = { version = "0.28.0", default-features = false }
 async-channel = { version = "2" }
 
@@ -92,7 +95,7 @@ tm_runtime.workspace   = true
 tm_keys.workspace      = true
 tm_netstack.workspace  = true
 tm_control.workspace   = true
-tm_tls.workspace       = true
+tm_tls = { workspace = true, features = ["mbedtls"] }
 thiserror.workspace    = true
 tokio   = { workspace = true, features = ["sync", "rt"] }
 tracing.workspace      = true
@@ -102,7 +105,6 @@ serde_json.workspace   = true
 heapless.workspace     = true
 esp-idf-svc = { workspace = true }
 esp-idf-hal = { workspace = true }
-esp-idf-sys = { workspace = true }
 embedded-svc = { workspace = true }
 async-channel = { workspace = true }
 
