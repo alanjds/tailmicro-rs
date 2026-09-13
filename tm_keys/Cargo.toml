@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 x25519-dalek = { workspace = true, features = ["getrandom", "static_secrets"] }
+ed25519-dalek = { workspace = true }
 rand      = { version = "0.8", features = ["getrandom"] }
 rand_core = "0.6"
 heapless  = { workspace = true }

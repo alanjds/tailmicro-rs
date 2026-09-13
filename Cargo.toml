@@ -39,6 +39,8 @@ sha2     = { version = "0.10", default-features = false }
 rand     = { version = "0.8", default-features = false }
 # Noise IK (control plane)
 snow = { version = "0.9", default-features = false, features = ["default-resolver"] }
+# Ed25519 control-key pin verification (verify-only, no signing/serde needed)
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 
 # Serialization — minimal; serde_json in streaming mode
 serde      = { version = "1", default-features = false, features = ["derive"] }

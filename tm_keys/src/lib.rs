@@ -7,6 +7,8 @@
 use x25519_dalek::{PublicKey, StaticSecret};
 use serde::{Deserialize, Serialize};
 
+pub mod pin;
+
 // ── Node key ─────────────────────────────────────────────────────────────────
 
 /// The long-lived identity key of a Tailscale node.
