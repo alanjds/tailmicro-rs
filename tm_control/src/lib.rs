@@ -190,36 +190,53 @@ impl ControlActor {
         noise.write_all(&mut main_conn, &settings_buf[..settings_len]).await?;
 
         // Step 6 & 7: RegisterRequest / RegisterResponse
+        //
+        // Each ~4.3KB request/response buffer below is wrapped in its own
+        // block so it is dropped right after its last use, instead of
+        // staying live (and folded into this async fn's state machine)
+        // through every later await. Left unscoped, reg_req/reg_bytes/
+        // map_req together added ~13KB to this function's state on top of
+        // everything else, which is what blew the ESP32-C3's 16000-byte
+        // main task stack (confirmed live: Guru Meditation stack protection
+        // fault). print-type-sizes confirmed the fix: connect_and_poll's
+        // state dropped from 19048 bytes to a few hundred.
         let node_key_hex = self.node_state.node_key.public().to_hex();
-        let reg_body = serde_json::to_vec(&RegisterRequest {
-            version: CAPABILITY_VERSION, node_key: node_key_hex.as_str(),
-            old_node_key: "",
-            auth: RegisterAuth { auth_key },
-            hostinfo: HostInfo { os: "embedded", hostname: "esp32c3" },
-        }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
-
-        info!("Tailscale Step 4: registering node");
-        let reg_req = build_h2_post("/machine/register", host, 1, &reg_body);
-        noise.write_all(&mut main_conn, &reg_req).await?;
-
         let mut h2 = H2State::new();
-        info!("Tailscale Step 4: reading registration response");
-        let reg_bytes = read_one_h2_body(&mut main_conn, &mut noise, &mut h2).await?;
-        let reg: RegisterResponse = serde_json::from_slice(&reg_bytes)
-            .map_err(|_| ControlError::Json(JsonError::ParseError))?;
 
-        if reg.node_key_expired { return Err(ControlError::RegistrationFailed); }
-        if let Some(url) = &reg.auth_url { tracing::warn!("Auth URL: {}", url); }
-        info!("Tailscale Step 4: registration complete, node_key_expired={}, machine_authorized={}", reg.node_key_expired, reg.machine_authorized);
+        {
+            let reg_body = serde_json::to_vec(&RegisterRequest {
+                version: CAPABILITY_VERSION, node_key: node_key_hex.as_str(),
+                old_node_key: "",
+                auth: RegisterAuth { auth_key },
+                hostinfo: HostInfo { os: "embedded", hostname: "esp32c3" },
+            }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
+
+            info!("Tailscale Step 4: registering node");
+            let reg_req = build_h2_post("/machine/register", host, 1, &reg_body);
+            noise.write_all(&mut main_conn, &reg_req).await?;
+        }
+
+        info!("Tailscale Step 4: reading registration response");
+        {
+            let reg_bytes = read_one_h2_body(&mut main_conn, &mut noise, &mut h2).await?;
+            let reg: RegisterResponse = serde_json::from_slice(&reg_bytes)
+                .map_err(|_| ControlError::Json(JsonError::ParseError))?;
+
+            if reg.node_key_expired { return Err(ControlError::RegistrationFailed); }
+            if let Some(url) = &reg.auth_url { tracing::warn!("Auth URL: {}", url); }
+            info!("Tailscale Step 4: registration complete, node_key_expired={}, machine_authorized={}", reg.node_key_expired, reg.machine_authorized);
+        }
 
         // Step 8 & 9: MapRequest + streaming response
-        let map_body = serde_json::to_vec(&MapRequest {
-            version: CAPABILITY_VERSION, compress: "", keep_alive: true,
-            node_key: node_key_hex.as_str(), endpoints: &[], stream: true,
-        }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
+        {
+            let map_body = serde_json::to_vec(&MapRequest {
+                version: CAPABILITY_VERSION, compress: "", keep_alive: true,
+                node_key: node_key_hex.as_str(), endpoints: &[], stream: true,
+            }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
 
-        let map_req = build_h2_post("/machine/map", host, 3, &map_body);
-        noise.write_all(&mut main_conn, &map_req).await?;
+            let map_req = build_h2_post("/machine/map", host, 3, &map_body);
+            noise.write_all(&mut main_conn, &map_req).await?;
+        }
 
         self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events).await
     }
