@@ -10,15 +10,12 @@
 //! # use std::{time::Duration, net::Ipv4Addr, error::Error};
 //! # #[tokio::main(flavor = "current_thread")]   // <— current_thread on ESP32!
 //! # async fn main() -> Result<(), Box<dyn Error>> {
-//! use esp_idf_svc::tls::EspTls;
-//! 
-//! // Warmup TLS first (before Device::new)
-//! let tls = EspTls::new().await.ok();
-//! 
+//! let config = tailmicro::Config::new("tskey-auth-...")
+//!     .with_control_pin_hex("<hex pin blob from tools/gen_fingerprint.py>")?;
+//!
 //! let dev = tailmicro::Device::new(
-//!     &tailmicro::Config::new("tskey-auth-..."),
+//!     &config,
 //!     Some("tskey-auth-...".to_owned()),
-//!     tls,
 //! ).await?;
 //!
 //! let sock = dev.udp_bind((dev.ipv4_addr().await?, 1234).into()).await?;
@@ -65,9 +62,6 @@ pub use tm_runtime::{tokio_freertos_yield, OurIpReceiver, OurIpSender};
 pub mod config;
 mod error;
 
-#[cfg(target_os = "espidf")]
-use esp_idf_svc::tls::{EspTls, InternalSocket};
-
 /// Mirrors `tailscale::Device` exactly.
 pub struct Device {
     runtime: tm_runtime::Runtime,
@@ -82,25 +76,14 @@ impl Device {
     /// On ESP32-C3, call this inside a `current_thread` Tokio runtime.
     /// 
     /// # Arguments
-    /// * `config` - Tailscale configuration
+    /// * `config` - Tailscale configuration (must carry a verified control
+    ///   pin — see `Config::with_control_pin_hex`)
     /// * `auth_key` - Auth key for Tailscale control plane
-    /// For ESP32-C3, you can pass a cached TLS instance to reuse it across connections,
-    /// avoiding memory fragmentation. The TLS instance should be created early (e.g., in wifi.rs)
-    /// and passed to this function.
     pub async fn new(config: &Config, auth_key: Option<String>) -> Result<Self, Error> {
-        Self::new_with_tls(config, auth_key, None).await
-    }
-    
-    /// Constructor for ESP32-C3 with cached TLS instance
-    ///
-    /// On ESP32-C3, you can pass a cached TLS instance to reuse it across connections,
-    /// avoiding memory fragmentation. The TLS instance should be created early (e.g., in wifi.rs)
-    /// and passed to this function.
-    pub async fn new_with_tls(config: &Config, auth_key: Option<String>, cached_tls: Option<EspTls<InternalSocket>>) -> Result<Self, Error> {
-        tracing::debug!("Device::new_with_tls() - starting device initialization");
-        
+        tracing::debug!("Device::new() - starting device initialization");
+
         let node_state = config.load_or_generate_keys().await?;
-        tracing::debug!("Device::new_with_tls() - keys loaded, node_state generated");
+        tracing::debug!("Device::new() - keys loaded, node_state generated");
 
         // Create channel for receiving the IP address
         let (our_ip_tx, our_ip_rx) = async_channel::bounded::<Ipv4Addr>(1);
@@ -113,8 +96,6 @@ impl Device {
                 .unwrap_or_default(),
             node_state,
             priority_peer: None,
-            #[cfg(target_os = "espidf")]
-            cached_tls,
             #[cfg(target_os = "espidf")]
             our_ip_tx: Some(our_ip_tx),
         };

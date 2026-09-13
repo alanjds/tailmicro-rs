@@ -16,11 +16,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .expect("set TS_PEER_IP env var")
         .parse()?;
 
+    let control_pin_hex = std::env::var("TAILMICRO_CONTROL_PIN")
+        .expect("set TAILMICRO_CONTROL_PIN env var (hex pin blob from tools/gen_fingerprint.py)");
+
     // ── Identical to tailscale-rs example ────────────────────────────────────
-    let dev = tailmicro::Device::new(
-        &tailmicro::Config::default_with_key_file("tailmicro_keys.json").await?,
-        Some(auth_key),
-    ).await?;
+    let config = tailmicro::Config::default_with_key_file("tailmicro_keys.json")
+        .await?
+        .with_control_pin_hex(&control_pin_hex)?;
+    let dev = tailmicro::Device::new(&config, Some(auth_key)).await?;
 
     let sock = dev.udp_bind((dev.ipv4_addr().await?, 1234).into()).await?;
 

@@ -97,7 +97,6 @@ tm_runtime.workspace   = true
 tm_keys.workspace      = true
 tm_netstack.workspace  = true
 tm_control.workspace   = true
-tm_tls = { workspace = true, features = ["mbedtls"] }
 thiserror.workspace    = true
 tokio   = { workspace = true, features = ["sync", "rt"] }
 tracing.workspace      = true

@@ -7,20 +7,14 @@ description = "Tailscale control plane: Noise IK, ts2021, streaming MapResponse"
 [dependencies]
 tm_h2.workspace   = true
 tm_keys.workspace = true
-tm_tls.workspace  = true
-esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc", rev = "dd794331a3c" }
 arrayvec  = { workspace = true }
 heapless  = { workspace = true }
 httparse  = { workspace = true }
 serde     = { workspace = true }
 serde_json = { workspace = true }
 snow      = { workspace = true }
-tokio     = { workspace = true, features = ["sync", "io-util"] }
+tokio     = { workspace = true, features = ["sync", "io-util", "net"] }
 async-channel = { workspace = true }
 thiserror = { workspace = true }
 tracing   = { workspace = true }
 log       = { workspace = true }
-
-[features]
-# Enable blanket IoStream impl for tokio types (host testing / non-embedded)
-tokio-io = []

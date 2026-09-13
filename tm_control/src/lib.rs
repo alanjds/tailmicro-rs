@@ -2,16 +2,19 @@
 //!
 //! # Memory usage notes
 //!
-//! The ControlActor uses approximately 30KB of heap memory:
-//! - TLS connection: ~24KB (esp-idf-svc EspTls internal state)
+//! The ControlActor uses approximately 6KB of heap memory:
+//! - TCP connection: negligible (a plain socket, no TLS state)
 //! - NoiseChannel buffers: ~8KB (2x 4114-byte arrays)
 //! - H/2 state and buffers: ~1KB
 //!
-//! On ESP32-C3 with 320KB RAM total, this leaves ~290KB for other operations.
-//! The actor is designed to run with Runtime::join() which avoids per-task heap
-//! allocations, keeping the total memory footprint reasonable.
+//! On ESP32-C3 with 320KB RAM total, this leaves ample room for other
+//! operations. The actor is designed to run with Runtime::join() which
+//! avoids per-task heap allocations, keeping the total memory footprint
+//! reasonable.
 pub mod noise;
 pub mod map_parser;
+pub mod pin;
+mod io;
 
 use arrayvec::ArrayVec;
 use serde::{Deserialize, Serialize};
@@ -23,9 +26,8 @@ use tm_h2::{
 };
 use tm_keys::NodeState;
 use map_parser::MapParser;
-use noise::{NoiseChannel, do_noise_handshake, fetch_server_key};
-use tm_tls::io::IoStream;
-use esp_idf_svc::tls::{EspTls, InternalSocket};
+use noise::{NoiseChannel, do_noise_handshake};
+pub use io::IoStream;
 
 // Max request size: body + headers (headers ~256 bytes)
 const MAX_REQUEST_SIZE: usize = 4096 + 256;
@@ -71,26 +73,23 @@ pub const CAPABILITY_VERSION: u16 = 72;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-pub const TAILSCALE_CONTROL_FINGERPRINTS: &[[u8; 32]] = &[[0u8; 32]];
-
 pub struct Config {
-    pub control_host:      &'static str,
-    pub control_port:      u16,
-    pub cert_fingerprints: &'static [[u8; 32]],
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self { control_host: "login.tailscale.com", control_port: 443,
-               cert_fingerprints: TAILSCALE_CONTROL_FINGERPRINTS }
-    }
+    pub control_host: &'static str,
+    pub control_port: u16,
+    /// The control server's Noise static public key, obtained and
+    /// signature-verified via `pin::verify_pin_hex` (or equivalent) before
+    /// this `Config` is constructed. There is no `/key` fetch anymore — this
+    /// is the only source of the responder key used in the Noise IK
+    /// handshake, so it is mandatory (no `Default` impl for `Config`: an
+    /// all-zero sentinel here can't verify anything downstream).
+    pub control_pin: [u8; 32],
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub enum ControlError { Tls, Noise(NoiseError), Http, H2(H2Error), Json(JsonError),
-                        PeerTableFull, RegistrationFailed, Io }
+                        PeerTableFull, RegistrationFailed, Io, Pin(pin::PinError) }
 #[derive(Debug)]
 pub enum NoiseError { Handshake, Decrypt, Encrypt }
 #[derive(Debug)]
@@ -134,34 +133,16 @@ struct MapRequest<'a> {
     node_key: &'a str, endpoints: &'a [&'a str], stream: bool,
 }
 
-// Use tm_tls::io::IoStream instead of defining our own
 
 // ── ControlActor ─────────────────────────────────────────────────────────────
 
-pub struct ControlActor { 
-    config: Config, 
+pub struct ControlActor {
+    config: Config,
     node_state: NodeState,
-    #[cfg(target_os = "espidf")]
-    cached_tls: Option<EspTls<InternalSocket>>,
 }
 
 impl ControlActor {
-    pub fn new(config: Config, node_state: NodeState) -> Self { 
-        Self { 
-            config, 
-            node_state,
-            #[cfg(target_os = "espidf")]
-            cached_tls: None
-        }
-    }
-    
-    #[cfg(target_os = "espidf")]
-    pub fn new_with_tls(config: Config, node_state: NodeState, cached_tls: EspTls<InternalSocket>) -> Self { 
-        Self { config, node_state, cached_tls: Some(cached_tls) }
-    }
-    
-    #[cfg(not(target_os = "espidf"))]
-    pub fn new_with_tls(config: Config, node_state: NodeState, _cached_tls:EspTls<InternalSocket>) -> Self { 
+    pub fn new(config: Config, node_state: NodeState) -> Self {
         Self { config, node_state }
     }
 
@@ -190,29 +171,17 @@ impl ControlActor {
         let port = self.config.control_port;
         info!("Tailscale connecting to {}:{}", host, port);
 
-        // Step 1 & 2: fetch server Noise key over HTTPS
-        info!("Tailscale Step 1: fetching server Noise key");
-        // Use the cached TLS if available
-        let mut key_conn = self.open_tls(host, port).await?;
-        info!("Tailscale Step 1: TLS connection established");
-        let server_noise_key = fetch_server_key(&mut key_conn, host, CAPABILITY_VERSION).await?;
-        info!("Tailscale Step 1: server Noise key received");
-        drop(key_conn);
-
-        // Step 3 & 4: open long-lived connection + Noise IK
-        // Use the cached TLS if available (but it's already taken by key_conn)
-        // For ESP32-C3 with TLS caching, we need to handle this differently:
-        // Either we create a new TLS for each connection, or we need to cache
-        // multiple TLS instances.
-        info!("Tailscale Step 2: opening main connection");
-        let mut main_conn = self.open_tls(host, port).await?;
-        info!("Tailscale Step 2: main TLS connection established");
-        info!("Tailscale Step 3: doing Noise IK handshake");
+        // The control server's Noise static key comes from the verified pin
+        // (Config::control_pin) — no /key HTTP(S) pre-fetch anymore.
+        info!("Tailscale Step 1: opening main connection");
+        let mut main_conn = self.open_tcp(host, port).await?;
+        info!("Tailscale Step 1: main TCP connection established");
+        info!("Tailscale Step 2: doing Noise IK handshake");
         let mut noise = do_noise_handshake(
-            &mut main_conn, &self.node_state.machine_key, &server_noise_key,
+            &mut main_conn, &self.node_state.machine_key, &self.config.control_pin,
             host, CAPABILITY_VERSION,
         ).await?;
-        info!("Tailscale Step 3: Noise IK handshake complete");
+        info!("Tailscale Step 2: Noise IK handshake complete");
 
         // Step 5: H/2 preface + SETTINGS
         noise.write_all(&mut main_conn, CLIENT_PREFACE).await?;
@@ -319,39 +288,14 @@ impl ControlActor {
     }
 }
 
-// ── TLS opener ────────────────────────────────────────────────────────────────
+// ── TCP opener ────────────────────────────────────────────────────────────────
+//
+// Plain TCP (port 80) — no TLS. `tokio::net::TcpStream` works identically on
+// host and ESP-IDF, so there is no per-platform branch here.
 
 impl ControlActor {
-    async fn open_tls<'a>(&mut self, host: &str, port: u16) -> Result<tm_tls::TlsStream, ControlError> {
-        #[cfg(target_os = "espidf")]
-        {
-            // Try to take the cached TLS from the Option
-            // If None, create a new TLS using get_tls(None)
-            match self.cached_tls.take() {
-                Some(cached_tls) => {
-                    // Use the cached TLS instance
-                    let config = tm_tls::TlsConfig { 
-                        host, 
-                        port, 
-                        verification: tm_tls::CertVerification::FullChain, 
-                        alpn: &[] 
-                    };
-                    tm_tls::TlsStream::connect_with_cached(&config, cached_tls)
-                        .await.map_err(|_| ControlError::Tls)
-                }
-                None => {
-                    // Create a new TLS connection
-                    tm_tls::TlsStream::connect(&tm_tls::TlsConfig { host, port, verification: tm_tls::CertVerification::FullChain, alpn: &[] })
-                        .await.map_err(|_| ControlError::Tls)
-                }
-            }
-        }
-        
-        #[cfg(not(target_os = "espidf"))]
-        {
-            tm_tls::TlsStream::connect(&tm_tls::TlsConfig { host, port, verification: tm_tls::CertVerification::FullChain, alpn: &[] })
-                .await.map_err(|_| ControlError::Tls)
-        }
+    async fn open_tcp(&self, host: &str, port: u16) -> Result<tokio::net::TcpStream, ControlError> {
+        tokio::net::TcpStream::connect((host, port)).await.map_err(|_| ControlError::Io)
     }
 }
 

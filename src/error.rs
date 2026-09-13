@@ -5,6 +5,7 @@ pub enum Error {
     Control(tm_control::ControlError),
     InternalFailure,
     RuntimeDegraded,
+    Pin(tm_control::pin::PinError),
 }
 
 impl std::fmt::Display for Error {

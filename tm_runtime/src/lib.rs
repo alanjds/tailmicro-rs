@@ -44,13 +44,12 @@ pub async fn tokio_freertos_yield() {
 #[cfg(target_os = "espidf")]
 use esp_idf_sys;
 
+
+
 /// Channel capacity for all inter-actor queues.
 /// Small = bounded memory, back-pressure propagates naturally.
 /// Reduced from 4 to 2 to save memory on ESP32-C3.
 const CHAN_CAP: usize = 2;
-
-#[cfg(target_os = "espidf")]
-use esp_idf_svc::tls::{EspTls, InternalSocket};
 
 use std::net::Ipv4Addr;
 
@@ -65,9 +64,6 @@ pub struct RuntimeConfig {
     pub auth_key:      heapless::String<128>,
     pub node_state:    NodeState,
     pub priority_peer: Option<[u8; 32]>,
-    /// Cached TLS instance for reuse (ESP32-C3 only).
-    #[cfg(target_os = "espidf")]
-    pub cached_tls:    Option<EspTls<InternalSocket>>,
     pub our_ip_tx:     Option<OurIpSender>,
 }
 
@@ -229,19 +225,9 @@ impl Runtime {
         }
 
         tracing::debug!("Runtime::join() - creating ControlActor");
-        #[cfg(target_os = "espidf")]
-        let control_actor = if let Some(cached_tls) = config.cached_tls.take() {
-            tracing::debug!("Runtime::join() - ControlActor: using cached TLS");
-            ControlActor::new_with_tls(config.control, config.node_state, cached_tls)
-        } else {
-            tracing::debug!("Runtime::join() - ControlActor: no cached TLS");
-            ControlActor::new(config.control, config.node_state)
-        };
-
-        #[cfg(not(target_os = "espidf"))]
         let control_actor = ControlActor::new(config.control, config.node_state);
 
-        
+
         #[cfg(target_os = "espidf")]
         {
             unsafe {

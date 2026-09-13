@@ -2,30 +2,42 @@
 //!
 //! # Protocol sequence (from Tailscale Go source + headscale implementation)
 //!
+//! The control server's static Noise public key is no longer fetched over
+//! the wire (there is no `/key` HTTP(S) round trip). It is supplied out of
+//! band, pinned and signature-verified via `tm_control::pin` (see
+//! `Config::control_pin`), before this handshake ever runs.
+//!
+//! The client's Noise IK init message is carried in the
+//! `X-Tailscale-Handshake` HTTP header (base64-encoded), *not* the POST
+//! body. This matches the real ts2021 server implementation
+//! (`control/controlhttp/controlhttpserver/controlhttpserver.go`:
+//! `acceptHTTP` unconditionally rejects a request with `400 missing
+//! Tailscale handshake header` when that header is absent — there is no
+//! body-based fallback). Verified live against
+//! `controlplane.tailscale.com:80`, which returns `101 Switching
+//! Protocols` for this exact framing.
+//!
 //! ```text
-//! Client                                    Server (login.tailscale.com)
+//! Client                                    Server (controlplane.tailscale.com)
 //!   |                                           |
-//!   |-- GET /key?v=<cap_version>  (HTTPS) ----> |  (1) fetch server public key
-//!   |<- {"PublicKey":"<hex>", ...} ------------ |
-//!   |                                           |
-//!   |-- POST /ts2021 HTTP/1.1                   |  (2) upgrade request
-//!   |   Upgrade: tailscale-control-protocol     |      embeds Noise init message
-//!   |   Content-Length: 48                      |      in the body (ClientDeferred)
-//!   |   <48 bytes Noise IK init message>        |
-//!   |<- HTTP/1.1 101 Switching Protocols ------ |  (3) upgrade accepted
+//!   |-- POST /ts2021 HTTP/1.1                   |  (1) upgrade request
+//!   |   Upgrade: tailscale-control-protocol     |      Noise init message is
+//!   |   X-Tailscale-Handshake: <base64 init>    |      base64'd into a header,
+//!   |   Content-Length: 0                       |      no body at all
+//!   |<- HTTP/1.1 101 Switching Protocols ------ |  (2) upgrade accepted
 //!   |   Upgrade: tailscale-control-protocol     |
 //!   |                                           |
-//!   |<- [optional: 5-byte EarlyNoise header     |  (4) EarlyNoise payload
+//!   |<- [optional: 5-byte EarlyNoise header     |  (3) EarlyNoise payload
 //!   |    + JSON {NodeKey, ...}]                 |      (ignore if absent)
 //!   |                                           |
-//!   |<- <48 bytes Noise IK response> ---------- |  (5) Noise response message
+//!   |<- <48 bytes Noise IK response> ---------- |  (4) Noise response message
 //!   |                                           |
 //!   |   [Noise channel established]             |
 //!   |                                           |
-//!   |-- POST /machine/register (H/2 over Noise) |  (6) RegisterRequest JSON
+//!   |-- POST /machine/register (H/2 over Noise) |  (5) RegisterRequest JSON
 //!   |<- RegisterResponse JSON                   |
 //!   |                                           |
-//!   |-- POST /machine/map (H/2 over Noise) ---- |  (7) MapRequest (long poll)
+//!   |-- POST /machine/map (H/2 over Noise) ---- |  (6) MapRequest (long poll)
 //!   |<- MapResponse JSON stream                 |      streaming H/2 DATA frames
 //! ```
 //!
@@ -210,7 +222,7 @@ impl NoiseChannel {
     pub async fn do_noise_handshake<S: crate::IoStream>(
         stream:      &mut S,
         machine_key: &MachinePrivateKey,
-        server_key:  &[u8; 32],   // from /key?v=<n> pre-fetch
+        server_key:  &[u8; 32],   // from Config::control_pin (verified offline pin, not fetched)
         host:        &str,
         cap_version: u16,
     ) -> Result<NoiseChannel, ControlError> {
@@ -232,22 +244,22 @@ impl NoiseChannel {
 
     // ── Step 2: HTTP/1.1 Upgrade request ─────────────────────────────────────
     //
-    // The Noise init message is sent as the POST body.
-    // This is the "ClientDeferred" optimization: the init message is
-    // piggybacked onto the HTTP upgrade request to save one RTT.
+    // The Noise init message is base64-encoded into the
+    // `X-Tailscale-Handshake` header. There is no body (Content-Length: 0)
+    // — see the module doc comment for why.
     //
     // Wire format:
     //   POST /ts2021 HTTP/1.1\r\n
     //   Host: <host>\r\n
     //   Upgrade: tailscale-control-protocol\r\n
-    //   Connection: Upgrade\r\n
-    //   Content-Length: <len>\r\n
+    //   Connection: upgrade\r\n
+    //   Tailscale-Cap-Version: <cap_version>\r\n
+    //   X-Tailscale-Handshake: <base64 of init_payload>\r\n
+    //   Content-Length: 0\r\n
     //   \r\n
-    //   <init_payload bytes>
 
-    let req = build_upgrade_request(host, cap_version, init_len);
+    let req = build_upgrade_request(host, cap_version, init_payload);
     stream.write_all(req.as_bytes()).await.map_err(|_| ControlError::Io)?;
-    stream.write_all(init_payload).await.map_err(|_| ControlError::Io)?;
 
     // ── Step 3: Parse 101 Switching Protocols ─────────────────────────────────
 
@@ -325,21 +337,44 @@ impl NoiseChannel {
 
 // ── Helper: build the HTTP/1.1 Upgrade request string ─────────────────────────
 
-fn build_upgrade_request(host: &str, cap_version: u16, body_len: usize) -> heapless::String<512> {
+/// Buffer size for the base64-encoded init message: NOISE_INIT_MSG_LEN (80)
+/// bytes encodes to ceil(80/3)*4 = 108 base64 chars. Sized generously.
+const BASE64_BUF_LEN: usize = 128;
+
+/// Minimal base64 (standard alphabet, `=`-padded) encoder — avoids pulling
+/// in a `base64` crate dependency for this one tens-of-bytes value.
+fn base64_encode(input: &[u8]) -> heapless::String<BASE64_BUF_LEN> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out: heapless::String<BASE64_BUF_LEN> = heapless::String::new();
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        let _ = out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        let _ = out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        let _ = out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 0x3F) as usize] as char } else { '=' });
+        let _ = out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3F) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn build_upgrade_request(host: &str, cap_version: u16, init_payload: &[u8]) -> heapless::String<512> {
+    let b64 = base64_encode(init_payload);
     let mut s = heapless::String::new();
     let _ = s.push_str("POST /ts2021 HTTP/1.1\r\n");
     let _ = s.push_str("Host: ");
     let _ = s.push_str(host);
     let _ = s.push_str("\r\n");
     let _ = s.push_str("Upgrade: tailscale-control-protocol\r\n");
-    let _ = s.push_str("Connection: Upgrade\r\n");
-    let _ = s.push_str("Content-Type: application/octet-stream\r\n");
-    let _ = s.push_str("Content-Length: ");
-    let _ = s.push_str(&body_len.to_string());
-    let _ = s.push_str("\r\n");
+    let _ = s.push_str("Connection: upgrade\r\n");
     let _ = s.push_str("Tailscale-Cap-Version: ");
     let _ = s.push_str(&cap_version.to_string());
-    let _ = s.push_str("\r\n\r\n");
+    let _ = s.push_str("\r\n");
+    let _ = s.push_str("X-Tailscale-Handshake: ");
+    let _ = s.push_str(&b64);
+    let _ = s.push_str("\r\n");
+    let _ = s.push_str("Content-Length: 0\r\n\r\n");
     s
 }
 
@@ -392,80 +427,3 @@ async fn read_101_response<S: crate::IoStream>(
     }
 }
 
-// ── Pre-fetch server public key via /key?v=<n> ────────────────────────────────
-//
-// Before the Noise handshake, the client must fetch the server's Noise
-// public key over plain HTTPS.  The response is JSON:
-//   {"PublicKey":"<hex-encoded 32 bytes>"}
-//
-// We parse this with a minimal JSON extractor to avoid pulling in the full
-// serde_json machinery for this one-time operation.
-
-pub async fn fetch_server_key<S: crate::IoStream>(
-    stream:      &mut S,
-    host:        &str,
-    cap_version: u16,
-) -> Result<[u8; 32], ControlError> {
-    // Send GET /key?v=<cap_version>
-    let mut req: heapless::String<256> = heapless::String::new();
-    let _ = req.push_str("GET /key?v=");
-    let _ = req.push_str(&cap_version.to_string());
-    let _ = req.push_str(" HTTP/1.1\r\n");
-    let _ = req.push_str("Host: ");
-    let _ = req.push_str(host);
-    let _ = req.push_str("\r\n");
-    let _ = req.push_str("Connection: close\r\n");
-    let _ = req.push_str("\r\n");
-    stream.write_all(req.as_bytes()).await.map_err(|_| ControlError::Io)?;
-
-    // Read response — short, fits in 512 bytes
-    let mut buf = [0u8; 512];
-    let mut total = 0;
-
-    // Read until connection close (Content-Length not guaranteed)
-    loop {
-        if total >= buf.len() { break; }
-        let single = &mut [0u8; 1];
-        match stream.read_exact(single).await {
-            Ok(()) => { buf[total] = single[0]; total += 1; }
-            Err(_) => break, // EOF = connection closed
-        }
-    }
-
-    let body = core::str::from_utf8(&buf[..total]).map_err(|_| ControlError::Json(crate::JsonError::InvalidUtf8))?;
-
-    // Minimal extract: find "PublicKey":"<hex>"
-    let key_hex = extract_json_string(body, "PublicKey")
-        .ok_or(ControlError::Json(crate::JsonError::MissingField))?;
-
-    if key_hex.len() != 64 {
-        return Err(ControlError::Json(crate::JsonError::ParseError));
-    }
-
-    let mut key = [0u8; 32];
-    for (i, chunk) in key_hex.as_bytes().chunks(2).enumerate() {
-        key[i] = u8::from_str_radix(
-            core::str::from_utf8(chunk).map_err(|_| ControlError::Json(crate::JsonError::ParseError))?,
-            16
-        ).map_err(|_| ControlError::Json(crate::JsonError::ParseError))?;
-    }
-    Ok(key)
-}
-
-/// Extract a JSON string value for a given key.
-/// Minimal implementation — no alloc, no recursion, no escape handling.
-/// Sufficient for the /key response which is a flat JSON object.
-fn extract_json_string<'a>(json: &'a str, key: &str) -> Option<&'a str> {
-    // Build needle on stack (max key length is reasonable)
-    let mut needle = [0u8; 64];
-    let mut pos = 0;
-    needle[pos] = b'"'; pos += 1;
-    for &c in key.as_bytes() { needle[pos] = c; pos += 1; }
-    needle[pos] = b'"'; pos += 1;
-    needle[pos] = b':'; pos += 1;
-    needle[pos] = b'"'; pos += 1;
-    let needle_str = core::str::from_utf8(&needle[..pos]).unwrap();
-    let start = json.find(needle_str)? + needle_str.len();
-    let end = json[start..].find('"')? + start;
-    Some(&json[start..end])
-}

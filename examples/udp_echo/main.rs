@@ -30,11 +30,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
 
     let auth_key = std::env::var("TS_AUTHKEY").expect("set TS_AUTHKEY");
+    let control_pin_hex = std::env::var("TAILMICRO_CONTROL_PIN")
+        .expect("set TAILMICRO_CONTROL_PIN env var (hex pin blob from tools/gen_fingerprint.py)");
 
-    let dev = tailmicro::Device::new(
-        &tailmicro::Config::new(&auth_key),
-        Some(auth_key),
-    ).await?;
+    let config = tailmicro::Config::new(&auth_key)
+        .with_control_pin_hex(&control_pin_hex)?;
+    let dev = tailmicro::Device::new(&config, Some(auth_key)).await?;
 
     let our_ip = dev.ipv4_addr().await?;
     tracing::info!("Tailnet IP: {}", our_ip);
