@@ -1,0 +1,4 @@
+/target
+
+# Ed25519 signing seed produced by tools/gen_fingerprint.py -- secret, never commit.
+tm_signing_key.bin
