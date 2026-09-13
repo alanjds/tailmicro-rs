@@ -229,7 +229,15 @@ impl ControlActor {
         h2: &mut H2State, events: &async_channel::Sender<ControlEvent>,
     ) -> Result<(), ControlError> {
         info!("Tailscale stream_map_response starting");
-        let mut frame_buf: heapless::Vec<u8, 4105> = heapless::Vec::new();
+        // Vec, not heapless::Vec: this local is live across every await in the
+        // loop below, and this whole call chain (connect_and_poll ->
+        // stream_map_response) is awaited inline with no spawn/Box::pin
+        // boundary, so a heapless (stack-inline) buffer here folds straight
+        // into the caller's combined async state machine. On the ESP32-C3's
+        // 16000-byte main task stack that overflows (confirmed live via a
+        // Guru Meditation: Stack protection fault in Wokwi); Vec keeps this
+        // 4105-byte scratch space on the heap instead.
+        let mut frame_buf: Vec<u8> = Vec::new();
         let mut parser: MapParser<8, 4> = MapParser::new();
         let mut our_ip_sent = false;
 
@@ -325,7 +333,10 @@ async fn read_one_h2_body<S: IoStream>(
     stream: &mut S, noise: &mut NoiseChannel, h2: &mut H2State,
 ) -> Result<ArrayVec<u8, 4096>, ControlError> {
     let mut body: ArrayVec<u8, 4096> = ArrayVec::new();
-    let mut fb: heapless::Vec<u8, 4105> = heapless::Vec::new();
+    // Vec, not heapless::Vec: same reasoning as stream_map_response's
+    // frame_buf (see comment there) — this local is live across every await
+    // in the loop below, nested inline in the same unboxed call chain.
+    let mut fb: Vec<u8> = Vec::new();
     loop {
         let mut hb = [0u8; 9];
         noise.read_exact(stream, &mut hb).await?;

@@ -103,11 +103,20 @@ const EARLY_PAYLOAD_MAGIC_BYTE: u8 = 0xFF;
 /// We use 4096-byte payloads (matching our H/2 frame size) for efficiency.
 pub struct NoiseChannel {
     state: TransportState,
-    /// Scratch buffer for Noise-framed writes (stack allocated).
+    /// Scratch buffer for Noise-framed writes, heap allocated.
     /// Size: 4096 payload + 16 tag + 2 length prefix = 4114 bytes.
-    write_buf: [u8; 4114],
-    /// Scratch buffer for Noise-framed reads.
-    read_buf: [u8; 4114],
+    /// Boxed so this doesn't get folded into the caller's async state
+    /// machine: `do_noise_handshake` is awaited inline (no spawn/Box::pin
+    /// boundary) from `connect_and_poll`, and `NoiseChannel` stays alive
+    /// there through the rest of the handshake and the map-poll loop, so
+    /// an unboxed 4114-byte array here doubles up with `stream_map_response`'s
+    /// own frame buffer inside one combined stack frame. On the ESP32-C3's
+    /// 16000-byte main task stack that overflows; a live Wokwi run hit
+    /// exactly this (Guru Meditation: Stack protection fault) before this
+    /// field was boxed.
+    write_buf: Box<[u8; 4114]>,
+    /// Scratch buffer for Noise-framed reads, heap allocated (see write_buf).
+    read_buf: Box<[u8; 4114]>,
     /// How many decrypted bytes are available in read_buf, starting at read_pos.
     read_avail: usize,
     read_pos:   usize,
@@ -197,7 +206,7 @@ impl NoiseChannel {
         let mut temp = [0u8; 4114];
         temp[..msg_len].copy_from_slice(&self.read_buf[..msg_len]);
         let plaintext_len = self.state
-            .read_message(&temp[..msg_len], &mut self.read_buf)
+            .read_message(&temp[..msg_len], &mut self.read_buf[..])
             .map_err(|_| ControlError::Noise(NoiseError::Decrypt))?;
 
         self.read_avail = plaintext_len;
@@ -325,11 +334,11 @@ impl NoiseChannel {
     let transport = handshake.into_transport_mode()
         .map_err(|_| ControlError::Noise(NoiseError::Handshake))?;
 
-        tracing::debug!("do_noise_handshake() - NoiseChannel created with buffers (3 x 4114 bytes = 12342 bytes)");
+        tracing::debug!("do_noise_handshake() - NoiseChannel created with heap-allocated buffers (2 x 4114 bytes = 8228 bytes)");
         Ok(NoiseChannel {
             state:      transport,
-            write_buf:  [0u8; 4114],
-            read_buf:   [0u8; 4114],
+            write_buf:  Box::new([0u8; 4114]),
+            read_buf:   Box::new([0u8; 4114]),
             read_avail: 0,
         read_pos:   0,
     })
