@@ -49,13 +49,28 @@ const FLAG_END_HEADERS: u8 = 0x4;
 const FLAG_ACK:         u8 = 0x1;
 const FLAG_PADDED:      u8 = 0x8;
 
-/// Maximum frame body we will accept from the server.
-/// We tell the server this in SETTINGS_MAX_FRAME_SIZE (4 KB).
-/// MapResponse arrives in chunks this size — never allocated all at once.
-pub const MAX_FRAME_SIZE: u32 = 4096;
+/// Maximum frame body we will accept from the server, and the value we send
+/// in SETTINGS_MAX_FRAME_SIZE.
+///
+/// RFC 7540 SS6.5.2 fixes the legal range for this setting at
+/// `[2^14, 2^24-1]` (16384..=16777215) and requires a PROTOCOL_ERROR
+/// connection error for any value outside it — this used to be set to 4096,
+/// which is below that minimum. The real control server enforced this: it
+/// replied with `GoAway { error_code: 1 }` (PROTOCOL_ERROR) right after our
+/// SETTINGS frame, before ever looking at the HEADERS/DATA that followed.
+/// Confirmed root-caused with a Python reference client sending a
+/// byte-for-byte copy of this crate's SETTINGS frame against the live
+/// server (`GoAway` reproduced with 4096, cleared with 16384) before this
+/// value was changed — see docs/noise-handshake-wire-format.md. Frame
+/// buffers on our side are heap `Vec<u8>`s sized per-frame (not fixed stack
+/// arrays), so raising this doesn't cost fixed memory; the server has no
+/// obligation to actually send frames this large.
+pub const MAX_FRAME_SIZE: u32 = 16384;
 
-/// Our initial stream-level flow-control window (matches frame size).
-pub const INITIAL_WINDOW: u32 = MAX_FRAME_SIZE;
+/// Our initial stream-level flow-control window. Independent of
+/// MAX_FRAME_SIZE (no RFC-mandated minimum here), kept at the crate's
+/// original frame-chunk size.
+pub const INITIAL_WINDOW: u32 = 4096;
 
 /// Connection-level window we advertise (32 KB total across all DATA frames).
 pub const CONN_WINDOW: u32 = 32 * 1024;
@@ -158,20 +173,19 @@ pub fn write_ping_ack(buf: &mut [u8; 17], payload: &[u8; 8]) {
     buf[9..17].copy_from_slice(payload);
 }
 
-/// Write a HEADERS frame for the MapResponse request.
+/// Write a HEADERS frame for a control-plane request (register or map poll).
 ///
 /// Uses literal header encoding (HPACK static table entries only):
-///   :method POST, :path /ts2021, :scheme https, :authority login.tailscale.com,
-///   content-type application/json, ts-version 96
+///   :method POST, :path <path>, :scheme https, :authority <host>,
+///   content-type application/json, authorization <auth_token>
 ///
 /// Returns bytes written into `buf`.  Caller must ensure buf ≥ 256 bytes.
-///
-/// `stream_id` is always 1 for our single-stream design.
 pub fn write_map_request_headers(
     buf:        &mut [u8],
     stream_id:  u32,
     auth_token: &[u8],
     host:       &[u8],
+    path:       &[u8],
 ) -> usize {
     // We pre-encode HPACK manually — no dynamic table, all literals.
     // This is verbose but predictable and allocates nothing.
@@ -197,9 +211,15 @@ pub fn write_map_request_headers(
     buf[pos] = 0x83; pos += 1;
     // :scheme https = index 7
     buf[pos] = 0x87; pos += 1;
-    // :path /ts2021 — literal with index :path (index 4, 0x44)
+    // :path — literal with index :path (index 4, 0x44). This was previously
+    // hardcoded to b"/ts2021" (the upgrade path, not a real request path),
+    // so both the register and map requests always asked for /ts2021
+    // regardless of the caller's actual `path` argument. The real server
+    // accepted the HTTP/2 connection fine but rejected this at the
+    // connection level (h2 GoAway, PROTOCOL_ERROR) - confirmed root-caused
+    // and fixed via a Python h2-library reference request against the live
+    // server before porting here; see docs/noise-handshake-wire-format.md.
     buf[pos] = 0x44; pos += 1;
-    let path = b"/ts2021";
     buf[pos] = path.len() as u8; pos += 1;
     buf[pos..pos+path.len()].copy_from_slice(path); pos += path.len();
 

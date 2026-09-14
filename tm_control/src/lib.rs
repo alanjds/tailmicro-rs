@@ -345,7 +345,7 @@ impl ControlActor {
 fn build_h2_post(path: &str, host: &str, stream_id: u32, body: &[u8]) -> Box<ArrayVec<u8, MAX_REQUEST_SIZE>> {
     let mut out: Box<ArrayVec<u8, MAX_REQUEST_SIZE>> = Box::new(ArrayVec::new());
     let mut hbuf = [0u8; 256];
-    let hlen = write_map_request_headers(&mut hbuf, stream_id, b"", host.as_bytes());
+    let hlen = write_map_request_headers(&mut hbuf, stream_id, b"", host.as_bytes(), path.as_bytes());
     for b in &hbuf[..hlen] { let _ = out.push(*b); }
     let blen = body.len() as u32;
     let _ = out.push(((blen>>16)&0xFF) as u8);
