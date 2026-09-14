@@ -263,6 +263,41 @@ Both were live-verified fixed via the debug logging (not yet a full
 end-to-end registration success at the time of writing - see the Rust
 change's commit message for the actual outcome of the next live run).
 
+With all of the above fixed and a fresh, valid reusable auth key, a live run
+achieved a **full successful registration**: the server returned
+`MachineAuthorized: true` for a real node in the account's tailnet. This is
+the first point in the project where a real Tailscale device registration
+has been completed end-to-end from this codebase.
+
+## Follow-up: hardcoded stream ID 1 broke the second (map) request
+
+Registration succeeding immediately surfaced the next bug: proceeding to
+`/machine/map` failed with `H2(UnexpectedStream(3))`.
+
+`tm_h2::parse_frame` hardcoded `if hdr.stream_id != 1`, and
+`tm_control::stream_map_response`'s proactive stream-level `WINDOW_UPDATE`
+hardcoded stream `1` too. Both were fine as long as the map poll was the
+*only* request ever made on a connection (the module's original one-stream
+design assumption) - but `connect_and_poll` actually sends **two** requests
+over the same connection: `/machine/register` on stream 1, then
+`/machine/map` on stream 3. Per RFC 7540 SS5.1.1, each new client-initiated
+HTTP/2 request must use its own, incrementing odd stream ID - stream IDs
+are not reusable - so the map response's DATA frames correctly arrived on
+stream 3, and our hardcoded `1` check rejected every one of them.
+
+Not re-verified in Python first: this is a pure client-side bookkeeping bug
+(which stream ID our own code expects), not a question of server behavior -
+the "new request needs a new stream ID" rule is exactly what the Python `h2`
+library already did automatically (via `get_next_available_stream_id()`) in
+every earlier reference script, so there was nothing left to discover
+end-to-end against the real server that wasn't already established.
+
+Fixed by adding an `expected_stream: u32` parameter to
+`tm_h2::parse_frame`, and named `REGISTER_STREAM_ID = 1` /
+`MAP_STREAM_ID = 3` constants in `tm_control`, threaded through
+`read_one_h2_body`, `build_h2_post`'s two call sites, and the map-response
+loop's `WINDOW_UPDATE`.
+
 ## Process note
 
 Going forward, when a new protocol-level roadblock turns up, prototype the
