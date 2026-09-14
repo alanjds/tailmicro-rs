@@ -181,6 +181,51 @@ sequence under test, not just the one frame believed to be buggy — reusing
 a well-behaved library's defaults for "the rest" of the exchange can hide a
 second bug (as it did here for one iteration).
 
+## Follow-up: RegisterRequest's always-empty `OldNodeKey` field
+
+With both H/2 bugs above fixed, `host_handshake.rs` reached
+`Json(ParseError)` on the registration response — even with a real
+`TAILSCALE_AUTH_KEY` from `.env`, not just the earlier placeholder one. The
+server was still replying `500 Internal Server Error` (plain text, not
+JSON), so parsing it as `RegisterResponse` correctly failed; the real bug
+was upstream of that, in what we sent.
+
+`tm_control`'s `RegisterRequest.old_node_key` was a bare `&str`, always
+serialized as `"OldNodeKey":""` (no key rotation ever in progress in this
+codebase). Root-caused in Python: extended the real-auth-key `h2` test to
+print the exact JSON body sent and vary it field-by-field against the live
+server. Two things needed fixing together to get an actual `200`:
+
+1. **`"OldNodeKey":""` must be omitted, not sent empty.** The control
+   server's Go-side type for this field is `key.NodePublic`, whose
+   `UnmarshalText` requires either the field be entirely absent/null or a
+   real `"nodekey:<64 hex chars>"` value — an empty string fails to parse
+   and (apparently, based on observed behavior) surfaces as a generic `500`
+   rather than a `400`. This matches the official Rust client's own
+   `Option<NodePublicKey>` type with a serde skip-if-default annotation for
+   this exact field (`ts_control_serde::register::RegisterRequest`) — our
+   plain-`&str` port had dropped the "optional" part.
+2. **`NodeKey` must be a real, non-all-zero key.** An earlier isolated
+   Python test that used `"nodekey:" + "00"*32` (an all-zero placeholder)
+   still got `500` even after fixing bug 1 above; switching to a real random
+   32-byte key got a real `200` with a genuine JSON `RegisterResponse` body.
+   This particular sub-case doesn't need a Rust-side fix: `tm_control`
+   already uses `NodeState::generate()`'s real key, never an all-zero
+   placeholder, in the actual (non-test) code path — it only mattered for
+   correctly interpreting the Python isolation test.
+
+Fixed by changing `RegisterRequest::old_node_key` to `Option<&str>` with
+`#[serde(skip_serializing_if = "Option::is_none")]`, and passing `None` from
+`connect_and_poll` (`tm_control` has no node-key-rotation logic yet, so this
+is always `None` for now — revisit when rotation is implemented).
+
+**Caution for future live verification against the real auth key**: each
+successful registration attempt with a fresh random node key creates a real
+device entry in the account's tailnet (or consumes a reusable key's use
+count). Prefer a single confirming run per fix rather than repeated retries,
+and check `https://login.tailscale.com/admin/machines` afterwards to clean
+up any throwaway `esp32c3` test devices this creates.
+
 ## Process note
 
 Going forward, when a new protocol-level roadblock turns up, prototype the
