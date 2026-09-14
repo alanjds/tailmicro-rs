@@ -75,10 +75,18 @@ use tm_keys::MachinePrivateKey;
 /// Noise pattern string matching Tailscale's controlbase implementation.
 pub const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
-/// Size of the Noise handshake init message (sent by client in POST body).
-/// Fixed for Noise IK with Curve25519: 32 (e) + 16 (s encrypted) + 16 (tag) = 64
-/// Actually: prologue(0) + e(32) + es(0) + s(48) + ss(0) = 80 bytes
-pub const NOISE_INIT_MSG_LEN: usize = 80;
+/// Size of the Noise handshake init message (sent via X-Tailscale-Handshake).
+/// Fixed for Noise_IK_25519_ChaChaPoly_BLAKE2s's first message (-> e, es, s, ss):
+/// e (32, raw ephemeral public key) + s (32 + 16 tag, encrypted static key)
+/// + payload (0 + 16 tag, encrypted empty payload) = 32 + 48 + 16 = 96 bytes.
+/// The previous value (80) omitted the empty payload's own AEAD tag, which
+/// made snow::HandshakeState::write_message fail with Error::Input (output
+/// buffer too small) on every real handshake attempt - confirmed via a
+/// host-native run against the real control server (tm_control/examples/
+/// host_handshake.rs), not caught by the ESP32-C3 stack-overflow debugging
+/// this shared code path with, since that never got far enough to build the
+/// init message before the stack fix.
+pub const NOISE_INIT_MSG_LEN: usize = 96;
 
 /// Size of the Noise handshake response message (received from server).
 pub const NOISE_RESP_MSG_LEN: usize = 48;
@@ -244,11 +252,11 @@ impl NoiseChannel {
             .local_private_key(machine_key.as_bytes())
             .remote_public_key(server_key)
             .build_initiator()
-            .map_err(|_| ControlError::Noise(NoiseError::Handshake))?;
+            .map_err(|e| { tracing::error!("build_initiator failed: {:?}", e); ControlError::Noise(NoiseError::Handshake) })?;
 
     let mut init_msg = [0u8; NOISE_INIT_MSG_LEN];
     let init_len = handshake.write_message(&[], &mut init_msg)
-        .map_err(|_| ControlError::Noise(NoiseError::Handshake))?;
+        .map_err(|e| { tracing::error!("write_message failed: {:?}", e); ControlError::Noise(NoiseError::Handshake) })?;
     let init_payload = &init_msg[..init_len];
 
     // ── Step 2: HTTP/1.1 Upgrade request ─────────────────────────────────────
@@ -268,7 +276,9 @@ impl NoiseChannel {
     //   \r\n
 
     let req = build_upgrade_request(host, cap_version, init_payload);
+    tracing::debug!("do_noise_handshake() - request ({} bytes, init_payload {} bytes):\n{}", req.len(), init_payload.len(), req.as_str());
     stream.write_all(req.as_bytes()).await.map_err(|_| ControlError::Io)?;
+    tracing::debug!("do_noise_handshake() - request write_all returned Ok");
 
     // ── Step 3: Parse 101 Switching Protocols ─────────────────────────────────
 
@@ -327,12 +337,12 @@ impl NoiseChannel {
 
     let mut resp_payload = [0u8; 64]; // Noise IK response payload (empty for ts2021)
     handshake.read_message(noise_resp_start, &mut resp_payload)
-        .map_err(|_| ControlError::Noise(NoiseError::Handshake))?;
+        .map_err(|e| { tracing::error!("read_message (noise response) failed: {:?}", e); ControlError::Noise(NoiseError::Handshake) })?;
 
     // ── Step 6: Transition to transport mode ──────────────────────────────────
 
     let transport = handshake.into_transport_mode()
-        .map_err(|_| ControlError::Noise(NoiseError::Handshake))?;
+        .map_err(|e| { tracing::error!("into_transport_mode failed: {:?}", e); ControlError::Noise(NoiseError::Handshake) })?;
 
         tracing::debug!("do_noise_handshake() - NoiseChannel created with heap-allocated buffers (2 x 4114 bytes = 8228 bytes)");
         Ok(NoiseChannel {
@@ -346,9 +356,10 @@ impl NoiseChannel {
 
 // ── Helper: build the HTTP/1.1 Upgrade request string ─────────────────────────
 
-/// Buffer size for the base64-encoded init message: NOISE_INIT_MSG_LEN (80)
-/// bytes encodes to ceil(80/3)*4 = 108 base64 chars. Sized generously.
-const BASE64_BUF_LEN: usize = 128;
+/// Buffer size for the base64-encoded init message: NOISE_INIT_MSG_LEN (96)
+/// bytes encodes to exactly ceil(96/3)*4 = 128 base64 chars. A little slack
+/// on top in case NOISE_INIT_MSG_LEN ever grows again.
+const BASE64_BUF_LEN: usize = 144;
 
 /// Minimal base64 (standard alphabet, `=`-padded) encoder — avoids pulling
 /// in a `base64` crate dependency for this one tens-of-bytes value.

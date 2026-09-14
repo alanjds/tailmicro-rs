@@ -325,7 +325,9 @@ impl ControlActor {
 
 impl ControlActor {
     async fn open_tcp(&self, host: &str, port: u16) -> Result<tokio::net::TcpStream, ControlError> {
-        tokio::net::TcpStream::connect((host, port)).await.map_err(|_| ControlError::Io)
+        let s = tokio::net::TcpStream::connect((host, port)).await.map_err(|_| ControlError::Io)?;
+        tracing::debug!("open_tcp: connected local={:?} peer={:?} nodelay={:?}", s.local_addr(), s.peer_addr(), s.nodelay());
+        Ok(s)
     }
 }
 

@@ -18,3 +18,10 @@ async-channel = { workspace = true }
 thiserror = { workspace = true }
 tracing   = { workspace = true }
 log       = { workspace = true }
+
+[dev-dependencies]
+# For host-native examples/tests exercising the control connection directly
+# (no ESP-IDF needed: this crate has no ESP dependency, only the top-level
+# `tailmicro` crate does, for WiFi/NVS unrelated to this path).
+tokio = { workspace = true, features = ["rt", "macros", "net", "sync", "io-util", "time"] }
+tracing-subscriber = "0.3"
