@@ -40,7 +40,18 @@ impl NodePublicKey {
     pub fn as_bytes(&self) -> &[u8; 32] { &self.0 }
 
     /// Hex-encoded, prefixed — matches Tailscale wire format.
-    pub fn to_hex(&self) -> heapless::String<68> {
+    ///
+    /// Capacity is 80, not the tighter 68 this used to be: `"nodekey:"` (8
+    /// bytes) + 64 hex digits = 72 bytes, already over 68. The `core::fmt::write`
+    /// calls below silently truncate on overflow (`let _ =` discards the
+    /// `Err`), so the old capacity produced a real-looking but truncated
+    /// 60-hex-digit (30-byte) key with no error anywhere - confirmed live:
+    /// this is what made every `RegisterRequest.NodeKey` sent to the real
+    /// control server malformed, which it rejected with a generic `500`.
+    /// Root-caused by logging the exact request body sent from
+    /// `connect_and_poll` and noticing the hex string was short. See
+    /// docs/noise-handshake-wire-format.md.
+    pub fn to_hex(&self) -> heapless::String<80> {
         let mut s = heapless::String::new();
         s.push_str("nodekey:").ok();
         for b in &self.0 {
@@ -72,7 +83,7 @@ impl MachinePrivateKey {
 impl MachinePublicKey {
     pub fn from_bytes(b: [u8; 32]) -> Self { Self(b) }
     pub fn as_bytes(&self) -> &[u8; 32] { &self.0 }
-    pub fn to_hex(&self) -> heapless::String<68> {
+    pub fn to_hex(&self) -> heapless::String<80> {
         let mut s = heapless::String::new();
         s.push_str("mkey:").ok();
         for b in &self.0 {
@@ -109,7 +120,7 @@ impl DiscoPrivateKey {
 impl DiscoPublicKey {
     pub fn from_bytes(b: [u8; 32]) -> Self { Self(b) }
     pub fn as_bytes(&self) -> &[u8; 32] { &self.0 }
-    pub fn to_hex(&self) -> heapless::String<68> {
+    pub fn to_hex(&self) -> heapless::String<80> {
         let mut s = heapless::String::new();
         s.push_str("discokey:").ok();
         for b in &self.0 {

@@ -114,14 +114,37 @@ pub enum ControlEvent {
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct RegisterRequest<'a> {
-    version: u16, node_key: &'a str, old_node_key: &'a str,
+    version: u16, node_key: &'a str,
+    // Option, not a bare &str: the real control server's Go-side type for
+    // this field is `key.NodePublic` (a `"nodekey:<hex>"`-prefixed key),
+    // whose UnmarshalText rejects an empty string. Always sending
+    // `"OldNodeKey":""` (no key rotation in progress) made every
+    // registration request fail with `500 Internal Server Error` - confirmed
+    // root-caused in Python (a real `h2` client got a clean 200 once this
+    // field was omitted instead of sent empty) before this fix; see
+    // docs/noise-handshake-wire-format.md. `skip_serializing_if` omits the
+    // field entirely rather than serializing `null`, matching the official
+    // Rust client's own `Option<NodePublicKey>` + serde_with `is_default`
+    // skip behavior for this same field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_node_key: Option<&'a str>,
     auth: RegisterAuth<'a>, hostinfo: HostInfo<'a>,
 }
 #[derive(Serialize)]
 struct RegisterAuth<'a> { #[serde(rename="AuthKey")] auth_key: &'a str }
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
-struct HostInfo<'a> { os: &'a str, hostname: &'a str }
+struct HostInfo<'a> {
+    // The real field name is "OS" (all-caps, tailcfg.Hostinfo.OS), not the
+    // "Os" that #[serde(rename_all = "PascalCase")] would otherwise produce
+    // from `os` - confirmed via the live control server's response and the
+    // real tailcfg.go source. Explicit rename needed here specifically
+    // because PascalCase-ing a lowercase field only ever capitalizes the
+    // first letter.
+    #[serde(rename = "OS")]
+    os: &'a str,
+    hostname: &'a str,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -211,12 +234,13 @@ impl ControlActor {
         {
             let reg_body = serde_json::to_vec(&RegisterRequest {
                 version: CAPABILITY_VERSION, node_key: node_key_hex.as_str(),
-                old_node_key: "",
+                old_node_key: None,
                 auth: RegisterAuth { auth_key },
                 hostinfo: HostInfo { os: "embedded", hostname: "esp32c3" },
             }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
 
             info!("Tailscale Step 4: registering node");
+            tracing::debug!("register request body: {}", core::str::from_utf8(&reg_body).unwrap_or("<invalid utf8>"));
             let reg_req = build_h2_post("/machine/register", host, 1, &reg_body);
             noise.write_all(&mut main_conn, &reg_req).await?;
         }
@@ -224,6 +248,7 @@ impl ControlActor {
         info!("Tailscale Step 4: reading registration response");
         {
             let reg_bytes = read_one_h2_body(&mut main_conn, &mut noise, &mut h2).await?;
+            tracing::debug!("register response body: {}", core::str::from_utf8(&reg_bytes).unwrap_or("<invalid utf8>"));
             let reg: RegisterResponse = serde_json::from_slice(&reg_bytes)
                 .map_err(|_| ControlError::Json(JsonError::ParseError))?;
 
