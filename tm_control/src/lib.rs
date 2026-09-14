@@ -71,6 +71,15 @@ pub struct MapState<const MAX_PEERS: usize = 8, const MAX_REGIONS: usize = 4> {
 /// Conservative version: avoids PeerChangesDelta (cap 72+).
 pub const CAPABILITY_VERSION: u16 = 72;
 
+/// HTTP/2 stream IDs for this connection's two requests. Each new
+/// client-initiated HTTP/2 request must use its own, incrementing odd
+/// stream ID (RFC 7540 SS5.1.1) - these are not interchangeable or reusable,
+/// which is why parse_frame/WINDOW_UPDATE need the right one passed in
+/// explicitly rather than assuming "1" everywhere. See
+/// docs/noise-handshake-wire-format.md.
+const REGISTER_STREAM_ID: u32 = 1;
+const MAP_STREAM_ID: u32 = 3;
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 pub struct Config {
@@ -241,13 +250,13 @@ impl ControlActor {
 
             info!("Tailscale Step 4: registering node");
             tracing::debug!("register request body: {}", core::str::from_utf8(&reg_body).unwrap_or("<invalid utf8>"));
-            let reg_req = build_h2_post("/machine/register", host, 1, &reg_body);
+            let reg_req = build_h2_post("/machine/register", host, REGISTER_STREAM_ID, &reg_body);
             noise.write_all(&mut main_conn, &reg_req).await?;
         }
 
         info!("Tailscale Step 4: reading registration response");
         {
-            let reg_bytes = read_one_h2_body(&mut main_conn, &mut noise, &mut h2).await?;
+            let reg_bytes = read_one_h2_body(&mut main_conn, &mut noise, &mut h2, REGISTER_STREAM_ID).await?;
             tracing::debug!("register response body: {}", core::str::from_utf8(&reg_bytes).unwrap_or("<invalid utf8>"));
             let reg: RegisterResponse = serde_json::from_slice(&reg_bytes)
                 .map_err(|_| ControlError::Json(JsonError::ParseError))?;
@@ -264,7 +273,7 @@ impl ControlActor {
                 node_key: node_key_hex.as_str(), endpoints: &[], stream: true,
             }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
 
-            let map_req = build_h2_post("/machine/map", host, 3, &map_body);
+            let map_req = build_h2_post("/machine/map", host, MAP_STREAM_ID, &map_body);
             noise.write_all(&mut main_conn, &map_req).await?;
         }
 
@@ -301,7 +310,7 @@ impl ControlActor {
             noise.read_exact(stream, &mut frame_buf[..blen]).await?;
             info!("Tailscale frame received: length={}, type={}", hdr.length, hdr.frame_type);
 
-            match tm_h2::parse_frame(&hdr, &frame_buf[..blen], h2)? {
+            match tm_h2::parse_frame(&hdr, &frame_buf[..blen], MAP_STREAM_ID, h2)? {
                 FrameAction::Data { payload, end_stream } => {
                     info!("Tailscale Data frame: payload_len={}, end_stream={}", payload.len(), end_stream);
                     let done = parser.feed(payload).map_err(ControlError::Json)?;
@@ -310,7 +319,13 @@ impl ControlActor {
                     // Proactive WINDOW_UPDATE (MicroLink technique)
                     let (cwu, swu) = h2.consumed(payload.len() as u32);
                     if cwu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,0,cwu); noise.write_all(stream,&b).await?; }
-                    if swu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,1,swu); noise.write_all(stream,&b).await?; }
+                    // Stream-level WINDOW_UPDATE must target the stream the
+                    // data actually arrived on, not a hardcoded 1 - this was
+                    // fine when the map poll was (incorrectly) the only
+                    // stream ever read, but breaks now that /machine/map
+                    // correctly runs on stream 3 (see parse_frame's
+                    // expected_stream fix). See docs/noise-handshake-wire-format.md.
+                    if swu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,MAP_STREAM_ID,swu); noise.write_all(stream,&b).await?; }
 
                     if done || end_stream {
                         info!("Tailscale parser.finish called, our_ip_sent={}", our_ip_sent);
@@ -388,7 +403,7 @@ fn build_h2_post(path: &str, host: &str, stream_id: u32, body: &[u8]) -> Box<Arr
 }
 
 async fn read_one_h2_body<S: IoStream>(
-    stream: &mut S, noise: &mut NoiseChannel, h2: &mut H2State,
+    stream: &mut S, noise: &mut NoiseChannel, h2: &mut H2State, expected_stream: u32,
 ) -> Result<Box<ArrayVec<u8, 4096>>, ControlError> {
     // Boxed: this local is live across every await in the loop below (it
     // accumulates the body across frames), so it's already part of this
@@ -413,7 +428,7 @@ async fn read_one_h2_body<S: IoStream>(
         let blen = hdr.length as usize;
         fb.resize(blen, 0);
         noise.read_exact(stream, &mut fb[..blen]).await?;
-        match tm_h2::parse_frame(&hdr, &fb[..blen], h2)? {
+        match tm_h2::parse_frame(&hdr, &fb[..blen], expected_stream, h2)? {
             FrameAction::Data { payload, end_stream } => {
                 for b in payload { let _ = body.push(*b); }
                 if end_stream { return Ok(body); }

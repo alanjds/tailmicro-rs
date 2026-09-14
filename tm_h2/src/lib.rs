@@ -296,15 +296,24 @@ pub enum FrameAction<'a> {
 
 /// Parse a frame whose header has already been read.
 ///
-/// `body` must be exactly `hdr.length` bytes.
+/// `body` must be exactly `hdr.length` bytes. `expected_stream` is the
+/// stream ID the caller is currently reading a response for (each HTTP/2
+/// request opens its own, client-chosen, incrementing odd stream ID - this
+/// used to be hardcoded to `1`, which only ever matched the *first* request
+/// made on a connection. Sending a second request - e.g. `/machine/map` on
+/// stream 3, right after `/machine/register` on stream 1 - made every DATA
+/// frame of that second response fail with `UnexpectedStream`, confirmed
+/// live against the real control server once registration itself started
+/// succeeding. See docs/noise-handshake-wire-format.md.
 pub fn parse_frame<'a>(
     hdr:   &FrameHeader,
     body:  &'a [u8],
+    expected_stream: u32,
     state: &mut H2State,
 ) -> Result<FrameAction<'a>, H2Error> {
     match hdr.frame_type {
         FRAME_DATA => {
-            if hdr.stream_id != 1 {
+            if hdr.stream_id != expected_stream {
                 return Err(H2Error::UnexpectedStream(hdr.stream_id));
             }
             // Skip padding if flagged
