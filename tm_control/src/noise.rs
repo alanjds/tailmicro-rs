@@ -94,7 +94,8 @@
 //! For our purposes (ESP32-C3 embedded client), the EarlyNoise payload
 //! is informational only.  We skip it if present.
 
-use snow::{Builder as NoiseBuilder, HandshakeState, TransportState};
+use snow::Builder as NoiseBuilder;
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag, KeyInit, AeadInPlace};
 use crate::{ControlError, NoiseError};
 use tm_keys::MachinePrivateKey;
 
@@ -140,6 +141,14 @@ pub const NOISE_RESP_FRAME_HEADER_LEN: usize = 3;
 const MSG_TYPE_INITIATION: u8 = 1;
 const MSG_TYPE_RESPONSE: u8 = 2;
 const MSG_TYPE_ERROR: u8 = 3;
+const MSG_TYPE_RECORD: u8 = 4;
+
+/// Header length for a post-handshake Record/Error frame: 1-byte type +
+/// 2-byte big-endian length (of ciphertext+tag for Record).
+const FRAME_HEADER_LEN: usize = 3;
+
+/// ChaCha20-Poly1305 authentication tag length.
+const TAG_LEN: usize = 16;
 
 /// Maximum size of the EarlyNoise JSON payload we'll accept (to avoid alloc).
 /// If the server sends something larger, we skip it.
@@ -148,19 +157,46 @@ const MAX_EARLY_NOISE_LEN: usize = 512;
 /// 5-byte prefix that indicates an EarlyNoise payload is present.
 /// From Tailscale Go source: `EarlyPayloadMagic = "\xff\xff\xff\xff\xff"`.
 /// If the first byte is 0xFF, the next 4 bytes are a big-endian u32 length.
+/// This is a *pre-handshake* concept (checked in cleartext, before the Noise
+/// response message) - distinct from the post-handshake "challenge packet"
+/// below, which arrives already Noise-encrypted as a Record message.
 const EARLY_PAYLOAD_MAGIC_BYTE: u8 = 0xFF;
+
+/// Magic prefix for the optional post-handshake "challenge packet": the
+/// server's first Record message may be this 5-byte magic followed by a
+/// 4-byte big-endian length and a JSON payload (`{"nodeKeyChallenge": ...}`),
+/// sent *before* any real HTTP/2 traffic. Confirmed live against
+/// `controlplane.tailscale.com` and cross-checked against the official Rust
+/// client (`tailscale-rs`'s `ts_control/src/tokio/connect.rs`,
+/// `CHALLENGE_MAGIC`). Informational only for us - we skip it if present.
+const CHALLENGE_MAGIC: [u8; 5] = [0xFF, 0xFF, 0xFF, b'T', b'S'];
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// A completed Noise transport channel over which H/2 frames flow.
 ///
-/// After handshake, all data is wrapped in Noise transport messages:
-/// - Wire format: 2-byte big-endian length + encrypted payload + 16-byte tag
-/// - Max payload per message: 65519 bytes (Noise max 65535 - 16 tag)
+/// After handshake, all data is wrapped in Noise transport (Record) messages:
+/// - Wire format: 1-byte type (0x04) + 2-byte big-endian length (of
+///   ciphertext+tag) + ciphertext + 16-byte tag
+/// - The nonce is a 12-byte value: 4 zero bytes + an 8-byte **big-endian**
+///   counter, one per direction, starting at 0. This deviates from the
+///   Noise spec's own default (little-endian) - confirmed against the real
+///   server and against the official Rust client's from-scratch cipher
+///   (`ts_control_noise::cipher::ChaCha20Poly1305BigEndian`), which exists
+///   specifically to work around `snow`'s (and most other Noise libraries')
+///   little-endian nonce convention. `snow::TransportState` cannot be used
+///   here for that reason - we take the raw split keys via
+///   `dangerously_get_raw_split()` instead and drive the cipher ourselves.
 ///
-/// We use 4096-byte payloads (matching our H/2 frame size) for efficiency.
+/// Max payload per message: 65519 bytes (Noise max 65535 - 16 tag). We use
+/// 4096-byte payloads (matching our H/2 frame size) for efficiency.
 pub struct NoiseChannel {
-    state: TransportState,
+    /// Cipher and nonce counter for data we send (initiator's first split key).
+    tx_cipher: ChaCha20Poly1305,
+    tx_nonce:  u64,
+    /// Cipher and nonce counter for data we receive (initiator's second split key).
+    rx_cipher: ChaCha20Poly1305,
+    rx_nonce:  u64,
     /// Scratch buffer for Noise-framed writes, heap allocated.
     /// Size: 4096 payload + 16 tag + 2 length prefix = 4114 bytes.
     /// Boxed so this doesn't get folded into the caller's async state
@@ -216,25 +252,35 @@ impl NoiseChannel {
         stream: &mut S,
         data:   &[u8],
     ) -> Result<(), ControlError> {
-        // Noise transport message: 2-byte length + ciphertext + 16-byte tag
-        let payload_max = self.write_buf.len() - 18; // 2 length + 16 tag
+        // Record wire message: 3-byte header (type=0x04, big-endian length
+        // of ciphertext+tag) + ciphertext + 16-byte tag.
+        let payload_max = self.write_buf.len() - FRAME_HEADER_LEN - TAG_LEN;
         let mut offset = 0;
 
         while offset < data.len() {
             let chunk_len = (data.len() - offset).min(payload_max);
             let chunk = &data[offset..offset + chunk_len];
 
-            // Encrypt into write_buf[2..]
-            let ciphertext_len = self.state
-                .write_message(chunk, &mut self.write_buf[2..])
+            // Encrypt in place into write_buf[3..3+chunk_len]; the tag comes
+            // back separately (detached) and is appended right after.
+            self.write_buf[FRAME_HEADER_LEN..FRAME_HEADER_LEN + chunk_len].copy_from_slice(chunk);
+            let nonce_bytes = be_nonce(self.tx_nonce);
+            let tag = self.tx_cipher
+                .encrypt_in_place_detached(
+                    Nonce::from_slice(&nonce_bytes),
+                    &[],
+                    &mut self.write_buf[FRAME_HEADER_LEN..FRAME_HEADER_LEN + chunk_len],
+                )
                 .map_err(|_| ControlError::Noise(NoiseError::Encrypt))?;
+            self.tx_nonce += 1;
+            self.write_buf[FRAME_HEADER_LEN + chunk_len..FRAME_HEADER_LEN + chunk_len + TAG_LEN]
+                .copy_from_slice(&tag);
 
-            // Prepend 2-byte length (big-endian, per Tailscale wire format)
-            let total = ciphertext_len as u16;
-            self.write_buf[0] = (total >> 8) as u8;
-            self.write_buf[1] =  total        as u8;
+            let ciphertext_len = chunk_len + TAG_LEN;
+            self.write_buf[0] = MSG_TYPE_RECORD;
+            self.write_buf[1..3].copy_from_slice(&(ciphertext_len as u16).to_be_bytes());
 
-            stream.write_all(&self.write_buf[..2 + ciphertext_len]).await
+            stream.write_all(&self.write_buf[..FRAME_HEADER_LEN + ciphertext_len]).await
                 .map_err(|_| ControlError::Io)?;
 
             offset += chunk_len;
@@ -246,31 +292,94 @@ impl NoiseChannel {
         &mut self,
         stream: &mut S,
     ) -> Result<(), ControlError> {
-        // Read 2-byte length prefix
-        let mut len_bytes = [0u8; 2];
-        stream.read_exact(&mut len_bytes).await.map_err(|_| ControlError::Io)?;
-        let msg_len = u16::from_be_bytes(len_bytes) as usize;
+        // Read the 3-byte frame header (type + big-endian length).
+        let mut hdr = [0u8; FRAME_HEADER_LEN];
+        stream.read_exact(&mut hdr).await.map_err(|_| ControlError::Io)?;
+        let msg_type = hdr[0];
+        let ciphertext_len = u16::from_be_bytes([hdr[1], hdr[2]]) as usize;
 
-        if msg_len + 16 > self.read_buf.len() {
+        if ciphertext_len > self.read_buf.len() || ciphertext_len < TAG_LEN {
             return Err(ControlError::Noise(NoiseError::Decrypt));
         }
 
-        // Read the ciphertext
-        stream.read_exact(&mut self.read_buf[..msg_len]).await
+        stream.read_exact(&mut self.read_buf[..ciphertext_len]).await
             .map_err(|_| ControlError::Io)?;
 
-        // Decrypt: read_message takes immutable input, mutable output
-        // We need to copy input to a temporary buffer first to avoid borrow conflict
-        let mut temp = [0u8; 4114];
-        temp[..msg_len].copy_from_slice(&self.read_buf[..msg_len]);
-        let plaintext_len = self.state
-            .read_message(&temp[..msg_len], &mut self.read_buf[..])
-            .map_err(|_| ControlError::Noise(NoiseError::Decrypt))?;
+        match msg_type {
+            MSG_TYPE_RECORD => {
+                let plaintext_len = ciphertext_len - TAG_LEN;
+                let mut tag = [0u8; TAG_LEN];
+                tag.copy_from_slice(&self.read_buf[plaintext_len..ciphertext_len]);
+                let nonce_bytes = be_nonce(self.rx_nonce);
+                self.rx_cipher
+                    .decrypt_in_place_detached(
+                        Nonce::from_slice(&nonce_bytes),
+                        &[],
+                        &mut self.read_buf[..plaintext_len],
+                        Tag::from_slice(&tag),
+                    )
+                    .map_err(|_| ControlError::Noise(NoiseError::Decrypt))?;
+                self.rx_nonce += 1;
+                self.read_avail = plaintext_len;
+                self.read_pos   = 0;
+                Ok(())
+            }
+            MSG_TYPE_ERROR => {
+                // msgTypeError: unauthenticated human-readable text, per the
+                // real protocol - not encrypted/authenticated, hint only.
+                let msg = core::str::from_utf8(&self.read_buf[..ciphertext_len]).unwrap_or("<invalid utf8>");
+                tracing::error!("ts2021 server sent error record: {}", msg);
+                Err(ControlError::Noise(NoiseError::Decrypt))
+            }
+            other => {
+                tracing::error!("ts2021 record frame: unexpected message type {}", other);
+                Err(ControlError::Noise(NoiseError::Decrypt))
+            }
+        }
+    }
 
-        self.read_avail = plaintext_len;
-        self.read_pos   = 0;
+    /// Skip the optional post-handshake "challenge packet" if the server
+    /// sends one as its first Record (see `CHALLENGE_MAGIC`'s doc comment).
+    /// If the first bytes aren't the magic, they're left buffered for the
+    /// caller's next `read_exact` (this is real H/2 traffic, not a challenge).
+    async fn skip_challenge_packet<S: crate::IoStream>(
+        &mut self,
+        stream: &mut S,
+    ) -> Result<(), ControlError> {
+        if self.read_avail == 0 {
+            self.fill_read_buf(stream).await?;
+        }
+        if self.read_avail < CHALLENGE_MAGIC.len()
+            || self.read_buf[self.read_pos..self.read_pos + CHALLENGE_MAGIC.len()] != CHALLENGE_MAGIC
+        {
+            return Ok(());
+        }
+
+        let mut magic = [0u8; 5];
+        self.read_exact(stream, &mut magic).await?;
+        let mut len_buf = [0u8; 4];
+        self.read_exact(stream, &mut len_buf).await?;
+        let json_len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut remaining = json_len;
+        let mut discard = [0u8; 64];
+        while remaining > 0 {
+            let take = remaining.min(discard.len());
+            self.read_exact(stream, &mut discard[..take]).await?;
+            remaining -= take;
+        }
+        tracing::debug!("do_noise_handshake() - skipped {}-byte challenge packet", json_len);
         Ok(())
     }
+}
+
+/// 12-byte AEAD nonce for the ts2021 transport cipher: 4 zero bytes followed
+/// by an 8-byte **big-endian** counter. This deviates from the Noise spec's
+/// own (little-endian) convention - see `NoiseChannel`'s doc comment.
+fn be_nonce(counter: u64) -> [u8; 12] {
+    let mut n = [0u8; 12];
+    n[4..].copy_from_slice(&counter.to_be_bytes());
+    n
 }
 
 // ── Handshake ─────────────────────────────────────────────────────────────────
@@ -432,18 +541,38 @@ impl NoiseChannel {
         .map_err(|e| { tracing::error!("read_message (noise response) failed: {:?}", e); ControlError::Noise(NoiseError::Handshake) })?;
 
     // ── Step 6: Transition to transport mode ──────────────────────────────────
+    //
+    // We can't use snow::HandshakeState::into_transport_mode()/TransportState
+    // here: the real ts2021 transport cipher uses big-endian nonces (see
+    // NoiseChannel's doc comment), which snow's TransportState doesn't
+    // support. `dangerously_get_raw_split()` gives us the two raw derived
+    // keys instead, so we can drive ChaCha20Poly1305 ourselves with the
+    // correct nonce convention. As initiator, the first key is ours to send
+    // with and the second is for what we receive (Noise spec Split():
+    // c1 = initiator-to-responder, c2 = responder-to-initiator; matches
+    // `snow::TransportState`'s own `cipherstates.0`/`.1` assignment for the
+    // initiator role, and the official Rust client's `get_ciphers()` order).
 
-    let transport = handshake.into_transport_mode()
-        .map_err(|e| { tracing::error!("into_transport_mode failed: {:?}", e); ControlError::Noise(NoiseError::Handshake) })?;
+    let (tx_key, rx_key) = handshake.dangerously_get_raw_split();
 
-        tracing::debug!("do_noise_handshake() - NoiseChannel created with heap-allocated buffers (2 x 4114 bytes = 8228 bytes)");
-        Ok(NoiseChannel {
-            state:      transport,
-            write_buf:  Box::new([0u8; 4114]),
-            read_buf:   Box::new([0u8; 4114]),
-            read_avail: 0,
+    tracing::debug!("do_noise_handshake() - NoiseChannel created with heap-allocated buffers (2 x 4114 bytes = 8228 bytes)");
+    let mut channel = NoiseChannel {
+        tx_cipher:  ChaCha20Poly1305::new(Key::from_slice(&tx_key)),
+        tx_nonce:   0,
+        rx_cipher:  ChaCha20Poly1305::new(Key::from_slice(&rx_key)),
+        rx_nonce:   0,
+        write_buf:  Box::new([0u8; 4114]),
+        read_buf:   Box::new([0u8; 4114]),
+        read_avail: 0,
         read_pos:   0,
-    })
+    };
+
+    // The server may send an optional post-handshake "challenge packet" as
+    // its first Record, before any real H/2 traffic - see CHALLENGE_MAGIC's
+    // doc comment. Confirmed live against controlplane.tailscale.com.
+    channel.skip_challenge_packet(stream).await?;
+
+    Ok(channel)
 }
 
 // ── Helper: build the HTTP/1.1 Upgrade request string ─────────────────────────
