@@ -226,6 +226,43 @@ count). Prefer a single confirming run per fix rather than repeated retries,
 and check `https://login.tailscale.com/admin/machines` afterwards to clean
 up any throwaway `esp32c3` test devices this creates.
 
+## Follow-up: truncated NodeKey hex and wrong Hostinfo.OS field name
+
+Fixing `OldNodeKey` above still wasn't enough: `host_handshake.rs` kept
+getting `500 Internal Server Error` even with a real `TAILSCALE_AUTH_KEY`.
+Added temporary `tracing::debug!` logging of the exact JSON request/response
+bytes (rather than writing another Python isolation test - the bug was
+visible directly in the Rust-side request body once logged) and found two
+more bugs in the same request:
+
+1. **`NodeKey` was silently truncated to 30 bytes (60 hex digits) instead
+   of 32 (64 hex digits).** `tm_keys`'s `{Node,Machine,Disco}PublicKey::to_hex()`
+   built the hex string into a `heapless::String<68>`, but `"nodekey:"` (8
+   bytes) + 64 hex digits = 72 bytes - already over capacity before the
+   `discokey:` (9-byte prefix, 73 bytes total) and `mkey:` (5-byte prefix,
+   69 bytes total) variants are even considered. `heapless::String::push_str`
+   and the `core::fmt::write` calls used per-byte both return `Result` and
+   were called with `let _ =` / `.ok()`, silently discarding the overflow
+   error instead of failing loudly - so the string just stopped 4 hex digits
+   short of a full key with no visible error anywhere except a subtly wrong
+   value on the wire. This is exactly the kind of bug the project's own
+   "no `unwrap_or`/`.ok()`/`let _ =` swallowing a real error" review habit
+   exists to catch; it slipped through because `heapless::String::push_str`'s
+   failure mode is silent truncation, not a panic. Fixed by raising the
+   capacity to 80 (comfortably over the worst case, `discokey:` + 64 hex =
+   73) for all three `to_hex()` methods.
+2. **`Hostinfo.OS` was serialized as `"Os"`, not `"OS"`.** The real Go
+   struct field is `tailcfg.Hostinfo.OS` (all-caps, no explicit JSON tag
+   needed on the Go side since the field name itself is `OS`). Rust's
+   `#[serde(rename_all = "PascalCase")]` on a lowercase `os` field produces
+   `"Os"` (only the first letter is capitalized), not `"OS"` - PascalCase
+   doesn't know this particular abbreviation should stay fully capitalized.
+   Fixed with an explicit `#[serde(rename = "OS")]` on that one field.
+
+Both were live-verified fixed via the debug logging (not yet a full
+end-to-end registration success at the time of writing - see the Rust
+change's commit message for the actual outcome of the next live run).
+
 ## Process note
 
 Going forward, when a new protocol-level roadblock turns up, prototype the
