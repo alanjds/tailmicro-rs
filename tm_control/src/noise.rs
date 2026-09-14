@@ -21,16 +21,18 @@
 //! Client                                    Server (controlplane.tailscale.com)
 //!   |                                           |
 //!   |-- POST /ts2021 HTTP/1.1                   |  (1) upgrade request
-//!   |   Upgrade: tailscale-control-protocol     |      Noise init message is
-//!   |   X-Tailscale-Handshake: <base64 init>    |      base64'd into a header,
-//!   |   Content-Length: 0                       |      no body at all
+//!   |   Upgrade: tailscale-control-protocol     |      Noise init message,
+//!   |   X-Tailscale-Handshake: <base64 frame>   |      wire-framed (see below)
+//!   |   Content-Length: 0                       |      and base64'd into a
+//!   |                                           |      header, no body at all
 //!   |<- HTTP/1.1 101 Switching Protocols ------ |  (2) upgrade accepted
 //!   |   Upgrade: tailscale-control-protocol     |
 //!   |                                           |
 //!   |<- [optional: 5-byte EarlyNoise header     |  (3) EarlyNoise payload
 //!   |    + JSON {NodeKey, ...}]                 |      (ignore if absent)
 //!   |                                           |
-//!   |<- <48 bytes Noise IK response> ---------- |  (4) Noise response message
+//!   |<- <3-byte header + 48 bytes Noise IK      |  (4) Noise response message,
+//!   |    response> ----------------------------|      also wire-framed
 //!   |                                           |
 //!   |   [Noise channel established]             |
 //!   |                                           |
@@ -49,19 +51,45 @@
 //! - Cipher: **ChaCha20-Poly1305**
 //! - Hash: **BLAKE2s**
 //!
-//! The `snow` crate supports all of these natively.
+//! The `snow` crate supports all of these natively, *except* the prologue,
+//! which we must set explicitly (see below) - `snow`'s default is empty.
+//!
+//! # Prologue and wire framing (see docs/noise-handshake-wire-format.md)
+//!
+//! Two things the Noise pattern name alone doesn't cover, both required for
+//! the real server to accept the handshake, confirmed against
+//! `tailscale/tailscale`'s `control/controlbase/handshake.go` and
+//! `messages.go`:
+//!
+//! - **Prologue**: `"Tailscale Control Protocol v" + <cap_version>` (ASCII
+//!   decimal) is mixed into the Noise hash state via `MixHash` right after
+//!   `Initialize()`, before the IK pre-message. Without this, the
+//!   initiator's and responder's hash states diverge from message 1 onward,
+//!   so the server's decryption of our encrypted static key fails silently
+//!   and it drops the connection with no response and no error - this was
+//!   the "early eof" bug.
+//! - **Message framing**: the base64 payload in `X-Tailscale-Handshake` is
+//!   not the bare `NOISE_INIT_MSG_LEN`-byte Noise message. It's a
+//!   `NOISE_INIT_FRAME_LEN`-byte `initiationMessage`: 2-byte cap_version
+//!   (big-endian) + 1-byte type (`0x01`) + 2-byte payload length
+//!   (big-endian) + the raw Noise payload. The server's reply is similarly
+//!   wrapped in a `NOISE_RESP_FRAME_HEADER_LEN`-byte header (1-byte type
+//!   `0x02` + 2-byte big-endian length) before the raw Noise response.
 //!
 //! # EarlyNoise payload
 //!
-//! The server may send a 5-byte framing header before the Noise response
-//! message.  The header is:
+//! The server may send a 5-byte framing header before the (wire-framed)
+//! Noise response message.  The header is:
 //! - Bytes 0-4: big-endian `u32` length (of the JSON payload) OR the
 //!   literal bytes `\x00\x00\x00\x00\x00` meaning "no early payload"
 //!
 //! The `EarlyPayloadMagic` is checked via the first byte:
 //! if `buf[0] == 0x00` AND `buf[1] == 0x00` AND len is < 4096, it is a
-//! length-prefixed JSON; otherwise the bytes are the start of the Noise
-//! response message (no early payload).
+//! length-prefixed JSON; otherwise the bytes are the start of the
+//! wire-framed Noise response (no early payload). This never actually
+//! fires against `controlplane.tailscale.com` (its message-type byte for a
+//! real response, `0x02`, never collides with the `0xFF` magic byte), but
+//! is kept for servers that do send it.
 //!
 //! For our purposes (ESP32-C3 embedded client), the EarlyNoise payload
 //! is informational only.  We skip it if present.
@@ -75,7 +103,8 @@ use tm_keys::MachinePrivateKey;
 /// Noise pattern string matching Tailscale's controlbase implementation.
 pub const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
-/// Size of the Noise handshake init message (sent via X-Tailscale-Handshake).
+/// Size of the raw Noise handshake init message (the Noise protocol's own
+/// bytes, before the wire-framing header below is added).
 /// Fixed for Noise_IK_25519_ChaChaPoly_BLAKE2s's first message (-> e, es, s, ss):
 /// e (32, raw ephemeral public key) + s (32 + 16 tag, encrypted static key)
 /// + payload (0 + 16 tag, encrypted empty payload) = 32 + 48 + 16 = 96 bytes.
@@ -88,8 +117,29 @@ pub const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 /// init message before the stack fix.
 pub const NOISE_INIT_MSG_LEN: usize = 96;
 
-/// Size of the Noise handshake response message (received from server).
+/// Size of the raw Noise handshake response message (the Noise protocol's
+/// own bytes, after stripping the 3-byte wire-framing header below).
 pub const NOISE_RESP_MSG_LEN: usize = 48;
+
+/// Size of the `initiationMessage` wire frame actually carried, base64'd, in
+/// the `X-Tailscale-Handshake` header: a 5-byte header (2-byte cap_version
+/// big-endian, 1-byte message type, 2-byte payload length big-endian) plus
+/// the `NOISE_INIT_MSG_LEN`-byte Noise payload. See
+/// `control/controlbase/messages.go`'s `initiationMessage` in the real
+/// tailscale/tailscale source - this framing (not just the bare Noise
+/// payload) is required for the server to accept the handshake at all;
+/// see docs/noise-handshake-wire-format.md for how this was found.
+pub const NOISE_INIT_FRAME_LEN: usize = 5 + NOISE_INIT_MSG_LEN;
+
+/// Size of the `responseMessage` wire frame's header (1-byte message type,
+/// 2-byte payload length big-endian) that precedes the raw
+/// `NOISE_RESP_MSG_LEN`-byte Noise response on the wire.
+pub const NOISE_RESP_FRAME_HEADER_LEN: usize = 3;
+
+/// Wire message types from `control/controlbase/messages.go`.
+const MSG_TYPE_INITIATION: u8 = 1;
+const MSG_TYPE_RESPONSE: u8 = 2;
+const MSG_TYPE_ERROR: u8 = 3;
 
 /// Maximum size of the EarlyNoise JSON payload we'll accept (to avoid alloc).
 /// If the server sends something larger, we skip it.
@@ -248,20 +298,35 @@ impl NoiseChannel {
         // ── Step 1: Build Noise init message ──────────────────────────────────────
 
         tracing::debug!("do_noise_handshake() - Step 1: Building Noise IK init message");
+        // Prologue: "Tailscale Control Protocol v<cap_version>", mixed into
+        // the Noise hash state before anything else. Required for the
+        // server's decryption of our message to succeed at all - see the
+        // module doc comment and docs/noise-handshake-wire-format.md.
+        let prologue = format!("Tailscale Control Protocol v{}", cap_version);
         let mut handshake = NoiseBuilder::new(NOISE_PATTERN.parse().unwrap())
             .local_private_key(machine_key.as_bytes())
             .remote_public_key(server_key)
+            .prologue(prologue.as_bytes())
             .build_initiator()
             .map_err(|e| { tracing::error!("build_initiator failed: {:?}", e); ControlError::Noise(NoiseError::Handshake) })?;
 
     let mut init_msg = [0u8; NOISE_INIT_MSG_LEN];
     let init_len = handshake.write_message(&[], &mut init_msg)
         .map_err(|e| { tracing::error!("write_message failed: {:?}", e); ControlError::Noise(NoiseError::Handshake) })?;
-    let init_payload = &init_msg[..init_len];
+
+    // Wire-frame the raw Noise payload into the `initiationMessage` layout
+    // the real server expects (see module doc comment): 2-byte cap_version
+    // (BE) + 1-byte type (0x01) + 2-byte payload length (BE) + payload.
+    let mut init_frame = [0u8; NOISE_INIT_FRAME_LEN];
+    init_frame[0..2].copy_from_slice(&cap_version.to_be_bytes());
+    init_frame[2] = MSG_TYPE_INITIATION;
+    init_frame[3..5].copy_from_slice(&(init_len as u16).to_be_bytes());
+    init_frame[5..5 + init_len].copy_from_slice(&init_msg[..init_len]);
+    let init_payload = &init_frame[..5 + init_len];
 
     // ── Step 2: HTTP/1.1 Upgrade request ─────────────────────────────────────
     //
-    // The Noise init message is base64-encoded into the
+    // The wire-framed init message is base64-encoded into the
     // `X-Tailscale-Handshake` header. There is no body (Content-Length: 0)
     // — see the module doc comment for why.
     //
@@ -284,20 +349,19 @@ impl NoiseChannel {
 
     read_101_response(stream).await?;
 
-    // ── Step 4: Handle optional EarlyNoise payload ────────────────────────────
+    // ── Step 4: Handle optional EarlyNoise payload, then the response frame ──
     //
     // The server may or may not send an EarlyNoise JSON payload before the
-    // Noise response message.  We detect it by peeking at the first byte:
-    // - 0xFF: EarlyNoise is present — read length, skip JSON
-    // - anything else: first byte of the Noise response — include in processing
+    // wire-framed Noise response message.  We detect it by peeking at the
+    // first byte:
+    // - 0xFF: EarlyNoise is present — read length, skip JSON, then read a
+    //   fresh byte for the response frame's type field below.
+    // - anything else: it's already the response frame's type byte.
 
     let mut first_byte = [0u8; 1];
     stream.read_exact(&mut first_byte).await.map_err(|_| ControlError::Io)?;
 
-    let mut noise_resp_buf = [0u8; NOISE_RESP_MSG_LEN];
-    let noise_resp_start;
-
-    if first_byte[0] == EARLY_PAYLOAD_MAGIC_BYTE {
+    let msg_type = if first_byte[0] == EARLY_PAYLOAD_MAGIC_BYTE {
         // Read remaining 4 bytes of the 5-byte EarlyNoise header
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await.map_err(|_| ControlError::Io)?;
@@ -322,16 +386,44 @@ impl NoiseChannel {
             }
         }
 
-        // Now read the full Noise response
-        stream.read_exact(&mut noise_resp_buf).await.map_err(|_| ControlError::Io)?;
-        noise_resp_start = &noise_resp_buf[..];
+        // The response frame follows; read its type byte fresh.
+        let mut type_byte = [0u8; 1];
+        stream.read_exact(&mut type_byte).await.map_err(|_| ControlError::Io)?;
+        type_byte[0]
     } else {
-        // first_byte[0] is the first byte of the Noise response
-        noise_resp_buf[0] = first_byte[0];
-        stream.read_exact(&mut noise_resp_buf[1..]).await
-            .map_err(|_| ControlError::Io)?;
-        noise_resp_start = &noise_resp_buf[..];
+        first_byte[0]
+    };
+
+    // Read the remaining 2 bytes of the 3-byte response frame header
+    // (message type already consumed above; this is the big-endian length).
+    let mut resp_len_buf = [0u8; 2];
+    stream.read_exact(&mut resp_len_buf).await.map_err(|_| ControlError::Io)?;
+    let resp_frame_len = u16::from_be_bytes(resp_len_buf) as usize;
+
+    let mut noise_resp_buf = [0u8; NOISE_RESP_MSG_LEN];
+    match msg_type {
+        MSG_TYPE_RESPONSE => {
+            if resp_frame_len != NOISE_RESP_MSG_LEN {
+                tracing::error!("ts2021 response frame: unexpected length {} (want {})", resp_frame_len, NOISE_RESP_MSG_LEN);
+                return Err(ControlError::Noise(NoiseError::Handshake));
+            }
+            stream.read_exact(&mut noise_resp_buf).await.map_err(|_| ControlError::Io)?;
+        }
+        MSG_TYPE_ERROR => {
+            // msgTypeError: unauthenticated human-readable text, per the
+            // real protocol - not encrypted/authenticated, hint only.
+            let mut err_buf = [0u8; MAX_EARLY_NOISE_LEN];
+            let take = resp_frame_len.min(err_buf.len());
+            stream.read_exact(&mut err_buf[..take]).await.map_err(|_| ControlError::Io)?;
+            tracing::error!("ts2021 server rejected handshake: {}", core::str::from_utf8(&err_buf[..take]).unwrap_or("<invalid utf8>"));
+            return Err(ControlError::Noise(NoiseError::Handshake));
+        }
+        other => {
+            tracing::error!("ts2021 response frame: unexpected message type {}", other);
+            return Err(ControlError::Noise(NoiseError::Handshake));
+        }
     }
+    let noise_resp_start = &noise_resp_buf[..];
 
     // ── Step 5: Process Noise response ────────────────────────────────────────
 
@@ -356,10 +448,10 @@ impl NoiseChannel {
 
 // ── Helper: build the HTTP/1.1 Upgrade request string ─────────────────────────
 
-/// Buffer size for the base64-encoded init message: NOISE_INIT_MSG_LEN (96)
-/// bytes encodes to exactly ceil(96/3)*4 = 128 base64 chars. A little slack
-/// on top in case NOISE_INIT_MSG_LEN ever grows again.
-const BASE64_BUF_LEN: usize = 144;
+/// Buffer size for the base64-encoded, wire-framed init message:
+/// NOISE_INIT_FRAME_LEN (101) bytes encodes to ceil(101/3)*4 = 136 base64
+/// chars. A little slack on top in case the frame ever grows again.
+const BASE64_BUF_LEN: usize = 160;
 
 /// Minimal base64 (standard alphabet, `=`-padded) encoder — avoids pulling
 /// in a `base64` crate dependency for this one tens-of-bytes value.
