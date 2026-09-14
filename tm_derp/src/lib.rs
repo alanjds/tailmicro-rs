@@ -107,7 +107,13 @@ pub enum DerpCmd {
     SendPacket {
         dst_key: NodePublicKey,
         /// Caller-owned buffer; actor copies out of it before returning.
-        payload: heapless::Vec<u8, MAX_DERP_PAYLOAD>,
+        ///
+        /// Boxed: async_channel's ring buffer (concurrent-queue) reserves 31
+        /// slots per block and returns each block by value, so an unboxed
+        /// MAX_DERP_PAYLOAD-sized buffer here balloons the caller's combined
+        /// async stack frame by 31x (see the ESP32-C3 stack overflow at
+        /// Runtime::join()'s tokio::join! entry).
+        payload: Box<heapless::Vec<u8, MAX_DERP_PAYLOAD>>,
     },
     Disconnect,
     Shutdown,
@@ -120,8 +126,8 @@ pub enum DerpEvent {
     /// A WireGuard packet arrived from a peer.
     PacketReceived {
         src_key: NodePublicKey,
-        /// Fixed-size buffer — no heap allocation per packet.
-        payload: heapless::Vec<u8, MAX_DERP_PAYLOAD>,
+        /// Boxed for the same reason as DerpCmd::SendPacket's payload above.
+        payload: Box<heapless::Vec<u8, MAX_DERP_PAYLOAD>>,
     },
     /// Server sent PING — we respond automatically, but surface it for metrics.
     PingReceived,

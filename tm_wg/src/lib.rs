@@ -84,11 +84,19 @@ mod ffi {
 
 pub enum WgCmd {
     /// Apply a fresh MapState — add new peers, remove gone ones.
-    ApplyMap(MapState<MAX_PEERS, 4>),
+    ///
+    /// Boxed: `async_channel`'s unbounded ring buffer (`concurrent-queue`)
+    /// reserves 31 slots per block and returns each block by value, so an
+    /// unboxed ~1.5KB variant here balloons the caller's stack frame (the
+    /// combined `tokio::join!()` poll function in `tm_runtime::Runtime::join`)
+    /// by 31x, even though these channels are actually bounded and this path
+    /// never runs. See tailmicro-rs commit fixing the ESP32-C3 stack overflow
+    /// at Runtime::join()'s tokio::join! entry.
+    ApplyMap(Box<MapState<MAX_PEERS, 4>>),
     /// Route an incoming WireGuard packet from DERP.
     InboundPacket {
         src_key: [u8; 32],
-        payload: heapless::Vec<u8, 1500>,
+        payload: Box<heapless::Vec<u8, 1500>>,
     },
     Shutdown,
 }
@@ -97,7 +105,7 @@ pub enum WgEvent {
     /// An outbound packet to send via DERP.
     OutboundPacket {
         dst_key: [u8; 32],
-        payload: heapless::Vec<u8, 1500>,
+        payload: Box<heapless::Vec<u8, 1500>>,
     },
     /// A WireGuard handshake completed.
     PeerHandshook([u8; 32]),

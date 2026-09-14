@@ -101,7 +101,12 @@ impl From<H2Error> for ControlError { fn from(e: H2Error) -> Self { Self::H2(e) 
 
 pub enum ControlCmd  { Start { auth_key: heapless::String<128> }, Reauth, Shutdown }
 pub enum ControlEvent {
-    MapUpdate(MapState), OurIpAssigned(TailnetIp), KeyExpiry, Error(ControlError),
+    // Boxed: async_channel's ring buffer (concurrent-queue) reserves 31 slots
+    // per block and returns each block by value, so an unboxed MapState here
+    // balloons the caller's combined async stack frame by 31x (see the
+    // ESP32-C3 stack overflow at Runtime::join()'s tokio::join! entry, fixed
+    // by boxing every oversized channel message payload across the workspace).
+    MapUpdate(Box<MapState>), OurIpAssigned(TailnetIp), KeyExpiry, Error(ControlError),
 }
 
 // ── Wire types ────────────────────────────────────────────────────────────────
@@ -296,7 +301,7 @@ impl ControlActor {
                         }
                         let old = core::mem::replace(&mut parser, MapParser::new());
                         info!("Tailscale MapUpdate event sent");
-                        let _ = events.send(ControlEvent::MapUpdate(old.out)).await;
+                        let _ = events.send(ControlEvent::MapUpdate(Box::new(old.out))).await;
                         if end_stream { info!("Tailscale stream ended"); return Ok(()); }
                     }
                 }
@@ -326,8 +331,17 @@ impl ControlActor {
 
 // ── H/2 request builder ───────────────────────────────────────────────────────
 
-fn build_h2_post(path: &str, host: &str, stream_id: u32, body: &[u8]) -> ArrayVec<u8, MAX_REQUEST_SIZE> {
-    let mut out = ArrayVec::new();
+// Boxed return: an unboxed ArrayVec<u8, MAX_REQUEST_SIZE> (~4.3KB) returned
+// by value here forces every caller to reserve a matching slot in its own
+// stack frame to receive it, on top of anything the caller already holds.
+// build_h2_post's own frame is a normal (non-async) call frame, released as
+// soon as it returns, so building `out` on its own stack and moving it into
+// a Box costs nothing extra there; the caller (connect_and_poll) only pays
+// for a pointer. Confirmed via a live Wokwi stack-overflow at this call site
+// after fixing the much larger tokio::join! frame bug (see connect_and_poll
+// and read_one_h2_body's boxing for the same reasoning).
+fn build_h2_post(path: &str, host: &str, stream_id: u32, body: &[u8]) -> Box<ArrayVec<u8, MAX_REQUEST_SIZE>> {
+    let mut out: Box<ArrayVec<u8, MAX_REQUEST_SIZE>> = Box::new(ArrayVec::new());
     let mut hbuf = [0u8; 256];
     let hlen = write_map_request_headers(&mut hbuf, stream_id, b"", host.as_bytes());
     for b in &hbuf[..hlen] { let _ = out.push(*b); }
@@ -348,8 +362,18 @@ fn build_h2_post(path: &str, host: &str, stream_id: u32, body: &[u8]) -> ArrayVe
 
 async fn read_one_h2_body<S: IoStream>(
     stream: &mut S, noise: &mut NoiseChannel, h2: &mut H2State,
-) -> Result<ArrayVec<u8, 4096>, ControlError> {
-    let mut body: ArrayVec<u8, 4096> = ArrayVec::new();
+) -> Result<Box<ArrayVec<u8, 4096>>, ControlError> {
+    // Boxed: this local is live across every await in the loop below (it
+    // accumulates the body across frames), so it's already part of this
+    // async fn's flattened generator state (this whole call chain is awaited
+    // inline, no spawn/Box::pin boundary). Returning it by value on top of
+    // that also forces the caller (connect_and_poll) to reserve a second
+    // 4096-byte slot to receive it. Boxing keeps it off the stack/state
+    // entirely and makes the return just a pointer move. Confirmed via a
+    // live Wokwi run: after fixing the tokio::join! 64KB frame bug, a
+    // smaller (~8KB) stack overflow remained here and in build_h2_post's
+    // by-value ArrayVec return, both fixed the same way.
+    let mut body: Box<ArrayVec<u8, 4096>> = Box::new(ArrayVec::new());
     // Vec, not heapless::Vec: same reasoning as stream_map_response's
     // frame_buf (see comment there) — this local is live across every await
     // in the loop below, nested inline in the same unboxed call chain.

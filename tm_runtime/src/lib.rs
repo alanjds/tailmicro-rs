@@ -332,7 +332,7 @@ impl Runtime {
                                         let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
                                             src_ip:   [0; 4],
                                             src_port: 0,
-                                            data,
+                                            data: Box::new(data),
                                         }).await;
                                         #[cfg(target_os = "espidf")]
                                         tokio_freertos_yield().await;
@@ -341,7 +341,7 @@ impl Runtime {
                                         let _ = pkt.extend_from_slice(&payload);
                                         let _ = wg_tx2.send(WgCmd::InboundPacket {
                                             src_key: *src_key.as_bytes(),
-                                            payload: pkt,
+                                            payload: Box::new(pkt),
                                         }).await;
                                         #[cfg(target_os = "espidf")]
                                         tokio_freertos_yield().await;
@@ -507,7 +507,7 @@ impl Runtime {
                                         let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
                                             src_ip:   [0; 4],  // from DERP src
                                             src_port: 0,
-                                            data,
+                                            data: Box::new(data),
                                         }).await;
                                     } else {
                                         // WireGuard packet
@@ -515,7 +515,7 @@ impl Runtime {
                                         let _ = pkt.extend_from_slice(&payload);
                                         let _ = wg_tx2.send(WgCmd::InboundPacket {
                                             src_key: *src_key.as_bytes(),
-                                            payload: pkt,
+                                            payload: Box::new(pkt),
                                         }).await;
                                     }
                                 }
