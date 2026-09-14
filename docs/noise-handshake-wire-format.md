@@ -85,6 +85,59 @@ real `tailscale/tailscale` Go source (`control/controlbase/handshake.go`,
 `control/controlbase/messages.go`) to confirm both findings against ground
 truth rather than trial and error.
 
+## Follow-up: transport-phase framing and nonce endianness
+
+Fixing the handshake above got past the Noise IK exchange, but registration
+then failed with a raw `Connection reset by peer` while reading the
+response. Cross-checked against the *official Rust reference implementation*
+(`github.com/tailscale/tailscale-rs`, specifically its `ts_control_noise`
+crate - locally available at `~/src/tailscale-rs`, our own fork with
+`~/src/tailscale-rs_upstream` kept alongside as the pristine tracking
+checkout), which independently confirmed two more real bugs, both again in
+`tm_control/src/noise.rs`'s `NoiseChannel`:
+
+1. **Wrong post-handshake wire framing.** `NoiseChannel` used a bare 2-byte
+   big-endian length prefix for transport-mode (`Record`) messages. The real
+   protocol wraps every post-handshake message the same way as the handshake
+   response: a 3-byte header (1-byte type - `0x04` for `Record`, `0x03` for
+   an unauthenticated `Error` message - + 2-byte big-endian length). Sending
+   without the type byte meant the server read our length's high byte as an
+   invalid message type and reset the connection outright - this explains
+   the raw TCP reset rather than a decrypt failure.
+2. **Wrong nonce endianness in the transport cipher.** `snow::TransportState`
+   uses the Noise spec's default little-endian nonce encoding. The real
+   ts2021 transport cipher uses **big-endian** nonces (confirmed in
+   `ts_control_noise::cipher::ChaCha20Poly1305BigEndian`, whose entire reason
+   for existing - per its own doc comment - is this exact deviation).
+   `snow::TransportState` has no way to override this, so `tm_control` now
+   takes the raw split keys via `dangerously_get_raw_split()` (an explicit,
+   `risky-raw-split`-feature-gated snow API for exactly this situation) and
+   drives `chacha20poly1305::ChaCha20Poly1305` directly with a big-endian
+   nonce, matching the reference.
+
+There's also a third, related piece: an optional **post-handshake challenge
+packet** - magic `\xFF\xFF\xFF 'T' 'S'` + 4-byte big-endian length + JSON
+(`{"nodeKeyChallenge": "chalpub:..."}`), sent as the server's first
+already-encrypted `Record` message, before any real HTTP/2 traffic. This is
+a different layer than the pre-handshake "EarlyNoise" concept `noise.rs`
+already handled (that one is cleartext, before the Noise response message).
+Both the official Go and Rust clients skip it unconditionally; `tm_control`
+now does the same (`NoiseChannel::skip_challenge_packet`).
+
+All three were verified with the same from-spec Python approach: extended
+the Python Noise IK reference with a matching transport codec (big-endian
+nonce, 3-byte Record framing), sent a minimal HTTP/2 client preface as the
+first Record after a real handshake, and confirmed the server replied with
+a real challenge packet (successfully decrypted, readable JSON) instead of
+resetting the connection - before porting any of this into Rust.
+
+Ported into `tm_control`, this gets the handshake and transport layer fully
+working end-to-end against the live server: `host_handshake.rs` now reaches
+real HTTP/2-level traffic (a `GoAway` from the h2 crate on the registration
+request) instead of failing anywhere in the Noise/transport plumbing. The
+`GoAway` is a distinct, later-stage bug (something about how the register
+request itself is built), tracked separately.
+
 ## Process note
 
 Going forward, when a new protocol-level roadblock turns up, prototype the
