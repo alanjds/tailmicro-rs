@@ -138,6 +138,49 @@ request) instead of failing anywhere in the Noise/transport plumbing. The
 `GoAway` is a distinct, later-stage bug (something about how the register
 request itself is built), tracked separately.
 
+## Follow-up: two H/2-layer bugs behind the same `GoAway`
+
+The `GoAway { error_code: 1 }` (PROTOCOL_ERROR) turned out to have two
+independent causes in `tm_h2`/`tm_control`, found one at a time using the
+same Python-first approach (a real `h2` library client driven over the
+already-validated Noise transport, `h2_register_test.py` and its variants).
+
+1. **Hardcoded `:path`.** `tm_h2::write_map_request_headers` always wrote
+   `/ts2021` (the *upgrade* path) as the HEADERS frame's `:path`, ignoring
+   the actual endpoint (`/machine/register`, `/machine/map`) the caller
+   wanted. Sending a correctly-pathed request via the `h2` library over the
+   validated transport got a normal response (`:status 500`) instead of a
+   `GoAway`, confirming this. Fixed by adding a `path: &[u8]` parameter and
+   threading it through from `build_h2_post`. **This fix alone was not
+   sufficient** — re-testing against the live server after porting it to
+   Rust still produced the identical `GoAway`, which is what led to bug 2.
+2. **`SETTINGS_MAX_FRAME_SIZE` below the RFC 7540 minimum.**
+   `tm_h2::write_settings` advertised `SETTINGS_MAX_FRAME_SIZE = 4096`.
+   RFC 7540 SS6.5.2 fixes the legal range for this setting at
+   `2^14..=2^24-1` (16384..=16777215) and mandates that a peer treat any
+   value outside that range as a connection-level PROTOCOL_ERROR — which is
+   exactly the `GoAway { error_code: 1 }` seen, sent immediately after our
+   SETTINGS frame, before the server ever looked at the HEADERS/DATA that
+   followed. This was not caught by the `path`-fix Python test because that
+   test used the `h2` library's own `initiate_connection()`, which sends
+   spec-compliant default settings — it never replicated `tm_h2`'s actual
+   (invalid) SETTINGS bytes. Root-caused by building a Python test that
+   sends a byte-for-byte reproduction of `tm_h2::write_settings`'s frame as
+   its own Record ahead of the HEADERS/DATA: with `MAX_FRAME_SIZE=4096` the
+   live server sent `ConnectionTerminated error_code:1` right after the
+   SETTINGS record (matching the Rust symptom exactly); with
+   `MAX_FRAME_SIZE=16384` the same script got a real `:status 500` response.
+   Fixed by raising `tm_h2::MAX_FRAME_SIZE` to `16384`. Frame buffers in
+   `tm_control` are heap `Vec<u8>`s sized per received frame, not fixed-size
+   stack arrays, so this costs nothing unless the server actually sends a
+   frame that large.
+
+**Lesson for future Python-first bisection**: a reference script must
+replicate the actual bytes the Rust code sends for *every* frame in the
+sequence under test, not just the one frame believed to be buggy — reusing
+a well-behaved library's defaults for "the rest" of the exchange can hide a
+second bug (as it did here for one iteration).
+
 ## Process note
 
 Going forward, when a new protocol-level roadblock turns up, prototype the
