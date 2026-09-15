@@ -27,6 +27,18 @@ machine are hand-rolled in `wg_spec.py`. No Noise/WireGuard library is used.
   implementation.
 - `boringtun_peer/`: a tiny detached-workspace Rust crate that runs boringtun
   as a responder for the interop test.
+- `ts_control.py`: **rung 2**: an independent, from-spec ts2021 control-plane
+  client (Noise_IK handshake, HTTP/2-over-Noise register + MapRequest,
+  MapResponse peer/DERPMap parsing).
+- `derp_client.py`: an independent, from-spec DERP relay client (TLS + `/derp`
+  upgrade, ServerKey/ClientInfo/ServerInfo SalsaBox handshake, SendPacket/
+  RecvPacket framing).
+- `disco.py`: an independent, from-spec disco ping/pong codec (SalsaBox), used
+  to wake a real peer's lazy wireguard config so it answers the handshake.
+- `validate_live_tailnet.py`: **rung 2 (live tailnet)**: uses the three clients
+  above to find an online peer and drive `wg_spec.py`'s initiator through DERP
+  to it — real Handshake Initiation → real type-2 Handshake Response → key
+  schedule → transport ICMP echo round-trip.
 
 The Rust side of the oracle lives in `tm_wg/examples/wg_emit_vectors.rs` and
 `tm_wg/examples/wg_cookie_probe.rs`, reached via the documented deterministic
@@ -45,19 +57,31 @@ uv run --with cryptography python3 tools/wg_validator/validate_offline.py
 #   backend on current nightly; keep the build target out of the repo.
 CARGO_TARGET_DIR="$(mktemp -d)" \
   uv run --with cryptography python3 tools/wg_validator/validate_live_boringtun.py
+
+# Rung 2 (LIVE tailnet): real WireGuard handshake to a real Tailscale peer,
+# relayed through DERP. Reads TAILSCALE_AUTH_KEY from the .env files (or set
+# TS_ENV=/path/to/.env). Registers a node named "wg-validator-probe".
+uv run --with cryptography --with h2 --with pynacl \
+  python3 tools/wg_validator/validate_live_tailnet.py
 ```
 
-Both scripts print a PASS/FAIL table and exit non-zero on any failure.
+All scripts print a PASS/FAIL table and exit non-zero on any failure.
 
 ## Status / limits
 
 - **Rung 1 (offline byte-level): PASS, byte-for-byte, no discrepancy found.**
 - **boringtun interop: PASS** (handshake + transport, both directions).
-- **NOT run against the live Tailscale tailnet.** A real handshake to a real
-  Tailscale peer needs a DERP relay client (peers are NAT'd) plus an
-  independent ts2021 control-plane client to fetch peers; that was out of
-  scope for this pass. The control endpoint is live and reachable (blocker is
-  implementation scope, not access). See `docs/wg-dataplane-notes.md`.
+- **Rung 2 (LIVE Tailscale tailnet): PASS — real peer interop confirmed.**
+  A real Tailscale peer returned a genuine type-2 WireGuard Handshake Response
+  over DERP; it AEAD-verified against our key schedule and an ICMP echo
+  round-tripped through the tunnel. No `tm_wg` discrepancy. Requires a live
+  auth key and at least one online peer on the tailnet; see
+  `docs/wg-dataplane-notes.md` for the captured output and the control/DERP/
+  disco findings surfaced along the way.
 
-The scalars in the emitters/scripts are fixed **test constants**, not secrets.
-No secret key material or Tailscale auth key is printed or committed.
+The scalars in the offline emitters/scripts are fixed **test constants**, not
+secrets. `validate_live_tailnet.py` reads the Tailscale auth key from the
+`.env` files at run time only; no secret key material or auth key is printed
+or committed. Each live run registers a `wg-validator-probe` node — with a
+non-ephemeral auth key these persist and should be removed from
+`https://login.tailscale.com/admin/machines`.
