@@ -201,6 +201,104 @@ peer crate is a detached workspace so it never touches the firmware graph.
   rekey timers, or the ESP32 target (those remain covered by host `cargo test`
   / future Wokwi runs).
 
+## Live Tailscale tailnet interop — the missing rung, now CLOSED
+
+The prior pass explicitly could not reach a real Tailscale peer (see "Honest
+limits" above: it needed a from-spec ts2021 control client + a DERP relay
+client, which were out of scope then). This pass built exactly those, all
+independent and from-spec, and drove `wg_spec.py`'s initiator through DERP to a
+**real Tailscale peer on the live tailnet**.
+
+New from-spec Python under `tools/wg_validator/` (independent oracles, not Rust
+transliterations; cross-checked against `tm_control`, `tm_derp`, `tm_disco`,
+and the upstream `tailscale-rs` reference):
+
+- `ts_control.py` — ts2021 control client: fetches the server Noise key from
+  `GET /key?v=72`, does the Noise_IK handshake (distinct construction string /
+  no-PSK / IK pre-message vs. the WireGuard `Noise_IKpsk2` in `wg_spec.py`),
+  the big-endian-nonce + 3-byte-Record transport codec, skips the challenge
+  packet, then drives HTTP/2 (the `h2` library) over the Noise transport to
+  register and to MapRequest/MapResponse.
+- `derp_client.py` — DERP relay client: TLS + `GET /derp` upgrade, ServerKey /
+  ClientInfo / ServerInfo handshake (NaCl `crypto_box`/SalsaBox), and
+  SendPacket/RecvPacket framing.
+- `disco.py` — from-spec disco ping/pong (SalsaBox, magic `TS💬`), needed to
+  wake a real peer's lazy wireguard config (see finding 3 below).
+- `validate_live_tailnet.py` — the glue that runs all five rungs.
+
+### Result: LIVE PEER INTEROP CONFIRMED — no `tm_wg` discrepancy
+
+Against peer `lenovopill` (a real Tailscale node) home DERP region 11, relayed
+through `derp11e.tailscale.com`, every rung passed with real captured output:
+
+1. ts2021 Noise IK control handshake + transport established (server key
+   `mkey:7d2792f9…`).
+2. Node registered on the live tailnet: `MachineAuthorized=true`.
+3. MapResponse parsed: our tailnet IP assigned, 32 peers, 3 online; DERPMap
+   region→hostname table extracted.
+4. DERP handshake completed (`proto=2`).
+5. **The real peer returned a genuine WireGuard Handshake Response (type 2,
+   92 B) over DERP** — e.g.
+   `02000000d0f5751dd86eb4ee764dd44e062efa7ef83c4d99592e42f8c618779e36f9d6c6…`
+   — which **decrypts with a valid empty-payload AEAD tag** using the key
+   schedule derived from our initiation. The peer performed real X25519 DHs
+   against our ephemeral + static keys and its own; a wrong wire byte or a
+   wrong mix-chain step anywhere would fail the tag. It did not.
+6. **Transport data round-tripped**: an ICMP echo request built by
+   `wg_spec.build_transport` and sent through DERP was decrypted by the peer,
+   its OS replied, and the reverse-direction transport packet decrypted on our
+   side (`counter=0`, inner IPv4, `ip_proto=1` ICMP, `icmp_type=0` Echo Reply).
+
+Since `validate_offline.py` already proved `tm_wg`'s bytes are identical to
+`wg_spec.py`'s, and `wg_spec.py` now interoperates with real Tailscale, this is
+**an explicit "no discrepancy — real Tailscale peer interop confirmed"** for
+the `tm_wg` wire format and key schedule. WireGuard PSK is all-zero (Tailscale
+convention), matching the offline/boringtun passes.
+
+### Findings while building the control/DERP/disco clients (NOT `tm_wg` bugs)
+
+These are in the *reference/control-plane* code, surfaced by the from-spec
+Python; none affect the `tm_wg` data plane, but they are recorded for accuracy:
+
+1. **A streaming MapRequest is read-only.** With `Stream=true` and cap
+   version ≥ 68 the control server ignores `Hostinfo`, `DiscoKey`,
+   `Endpoints` and every other write field (confirmed live: our disco key
+   propagated to peers as all-zeros from a streaming request). The disco key /
+   preferred DERP / endpoints must be published via a **non-streaming**
+   MapRequest first. `tm_control`'s only MapRequest is `Stream=true` and never
+   sends a `DiscoKey` at all — so as written it cannot establish a disco path
+   to a peer. This is the single change that unblocked the live handshake.
+2. **`Hostinfo` is required in a MapRequest** (a `400 "Hostinfo required in
+   MapRequest"` otherwise). `tm_control`'s `MapRequest` omits it.
+3. **Real peers gate the data plane behind disco.** A raw WireGuard
+   initiation to an idle peer is silently dropped: Tailscale trims inactive
+   peers out of its wireguard-go config and only re-adds one on disco
+   activity. A from-spec disco PING (which the peer answered with a PONG) is
+   what makes the peer configure our node and answer the WG handshake.
+4. **`tm_disco` uses the wrong AEAD.** `tm_disco/src/lib.rs` decrypts disco
+   payloads with XChaCha20-Poly1305 (24-byte nonce). Real disco uses NaCl
+   `crypto_box`/SalsaBox (Curve25519-XSalsa20-Poly1305), confirmed against both
+   the Go source and the upstream `ts_disco_protocol` (`crypto_box::SalsaBox`).
+   With XChaCha20-Poly1305 `tm_disco` cannot open a real peer's disco messages.
+5. **`tm_derp` frame-type constants are wrong for Ping/Pong/Health/Restarting.**
+   `tm_derp/src/lib.rs` uses `0x40/0x41/0x42/0x43`; the authoritative values
+   (Go source + `ts_transport_derp`) are `0x12/0x13/0x14/0x15`.
+
+Findings 1–2 are the reason the earlier note's claim that `tm_control` reached
+a working map poll should be read narrowly (it got a MapResponse, but never
+published a disco identity). Fixing them in Rust is a control-plane task,
+tracked separately from this WireGuard-data-plane validation; they are
+documented here because the from-spec oracle is what surfaced them.
+
+### Hygiene
+
+No secret key material or the Tailscale auth key is ever printed or committed;
+the auth key is read from the `.env` files at run time only. Node/machine/disco
+**public** keys and peer public keys are printed (safe). Each run registers a
+node named `wg-validator-probe`; with the current (non-ephemeral) auth key
+these persist and should be removed from
+`https://login.tailscale.com/admin/machines`.
+
 ## Out of scope for this run (needs hardware)
 
 - Wokwi/ESP live run and the MicroLink interop bench (plan checklist #3):
