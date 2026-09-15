@@ -376,6 +376,63 @@ version byte's position per `disco.py`) instead of `plaintext[2]`. Both look
 like real framing bugs but are a separate finding from the AEAD swap;
 flagging here for a follow-up card rather than folding into this fix.
 
+### Bug 3 — `tm_control` MapRequest never publishes the disco key (findings #1+#2 above)
+
+`tm_control/src/lib.rs` sent only a `Stream=true` MapRequest (Step 8), and
+its `MapRequest` struct carried no `Hostinfo`/`DiscoKey`/`Endpoints` fields
+at all. Per finding #1, the control server treats a streaming request (cap
+>= 68) as read-only and silently ignores those fields — so even if they had
+been added to a `Stream=true` request, they would never reach peers (a real
+device's disco key would propagate as all-zeros). Per finding #2, `Hostinfo`
+is unconditionally required (`400 "Hostinfo required in MapRequest"`
+otherwise) — the previous request also omitted it, though this had not yet
+surfaced as a visible failure in this codebase's own runs (see the
+narrowing note about that below).
+
+Fix, matching `tools/wg_validator/ts_control.py`'s `write_map()` /
+`start_keepalive_poll()` split exactly: send a **non-streaming** MapRequest
+first — `Stream: false`, carrying `Hostinfo` (`{"OS":"embedded",
+"Hostname":"esp32c3"}`, the same value already used for `/machine/register`),
+`DiscoKey` (`self.node_state.disco_key.public().to_hex()` — `NodeState`
+already carried the disco key, it just was never threaded into the map
+request), and `Endpoints` (empty — no active-path discovery is implemented
+yet, matching `ts_control.py`'s `endpoints or []` default) — before opening
+the existing streaming poll unchanged.
+
+Strictly additive, per the task's own risk framing (this is the only bug of
+the three that touches the currently-working registration/MapUpdate path):
+
+- `MapRequest` gained two fields, `disco_key: Option<&str>` and
+  `hostinfo: Option<HostInfo>`, both `#[serde(skip_serializing_if =
+  "Option::is_none")]`. The existing streaming call now explicitly passes
+  `disco_key: None, hostinfo: None`, which serializes byte-identically to
+  the pre-fix JSON body (the fields are omitted, not sent as `null`) — the
+  streaming request's wire bytes are unchanged.
+- A new step (labeled "Step 7.5" in the log/comments, between registration
+  and the streaming poll) builds and sends the publish MapRequest, then
+  drains its response via the existing `read_one_h2_body` helper (same
+  pattern already used for the register response) without altering
+  `stream_map_response` or `MapParser` at all.
+- HTTP/2 stream-id discipline (`docs/noise-handshake-wire-format.md`):
+  register stays on stream 1; the new publish request takes stream 3
+  (previously the streaming poll's ID); the streaming poll moves to stream
+  5. Each is still its own incrementing odd client-initiated stream ID per
+  RFC 7540 §5.1.1 — `tm_h2::H2State` has no cross-stream dynamic-table state
+  that ordering could break (confirmed by inspection: it only tracks
+  connection/stream flow-control byte counters).
+
+Verified: `cargo build -p tm_control` and `cargo check -p tm_control` on
+host — both clean (0 errors; only pre-existing, unrelated warnings —
+confirmed via `git stash`/`cargo test` before and after this change, both
+show the same 3-passed/2-failed `map_parser` test result, so nothing here
+regressed or fixed those). The new `MapRequest` JSON shape was diffed
+field-for-field against `ts_control.py::write_map`'s body (`Version`,
+`Compress`, `KeepAlive`, `NodeKey`, `DiscoKey`, `Endpoints`, `Stream`,
+`Hostinfo`) — same field set, same semantics. Not exercised against the
+live control server in this pass (per the task's rules, preferring not to
+register a live node); the wire shape is the verification. No live network
+command was run and no node was registered for this bug's fix.
+
 ## Out of scope for this run (needs hardware)
 
 - Wokwi/ESP live run and the MicroLink interop bench (plan checklist #3):
