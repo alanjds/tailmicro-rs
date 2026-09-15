@@ -35,8 +35,19 @@ use tm_keys::DiscoPrivateKey;
 
 // ── DISCO wire format ─────────────────────────────────────────────────────────
 
-/// DISCO message magic (first 6 bytes after the DISCO header).
-pub const DISCO_MAGIC: &[u8; 6] = b"\xc0\xde\x00\x00\x00\x00"; // simplified
+/// DISCO message magic: the literal `TS💬` (6 bytes) that prefixes every disco
+/// datagram on the wire, ahead of the sender's 32-byte disco public key.
+/// Value and framing cross-checked against `tools/wg_validator/disco.py`
+/// (`MAGIC`, which interoperated with a real Tailscale peer) and the
+/// authoritative `ts_disco_protocol`. Previously a placeholder
+/// (`\xc0\xde\x00\x00\x00\x00`) that was never actually checked.
+pub const DISCO_MAGIC: &[u8; 6] = b"TS\xf0\x9f\x92\xac";
+
+/// Length of the disco magic prefix.
+pub const MAGIC_LEN: usize = 6;
+
+/// Disco message version byte (`plaintext[1]`); currently always 0.
+pub const VERSION: u8 = 0;
 
 pub const MSG_PING: u8 = 0x01;
 pub const MSG_PONG: u8 = 0x02;
@@ -151,13 +162,22 @@ impl DiscoActor {
         src_port: u16,
         data:     &[u8],
     ) -> Option<DiscoEvent> {
-        // A DISCO packet starts with the sender's 32-byte disco public key,
-        // followed by a 24-byte nonce, followed by the encrypted payload.
-        if data.len() < PUBKEY_LEN + NONCE_LEN + TAG_LEN + 1 {
+        // A DISCO packet on the wire is:
+        //   magic(6)="TS💬" + sender_disco_pub(32) + nonce(24) + SalsaBox_ct
+        // (cross-checked against tools/wg_validator/disco.py's `open_disco`,
+        // which interoperated with a real peer). The magic MUST be present and
+        // checked, and every subsequent field is offset by MAGIC_LEN — the
+        // previous code omitted the magic entirely and read every field 6
+        // bytes early.
+        if data.len() < MAGIC_LEN + PUBKEY_LEN + NONCE_LEN + TAG_LEN + 1 {
+            return None;
+        }
+        if &data[..MAGIC_LEN] != DISCO_MAGIC {
             return None;
         }
 
-        let sender_key: [u8; 32] = data[..PUBKEY_LEN].try_into().ok()?;
+        let sender_key: [u8; 32] =
+            data[MAGIC_LEN..MAGIC_LEN + PUBKEY_LEN].try_into().ok()?;
 
         // Allowlist check (MicroLink pattern)
         let peer_state = self.allowed.iter_mut().find(|p| p.key == sender_key)?;
@@ -175,28 +195,40 @@ impl DiscoActor {
         let our_secret = crypto_box::SecretKey::from(*self.our_disco_key.as_bytes());
         let bx = crypto_box::SalsaBox::new(&sender_pub, &our_secret);
 
-        let nonce_bytes: [u8; 24] = data[PUBKEY_LEN..PUBKEY_LEN + NONCE_LEN]
+        let nonce_start = MAGIC_LEN + PUBKEY_LEN;
+        let ct_start = nonce_start + NONCE_LEN;
+        let nonce_bytes: [u8; 24] = data[nonce_start..ct_start]
             .try_into().ok()?;
         let mut ciphertext = heapless::Vec::<u8, 256>::new();
-        ciphertext.extend_from_slice(&data[PUBKEY_LEN + NONCE_LEN..]).ok()?;
+        ciphertext.extend_from_slice(&data[ct_start..]).ok()?;
 
         let nonce = crypto_box::Nonce::from(nonce_bytes);
         let plaintext = bx.decrypt(&nonce, ciphertext.as_ref()).ok()?;
 
         if plaintext.is_empty() { return None; }
 
+        // Disco plaintext framing: type(1) + version(1) + body.
+        // For PING the body is tx_id(12) + sender_node_key(32); the tx_id
+        // therefore begins at plaintext[2], NOT plaintext[1] (the version
+        // byte). Echoing from [1] would have PONGed `version || tx_id[0..11]`,
+        // which the peer rejects as not matching its PING.
         match plaintext[0] {
-            MSG_PING if plaintext.len() >= 1 + PING_LEN => {
+            MSG_PING if plaintext.len() >= 2 + PING_LEN => {
                 // Rate-limit: max 1 PONG per 100 ms per peer
-                // (simplified — real impl uses esp_timer_get_time())
+                // (simplified — real impl uses esp_timer_get_time()).
+                // The clock is not injected yet (now_ms == 0); guard the
+                // limiter on a real clock so a stubbed 0 does not (a) suppress
+                // every PONG via `0 - last < 100`, nor (b) underflow-panic
+                // once last_pong_ms > 0. saturating_sub is belt-and-braces.
                 let now_ms = 0u64; // TODO: inject clock
-                if now_ms - peer_state.last_pong_ms < 100 {
+                if now_ms != 0 && now_ms.saturating_sub(peer_state.last_pong_ms) < 100 {
                     return None;
                 }
                 peer_state.last_pong_ms = now_ms;
 
-                // Build PONG — echo the PING transaction ID
-                let tx_id: [u8; PING_LEN] = plaintext[1..1+PING_LEN].try_into().ok()?;
+                // Build PONG — echo the PING transaction ID (plaintext[2..14]).
+                let tx_id: [u8; PING_LEN] =
+                    plaintext[2..2 + PING_LEN].try_into().ok()?;
                 let mut pong = [0u8; PONG_LEN];
                 pong.copy_from_slice(&tx_id);
 
@@ -265,5 +297,87 @@ mod aead_crosscheck {
             .expect("SalsaBox failed to open a pynacl-sealed payload");
 
         assert_eq!(plaintext, expected_plaintext);
+    }
+}
+
+// ── Framing: magic skip + PING tx_id offset (Bug 4) ─────────────────────────
+//
+// Reuses the same pynacl-sealed vector as aead_crosscheck (sealed by
+// nacl.public.Box, the primitive tools/wg_validator/disco.py uses and that
+// interoperated with a real Tailscale peer). Here we wrap it into a full
+// on-the-wire disco datagram (magic || sender_pub || nonce || ct) and drive it
+// through the real DiscoActor::process, asserting the emitted PONG echoes the
+// TRUE 12-byte tx_id at plaintext[2..14] (`01..0c`). The pre-fix code — no
+// magic skip, tx_id read at plaintext[1..13] — could not even locate the
+// sender key past the magic, and would have echoed `00 01..0b`.
+#[cfg(test)]
+mod framing {
+    use super::*;
+    use tm_keys::DiscoPrivateKey;
+
+    fn vector() -> ([u8; 32], [u8; 32], [u8; 24], [u8; 62]) {
+        let mut receiver_priv = [0u8; 32];
+        for i in 0..32 { receiver_priv[i] = 0x21 + i as u8; }
+        let sender_pub: [u8; 32] = [
+            0x07, 0xa3, 0x7c, 0xbc, 0x14, 0x20, 0x93, 0xc8, 0xb7, 0x55, 0xdc, 0x1b,
+            0x10, 0xe8, 0x6c, 0xb4, 0x26, 0x37, 0x4a, 0xd1, 0x6a, 0xa8, 0x53, 0xed,
+            0x0b, 0xdf, 0xc0, 0xb2, 0xb8, 0x6d, 0x1c, 0x7c,
+        ];
+        let nonce: [u8; 24] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+            0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        ];
+        let ct: [u8; 62] = [
+            0x14, 0x65, 0x88, 0x31, 0x12, 0x21, 0x5b, 0x96, 0xeb, 0x3b, 0x39, 0x19,
+            0x96, 0xb2, 0x6c, 0x2b, 0x45, 0x01, 0xa9, 0x00, 0xd7, 0xb9, 0xd5, 0x02,
+            0x84, 0x40, 0xca, 0xeb, 0x86, 0x12, 0x8b, 0xa5, 0xad, 0x1d, 0x85, 0xbb,
+            0xcf, 0xc5, 0xdb, 0xd0, 0x55, 0x63, 0xdd, 0x93, 0xee, 0xc0, 0x5d, 0x8d,
+            0x3c, 0x24, 0x6d, 0x61, 0x63, 0xf8, 0xbe, 0xe4, 0xf0, 0xf5, 0x70, 0xb9,
+            0x1d, 0x9b,
+        ];
+        (receiver_priv, sender_pub, nonce, ct)
+    }
+
+    #[test]
+    fn process_extracts_ping_tx_id_after_magic() {
+        let (receiver_priv, sender_pub, nonce, ct) = vector();
+
+        // Build the full on-the-wire datagram.
+        let mut pkt: Vec<u8> = Vec::new();
+        pkt.extend_from_slice(DISCO_MAGIC);
+        pkt.extend_from_slice(&sender_pub);
+        pkt.extend_from_slice(&nonce);
+        pkt.extend_from_slice(&ct);
+
+        let mut actor = DiscoActor::new(DiscoPrivateKey::from_bytes(receiver_priv));
+        actor.add_peer(sender_pub); // allowlist the sender's disco key
+
+        let evt = actor
+            .process(&[10, 0, 0, 1], 41641, &pkt)
+            .expect("process should emit a PONG for a valid PING");
+
+        match evt {
+            DiscoEvent::SendPong { payload, .. } => {
+                // True tx_id is plaintext[2..14] == 0x01..=0x0c.
+                let expected: [u8; PONG_LEN] =
+                    [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c];
+                assert_eq!(payload, expected, "PONG must echo the true PING tx_id");
+            }
+            _ => panic!("expected SendPong"),
+        }
+    }
+
+    #[test]
+    fn process_rejects_wrong_magic() {
+        let (receiver_priv, sender_pub, nonce, ct) = vector();
+        let mut pkt: Vec<u8> = Vec::new();
+        pkt.extend_from_slice(b"NOPES!"); // 6 bytes, not the disco magic
+        pkt.extend_from_slice(&sender_pub);
+        pkt.extend_from_slice(&nonce);
+        pkt.extend_from_slice(&ct);
+
+        let mut actor = DiscoActor::new(DiscoPrivateKey::from_bytes(receiver_priv));
+        actor.add_peer(sender_pub);
+        assert!(actor.process(&[10, 0, 0, 1], 41641, &pkt).is_none());
     }
 }

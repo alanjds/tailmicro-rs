@@ -110,7 +110,14 @@ impl DiscoPrivateKey {
         DiscoPublicKey(*pk.as_bytes())
     }
     pub fn as_bytes(&self) -> &[u8; 32] { self.0.as_bytes() }
-    
+
+    /// Reconstruct from raw 32-byte scalar bytes.
+    ///
+    /// Additive constructor mirroring `DiscoPublicKey::from_bytes`; used to
+    /// rebuild a deterministic disco key from a fixed test vector (see the
+    /// `tm_disco` framing test) and anywhere a persisted disco key is loaded.
+    pub fn from_bytes(b: [u8; 32]) -> Self { Self(StaticSecret::from(b)) }
+
     /// Returns a reference to the inner x25519 private key for Diffie-Hellman
     pub fn as_static_secret(&self) -> &StaticSecret {
         &self.0
