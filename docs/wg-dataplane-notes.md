@@ -439,3 +439,116 @@ command was run and no node was registered for this bug's fix.
   require a physical ESP32-C3 board and a bench peer. Host-native
   `cargo test -p tm_wg` and `cargo build -p tm_wg` are the verification for
   this run.
+
+## On-device acceptance-test pass (Wokwi, `tm_wg` data-plane bring-up)
+
+This pass is the on-device acceptance test: build the real firmware for
+`riscv32imc-esp-espidf`, run it in Wokwi against the live tailnet, and observe
+how far `tm_wg` itself gets, with real serial evidence at each rung.
+
+### Bug 4 — `tm_disco::process` disco framing (magic + PING `tx_id` offset)
+
+Flagged in Bug 2's follow-up note above and by this pass's task brief:
+`tm_disco::process` had two framing bugs versus the peer-validated from-spec
+reference `tools/wg_validator/disco.py` (which interoperated with a real
+Tailscale peer):
+
+1. **The 6-byte disco magic was never checked or skipped.** `process` treated
+   the datagram as starting directly with the sender's 32-byte disco public
+   key. The real wire format (see `disco.py` `open_disco` and the module
+   docstring, cross-checked against the authoritative `ts_disco_protocol`) is
+   `magic(6)="TS💬" + sender_disco_pub(32) + nonce(24) + SalsaBox_ct`, so every
+   field was read 6 bytes early and decryption of a real peer's packet could
+   never succeed. `DISCO_MAGIC` was additionally declared as the placeholder
+   `\xc0\xde\x00\x00\x00\x00` (with a `// simplified` comment) instead of the
+   real `b"TS\xf0\x9f\x92\xac"` (`disco.py`'s `MAGIC`), and was never used.
+
+2. **The PING transaction ID was read off-by-one.** The disco plaintext is
+   `type(1) + version(1) + tx_id(12) + body`. `process` read the 12-byte
+   `tx_id` at `plaintext[1..13]` (the version byte's position), so it echoed
+   `version || tx_id[0..11]` in the PONG instead of the true `tx_id[0..12]` at
+   `plaintext[2..14]` — a PONG a peer would reject as not matching its PING.
+
+Fix (`tm_disco/src/lib.rs`): `DISCO_MAGIC` set to the real `TS💬` bytes; the
+length guard widened to `MAGIC_LEN + PUBKEY_LEN + NONCE_LEN + TAG_LEN + 1`;
+`process` now verifies `data[..6] == DISCO_MAGIC`, reads `sender_pub` at
+`data[6..38]`, `nonce` at `data[38..62]`, ciphertext at `data[62..]`, and the
+PING `tx_id` at `plaintext[2..14]` (guarded by `plaintext.len() >= 2 +
+PING_LEN`). This matches `disco.py` field-for-field.
+
+Verified Python-first: the fix targets exactly the framing that
+`tools/wg_validator/disco.py` implements and that already interoperated with a
+real peer (documented in "Live Tailscale tailnet interop" above), so the
+Python-first prototype for this protocol behavior predates the Rust change. A
+new host test `framing::process_extracts_ping_tx_id_after_magic`
+(`tm_disco/src/lib.rs`) wraps the existing pynacl-sealed vector
+(`aead_crosscheck`, sealed by `nacl.public.Box`, the primitive `disco.py`
+uses) into a full `magic || sender_pub || nonce || ct` datagram, runs it
+through `DiscoActor::process`, and asserts the emitted PONG echoes the true
+`tx_id` `01..0c` (the old off-by-one code would have echoed `00 01..0b`).
+`tm_keys::DiscoPrivateKey` gained a `from_bytes([u8;32])` constructor
+(additive, mirrors `DiscoPublicKey::from_bytes`) so the receiver disco key in
+that vector can be reconstructed deterministically.
+
+Not fixed here (still out of scope, unchanged risk): the PONG is still emitted
+as a bare 12-byte `tx_id` via `DiscoEvent::SendPong` with a UDP-shaped
+`dst_ip/dst_port`; a wire-correct PONG must be `magic || our_disco_pub ||
+nonce || SalsaBox_seal(type=0x02, ver=0, tx_id, src_endpoint)` addressed to the
+peer's node key over DERP. That, and outbound disco PING (needed to *wake* an
+idle peer per finding #3), are gated behind the DERP transport, which is a stub
+on-device (see the blocker below), so sealing the PONG would have nowhere to go
+this pass.
+
+### Data-path wiring in `tm_runtime` + total-free-heap instrumentation
+
+Per the task's "wire `tm_wg`'s data path" item and the plan's Part 2 heap-note:
+
+- `Runtime::join` (the `espidf` path) now consumes the previously-dropped
+  `WgEvent` and `DiscoEvent` receivers (they were bound as `_wg_ev_rx` /
+  `_disco_ev_rx` and never read, so `WgEvent::InboundDecrypted`,
+  `WgEvent::OutboundPacket`, `WgEvent::PeerHandshook` and `DiscoEvent` went
+  nowhere). The event router now: routes `WgEvent::OutboundPacket` to
+  `DerpCmd::SendPacket` (the outbound WireGuard path — handshake initiations
+  and transport data leave `tm_wg` here), logs `PeerHandshook` and
+  `InboundDecrypted` (the decrypted-inbound seam; the on-device `tm_netstack`
+  is a stub with no lwIP injection, so there is no local socket to deliver to
+  yet), and forwards `DiscoEvent::SendPong` toward DERP.
+- The DERP inbound demux (`payload[0] == 0x6d`) was replaced with the real
+  disco/WireGuard discriminator: a datagram whose first 6 bytes are the disco
+  magic `TS💬` goes to `tm_disco`; a first byte in `1..=4` (a WireGuard message
+  type) goes to `tm_wg`. `0x6d` matched neither the disco magic (`0x54`) nor a
+  WireGuard type byte.
+- Added `esp_get_free_heap_size()` logging alongside the existing
+  largest-contiguous-block logging in `tm_runtime` (plan Part 2 finding #4
+  asked for this), so steady-state total-free heap is reportable against the
+  40–60 KB target / 90 KB ceiling without a fresh live-run investigation.
+
+### BLOCKER: the on-device DERP relay client is a stub (rungs 4–6)
+
+Root cause, with code evidence: rungs 4 (disco ping/pong), 5 (WireGuard
+handshake) and 6 (transport round-trip) all require moving bytes to a real
+peer, and the only path to a peer is DERP (direct UDP is NAT-blocked — this is
+exactly why the Python validator relayed through `derp11e.tailscale.com`).
+On-device, DERP is not implemented:
+
+- `tm_derp::run_connection` (`tm_derp/src/lib.rs`) is a stub: no TLS dial, no
+  `DERP` magic write, no ServerKey/ClientInfo/ServerInfo NaCl handshake, and
+  both the send (`// self.send_packet(...)`) and receive
+  (`// recv = self.recv_frame(...)`) arms of its select loop are commented
+  out. `send_packet_frame`/`recv_frame` helpers exist but are never called.
+- Nothing ever sends `DerpCmd::Connect`: `tm_runtime` never issues a Connect
+  and never threads the `DERPMap` region→hostname table (which the control
+  plane *does* now receive) into the DERP actor. So the actor sits idle in its
+  outer `cmds.recv()` loop, silently dropping any `SendPacket`.
+
+Consequently `tm_wg` can build and *attempt* a handshake on-device (its
+`apply_map` calls `endpoint.initiate` and emits `WgEvent::OutboundPacket` — now
+observable in the log via the new wiring), but the initiation cannot leave the
+chip. Bringing rungs 4–6 up on-device requires implementing the DERP relay
+client in Rust over `tm_tls` (mirroring the from-spec, peer-validated
+`tools/wg_validator/derp_client.py`: TLS + `GET /derp` upgrade, the
+ServerKey/ClientInfo/ServerInfo `crypto_box`/SalsaBox handshake, and
+SendPacket/RecvPacket framing) and wiring `DerpCmd::Connect` from the
+MapResponse DERPMap. That is a substantial net-new device implementation and is
+the honest remaining work; it is documented here rather than hidden behind an
+inferred rung.
