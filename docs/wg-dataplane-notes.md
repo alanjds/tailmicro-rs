@@ -125,9 +125,85 @@ constants: `REKEY_AFTER_MESSAGES = 1<<60`, `REJECT_AFTER_MESSAGES = 2^64 -
 (required for the 165 s last-minute rekey path, which is load-bearing since
 an ESP32 client is always the initiator).
 
+## Independent Python reference validator (`tools/wg_validator/`)
+
+The Rust data plane initially had only *self*-round-trip tests (its own
+encoder against its own decoder). That cannot catch a wire-format/crypto bug
+that is uniformly wrong on both the encode and decode side. To close that gap,
+an **independent from-spec oracle** was written in Python
+(`cryptography` for X25519/ChaCha20Poly1305, `hashlib.blake2s`; HKDF, HChaCha20,
+and the whole Noise IKpsk2 state machine hand-rolled) that shares no code with
+`tm_wg` and is written against the WireGuard whitepaper and the plan's Part 2
+offset tables; never by mirroring the Rust. It reuses the Python-first
+methodology already established for the control plane
+(`docs/noise-handshake-wire-format.md`).
+
+To let the oracle compare against the *real* Rust code path (not a
+re-implementation), `handshake.rs` gained a small, documented testability seam:
+a private `EphemeralSecret` trait so `build_initiation` / `build_response` are
+the single source of truth for the mix-chain, plus two `#[doc(hidden)]`
+deterministic-ephemeral emitters (`initiate_handshake_with_ephemeral`,
+`ReceivedHandshake::respond_vector`). Production keeps `ReusableSecret` (whose
+scalar bytes deliberately can't leak); the emitters use `StaticSecret` (which
+*can* be built from a fixed scalar) so byte-exact vectors are reproducible.
+`tm_wg/examples/wg_emit_vectors.rs` and `wg_cookie_probe.rs` expose the bytes.
+
+### Results
+
+**Rung 1, offline byte-level oracle: PASS, byte-for-byte, no discrepancy
+found.** `validate_offline.py` runs the real `tm_wg` core for fixed inputs and
+independently reconstructs every field. All of the following matched exactly:
+
+- Handshake Initiation (148 B) byte-for-byte; MAC1 (offset 116, over
+  `msg[0..116]`) and MAC2 (offset 132, all-zero) domains.
+- Handshake Response (92 B) byte-for-byte; MAC1 (offset 60), MAC2 (offset 76).
+- Cookie Reply (type 3): XChaCha20Poly1305 decrypt with AAD = last mac1, and
+  the mac2 keyed-MAC domain (`msg[0..len-16]`), driven through the real
+  `MACSender::receive_cookie` + `write_macs`.
+- Transport Data (type 4): 16-byte header, **little-endian** 64-bit counter
+  nonce (correctly distinct from the ts2021 *control* plane's big-endian
+  transport nonce; a real cross-layer trap), byte-for-byte + decrypt.
+- TAI64N 12-byte big-endian timestamp encoding.
+- The full **bidirectional key schedule**: initiator-side and responder-side
+  derivations both agree with each other and with Rust for both directions.
+
+This proves the Rust encode/decode is not uniformly wrong *relative to the
+spec as the oracle understands it*.
+
+**Interop against a third independent implementation: PASS.**
+`validate_live_boringtun.py` drives the from-spec Python initiator through a
+full live handshake + bidirectional transport exchange against **boringtun**
+(Cloudflare's independent production Rust WireGuard, driven in-memory over
+loopback UDP, no tun/root). boringtun accepts our initiation, returns a valid
+type-2 response, decrypts our transport data to the exact plaintext, and its
+reverse-direction transport data decrypts on our side. This closes the residual
+risk that the oracle and `tm_wg` share the *same* from-spec misreading: a truly
+independent third party interoperates with the oracle, and `tm_wg`'s output is
+byte-identical to the oracle (above), so `tm_wg` would interop too.
+
+boringtun 0.6 pins `curve25519-dalek 4.0.0-rc.3`, which needs
+`--cfg curve25519_dalek_backend="serial"` to build on current nightly; the
+peer crate is a detached workspace so it never touches the firmware graph.
+
+### Honest limits (what this does NOT prove)
+
+- **Not run against the live Tailscale tailnet.** Rung 2 as specified (a real
+  WireGuard handshake to a real Tailscale peer node) requires either direct
+  UDP (blocked by NAT; needs disco/`tm_disco`) or a **DERP relay client**, on
+  top of an independent Python ts2021 control-plane client to fetch peers. The
+  control endpoint is reachable and live (a `GET /key?v=72` returned the
+  current server Noise key), so the blocker is implementation scope, not
+  access; the prior throwaway control-plane Python harness is not recoverable
+  from git history, and a from-scratch control-plane + DERP client was out of
+  scope for this pass. boringtun is real WireGuard but not a Tailscale peer.
+- The oracle validates the crypto/wire format and key schedule. It does not
+  exercise the actor, endpoint table, replay window under adversarial load,
+  rekey timers, or the ESP32 target (those remain covered by host `cargo test`
+  / future Wokwi runs).
+
 ## Out of scope for this run (needs hardware)
 
-- Wokwi/ESP live run and the MicroLink interop bench (plan checklist #3) —
+- Wokwi/ESP live run and the MicroLink interop bench (plan checklist #3):
   require a physical ESP32-C3 board and a bench peer. Host-native
   `cargo test -p tm_wg` and `cargo build -p tm_wg` are the verification for
   this run.
