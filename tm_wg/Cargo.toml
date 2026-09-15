@@ -1,13 +1,25 @@
 [package]
 name = "tm_wg"
 version.workspace = true
-edition.workspace = true
+# edition 2024 for this crate ONLY (vendored ts_tunnel uses let-chains); the
+# rest of the workspace stays 2021. Mixed editions in one workspace are fine.
+edition = "2024"
 
 [dependencies]
 tm_keys.workspace    = true
 tm_control.workspace = true
 arrayvec  = { workspace = true }
 heapless  = { workspace = true }
-tokio     = { workspace = true, features = ["sync"] }
+tokio     = { workspace = true, features = ["sync", "time", "macros"] }
 async-channel.workspace = true
 tracing   = { workspace = true }
+
+# ── WireGuard crypto core (vendored ts_tunnel) ────────────────────────────────
+x25519-dalek     = { workspace = true, features = ["reusable_secrets"] }
+chacha20poly1305 = { workspace = true, features = ["alloc"] }
+blake2           = { workspace = true }
+hkdf             = { workspace = true }
+aead             = { version = "0.5", default-features = false, features = ["alloc"] }
+rand             = { version = "0.8", features = ["getrandom"] }
+rand_core        = "0.6"
+zerocopy         = { version = "0.8", features = ["derive"] }

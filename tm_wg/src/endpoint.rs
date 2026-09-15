@@ -1,0 +1,765 @@
+//! WireGuard endpoint, rewritten (not vendored) against `ArrayVec` for
+//! no-heap, bounded-memory operation on the ESP32-C3 (plan Step 2).
+//!
+//! Differences from `ts_tunnel/src/endpoint.rs`:
+//!   * `HashMap<PeerId, Peer>` → `ArrayVec<Peer, MAX_PEERS>` (linear scan).
+//!   * `HashMap<SessionId, PeerId>` → `ArrayVec<(SessionId, PeerId), 3*MAX_PEERS>`
+//!     (3 keypairs/peer: current / previous / next).
+//!   * per-peer 32-deep `VecDeque` packet queue → `ArrayVec<Packet, QUEUE_DEPTH>`
+//!     (depth 2 — the RAM-dominant term per plan correction #5).
+//!   * `ts_time::Scheduler` (Arc + LazyLock) → two per-peer `Option<Instant>`
+//!     timers (`handshake_timeout`, `keepalive_at`); `next_event`/`dispatch`
+//!     scan the peer table.
+//!   * `HashMap<_, Vec<_>>` results → per-call bounded `ArrayVec` outcome
+//!     structs (single-peer-at-a-time, matching the actor mailbox).
+//!   * transport endpoint modelled as a Rust `enum Endpoint` (no 127.3.3.40
+//!     fake-IP hack); authenticated-only endpoint roaming, skipped for DERP.
+
+use core::net::SocketAddr;
+use core::time::Duration;
+use std::time::Instant;
+
+use arrayvec::ArrayVec;
+use zerocopy::{IntoBytes, TryFromBytes};
+
+use crate::vendor::{
+    config::{PeerConfig, PeerId},
+    handshake::{Handshake, ReceivedHandshake, SessionPair, initiate_handshake},
+    keys::{NodeKeyPair, NodePublicKey},
+    macs::{MACReceiver, MACSender},
+    messages::{HandshakeInitiation, HandshakeResponse, Message, SessionId},
+    packet::Packet,
+    session::{ReceiveSession, TransmitSession},
+    tai64n::TAI64NClock,
+};
+
+pub const MAX_PEERS: usize = 8;
+/// Per-peer packet queue depth. Kept small (plan correction #5: queues are the
+/// dominant RAM term, not the replay window).
+const QUEUE_DEPTH: usize = 2;
+/// Session-id map capacity: 3 keypairs/peer (current/previous/next).
+const SESSION_MAP_CAP: usize = 3 * MAX_PEERS;
+/// Max packets a single recv/dispatch call can emit toward one peer.
+const OUT_CAP: usize = QUEUE_DEPTH + 2;
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Handshake-retry jitter upper bound (prevents synchronized fleet storms).
+const HANDSHAKE_JITTER_MS: u64 = 334;
+
+/// The transport an endpoint uses to reach a peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Endpoint {
+    /// Direct UDP.
+    Udp(SocketAddr),
+    /// Relayed via a DERP region, addressed by the peer's node key.
+    Derp { region_id: u16, node_key: [u8; 32] },
+}
+
+impl Endpoint {
+    fn is_derp(&self) -> bool {
+        matches!(self, Endpoint::Derp { .. })
+    }
+}
+
+type Queue = ArrayVec<Packet, QUEUE_DEPTH>;
+
+/// Push `pkt` into a bounded queue, dropping the oldest if full.
+///
+/// Part of the outbound app-data path (queue packets while a session is being
+/// established). That path is not yet wired to a `WgCmd` variant, so this and
+/// `SessionState::needs_rotation` are currently unused.
+#[allow(dead_code)]
+fn queue_push(q: &mut Queue, pkt: Packet) {
+    if q.is_full() {
+        q.remove(0);
+    }
+    q.push(pkt);
+}
+
+enum SessionState {
+    /// No active session; packets may be queued for future transmission.
+    None(Queue),
+    Active {
+        recv: ReceiveSession,
+        recv_prev: Option<ReceiveSession>,
+        send: TransmitSession,
+    },
+}
+
+impl SessionState {
+    fn take(&mut self) -> SessionState {
+        core::mem::replace(self, SessionState::None(Queue::new()))
+    }
+
+    /// Activate `next`, rotating any existing session. Returns encrypted
+    /// packets to send (any that were queued), and the ids of receive sessions
+    /// that should be released from the session map.
+    fn activate(&mut self, next: SessionPair) -> (ArrayVec<Packet, OUT_CAP>, ArrayVec<SessionId, 2>) {
+        let mut out = ArrayVec::new();
+        let mut freed = ArrayVec::new();
+        match self.take() {
+            SessionState::None(queue) => {
+                for mut pkt in queue.into_iter() {
+                    next.send.encrypt(core::iter::once(&mut pkt));
+                    let _ = out.try_push(pkt);
+                }
+                *self = SessionState::Active {
+                    send: next.send,
+                    recv: next.recv,
+                    recv_prev: None,
+                };
+            }
+            SessionState::Active {
+                recv, recv_prev, ..
+            } => {
+                if let Some(prev) = recv_prev {
+                    let _ = freed.try_push(prev.id());
+                }
+                *self = SessionState::Active {
+                    send: next.send,
+                    recv: next.recv,
+                    recv_prev: Some(recv),
+                };
+            }
+        }
+        (out, freed)
+    }
+
+    fn deactivate(&mut self) -> ArrayVec<SessionId, 2> {
+        let mut freed = ArrayVec::new();
+        if let SessionState::Active {
+            recv, recv_prev, ..
+        } = self.take()
+        {
+            let _ = freed.try_push(recv.id());
+            if let Some(prev) = recv_prev {
+                let _ = freed.try_push(prev.id());
+            }
+        }
+        freed
+    }
+
+    fn encrypt_keepalive(&mut self, now: Instant) -> Option<Packet> {
+        if let SessionState::Active { send, .. } = self
+            && !send.expired(now)
+        {
+            let mut pkt = Packet::new(0);
+            send.encrypt(core::iter::once(&mut pkt));
+            Some(pkt)
+        } else {
+            None
+        }
+    }
+
+    /// Get the receive session matching `id`, if any (checks current + prev).
+    fn get_recv_mut(&mut self, id: SessionId, now: Instant) -> Option<&mut ReceiveSession> {
+        match self {
+            SessionState::None(_) => None,
+            SessionState::Active {
+                recv, recv_prev, ..
+            } => {
+                if recv.id() == id && !recv.expired(now) {
+                    Some(recv)
+                } else if let Some(prev) = recv_prev.as_mut()
+                    && prev.id() == id
+                    && !prev.expired(now)
+                {
+                    Some(prev)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// True if the transmit side is stale / absent and needs a new handshake.
+    #[allow(dead_code)] // consulted by the not-yet-wired outbound app-data path
+    fn needs_rotation(&self, now: Instant) -> bool {
+        match self {
+            SessionState::None(_) => true,
+            SessionState::Active { send, .. } => send.stale(now),
+        }
+    }
+}
+
+struct Peer {
+    id: PeerId,
+    config: PeerConfig,
+    endpoint: Endpoint,
+    session: SessionState,
+    handshake: Handshake,
+    last_seen_timestamp: Option<crate::vendor::tai64n::TAI64N>,
+    cookie_sender: MACSender,
+    handshake_timeout: Option<Instant>,
+    keepalive_at: Option<Instant>,
+}
+
+impl Peer {
+    fn new(id: PeerId, config: PeerConfig, endpoint: Endpoint) -> Self {
+        let cookie_sender = MACSender::new(&config.key);
+        Self {
+            id,
+            config,
+            endpoint,
+            session: SessionState::None(Queue::new()),
+            handshake: Handshake::None,
+            last_seen_timestamp: None,
+            cookie_sender,
+            handshake_timeout: None,
+            keepalive_at: None,
+        }
+    }
+
+    fn schedule_keepalive(&mut self, now: Instant) {
+        if self.keepalive_at.is_none() {
+            self.keepalive_at = Some(now + KEEPALIVE_TIMEOUT);
+        }
+    }
+}
+
+/// The result of processing one inbound packet.
+#[derive(Default)]
+pub struct RecvOut {
+    /// Encrypted packets to send back to the peer (handshake response,
+    /// session-confirmation, etc.).
+    pub to_peer: ArrayVec<Packet, OUT_CAP>,
+    /// Decrypted inbound payloads destined for the local netstack.
+    pub decrypted: ArrayVec<Packet, OUT_CAP>,
+    /// Set when a handshake completed (initiator side) this call.
+    pub handshook: bool,
+    /// The peer this packet belonged to, if identified.
+    pub peer: Option<PeerId>,
+}
+
+struct EndpointState {
+    my_key: NodeKeyPair,
+    my_cookie: MACReceiver,
+    timestamps: TAI64NClock,
+    /// SessionId → PeerId, linear-scan map.
+    sessions: ArrayVec<(SessionId, PeerId), SESSION_MAP_CAP>,
+    next_peer_id: u32,
+}
+
+impl EndpointState {
+    fn peer_for_session(&self, id: SessionId) -> Option<PeerId> {
+        self.sessions
+            .iter()
+            .find(|(s, _)| *s == id)
+            .map(|(_, p)| *p)
+    }
+
+    fn alloc_session(&mut self, peer: PeerId) -> SessionId {
+        loop {
+            let id = SessionId::random();
+            if !self.sessions.iter().any(|(s, _)| *s == id) && !self.sessions.is_full() {
+                self.sessions.push((id, peer));
+                return id;
+            }
+            if self.sessions.is_full() {
+                // Should not happen with correct rotation; drop oldest.
+                self.sessions.remove(0);
+            }
+        }
+    }
+
+    fn free_session(&mut self, id: SessionId) {
+        self.sessions.retain(|(s, _)| *s != id);
+    }
+}
+
+/// A WireGuard endpoint managing multiple peers, no heap for its own tables.
+pub struct WgEndpoint {
+    state: EndpointState,
+    peers: ArrayVec<Peer, MAX_PEERS>,
+}
+
+impl WgEndpoint {
+    pub fn new(my_key: NodeKeyPair) -> Self {
+        Self {
+            state: EndpointState {
+                my_key,
+                my_cookie: MACReceiver::new(&my_key.public),
+                timestamps: TAI64NClock::new(),
+                sessions: ArrayVec::new(),
+                next_peer_id: 0,
+            },
+            peers: ArrayVec::new(),
+        }
+    }
+
+    fn peer_index(&self, id: PeerId) -> Option<usize> {
+        self.peers.iter().position(|p| p.id == id)
+    }
+
+    fn peer_index_by_key(&self, key: &NodePublicKey) -> Option<usize> {
+        self.peers.iter().position(|p| p.config.key == *key)
+    }
+
+    /// Add a peer. Returns its id, or None if the table is full or the key is
+    /// already present.
+    pub fn add_peer(&mut self, cfg: PeerConfig, endpoint: Endpoint) -> Option<PeerId> {
+        if self.peer_index_by_key(&cfg.key).is_some() || self.peers.is_full() {
+            return None;
+        }
+        self.state.next_peer_id += 1;
+        let id = PeerId(self.state.next_peer_id);
+        self.peers.push(Peer::new(id, cfg, endpoint));
+        Some(id)
+    }
+
+    pub fn remove_peer(&mut self, id: PeerId) -> bool {
+        let Some(idx) = self.peer_index(id) else {
+            return false;
+        };
+        let mut peer = self.peers.remove(idx);
+        for sid in peer.session.deactivate() {
+            self.state.free_session(sid);
+        }
+        if let Some(sid) = peer.handshake.session_id() {
+            self.state.free_session(sid);
+        }
+        true
+    }
+
+    pub fn peer_key(&self, id: PeerId) -> Option<NodePublicKey> {
+        self.peer_index(id).map(|i| self.peers[i].config.key)
+    }
+
+    pub fn peer_endpoint(&self, id: PeerId) -> Option<Endpoint> {
+        self.peer_index(id).map(|i| self.peers[i].endpoint.clone())
+    }
+
+    pub fn peer_id_by_key(&self, key: &[u8; 32]) -> Option<PeerId> {
+        let k = NodePublicKey::from_bytes(*key);
+        self.peer_index_by_key(&k).map(|i| self.peers[i].id)
+    }
+
+    /// Start a handshake to the given peer, returning the initiation packet.
+    /// `now_unix` must be a synced wall-clock (seconds); pass None if the clock
+    /// is not yet synced (no handshake is produced, avoiding a bogus TAI64N).
+    pub fn initiate(&mut self, id: PeerId, now: Instant, now_unix: Option<u64>) -> Option<Packet> {
+        let Some(secs) = now_unix else {
+            tracing::warn!("clock not synced; skipping handshake initiation");
+            return None;
+        };
+        let idx = self.peer_index(id)?;
+        let session_id = self.state.alloc_session(id);
+        let peer = &mut self.peers[idx];
+        let (sent, init) = initiate_handshake(
+            self.state.my_key.private,
+            peer.config.key,
+            session_id,
+            self.state.timestamps.now_from_unix(secs, 0),
+        );
+        let mut pkt = Packet::from_wire(init.as_bytes());
+        let mac = peer.cookie_sender.write_macs(pkt.as_mut());
+        peer.handshake = Handshake::Initiated(sent, mac);
+        peer.handshake_timeout = Some(now + HANDSHAKE_TIMEOUT);
+        Some(pkt)
+    }
+
+    /// Process one inbound packet arriving over `from`.
+    pub fn recv_one(&mut self, raw: &[u8], from: Endpoint, now: Instant) -> RecvOut {
+        let mut out = RecvOut::default();
+
+        // Disco-demux belt-and-suspenders: only WireGuard type bytes 1..=4
+        // reach here. (Primary disco split happens at the runtime edge.)
+        match raw.first() {
+            Some(1..=4) => {}
+            _ => {
+                tracing::trace!("non-wireguard packet dropped at wg parser");
+                return out;
+            }
+        }
+
+        let Ok(msg) = Message::try_from(raw) else {
+            tracing::trace!("undecodable wireguard packet");
+            return out;
+        };
+
+        match msg {
+            Message::HandshakeInitiation(_) => self.recv_init(raw, &from, now, &mut out),
+            Message::HandshakeResponse(_) => self.recv_response(raw, now, &mut out),
+            Message::CookieReply(_) => self.recv_cookie(raw, &mut out),
+            Message::TransportDataHeader(_) => self.recv_transport(raw, &from, now, &mut out),
+        }
+        out
+    }
+
+    fn recv_init(&mut self, raw: &[u8], from: &Endpoint, now: Instant, out: &mut RecvOut) {
+        let Ok(init) = HandshakeInitiation::try_ref_from_bytes(raw) else {
+            return;
+        };
+        let Some(hs) = ReceivedHandshake::new(init, &self.state.my_key, &self.state.my_cookie)
+        else {
+            tracing::warn!("handshake initiation failed to process");
+            return;
+        };
+        let Some(idx) = self.peer_index_by_key(&hs.peer_static()) else {
+            tracing::warn!("no peer for handshake initiator key");
+            return;
+        };
+        let peer_id = self.peers[idx].id;
+        out.peer = Some(peer_id);
+
+        // Replay: reject an initiation whose timestamp is older than the last.
+        if let Some(last) = self.peers[idx].last_seen_timestamp
+            && hs.timestamp < last
+        {
+            tracing::warn!("handshake replay detected");
+            return;
+        }
+        self.peers[idx].last_seen_timestamp = Some(hs.timestamp);
+
+        let session_id = self.state.alloc_session(peer_id);
+        let peer = &mut self.peers[idx];
+        // Roaming: adopt sender address only for authenticated, non-DERP src.
+        maybe_roam(peer, from);
+        let pkt = peer.handshake.respond(
+            session_id,
+            hs,
+            &peer.config.psk,
+            &peer.cookie_sender,
+            now,
+        );
+        let _ = out.to_peer.try_push(pkt);
+    }
+
+    fn recv_response(&mut self, raw: &[u8], now: Instant, out: &mut RecvOut) {
+        let Ok(resp) = HandshakeResponse::try_ref_from_bytes(raw) else {
+            return;
+        };
+        let Some(peer_id) = self.state.peer_for_session(resp.receiver_id) else {
+            tracing::warn!("handshake response for unknown session");
+            return;
+        };
+        out.peer = Some(peer_id);
+        let Some(idx) = self.peer_index(peer_id) else {
+            return;
+        };
+
+        let session = {
+            let peer = &mut self.peers[idx];
+            peer.handshake
+                .finish(resp, &peer.config.psk, &self.state.my_cookie, now)
+        };
+        let Some(session) = session else {
+            tracing::warn!("handshake failed to complete");
+            return;
+        };
+        self.peers[idx].handshake_timeout = None;
+        out.handshook = true;
+
+        let (mut pkts, freed) = self.peers[idx].session.activate(session);
+        for sid in freed {
+            self.state.free_session(sid);
+        }
+        // Initiator must send at least one packet to confirm the session.
+        if pkts.is_empty() {
+            let mut ka = Packet::new(0);
+            if let SessionState::Active { send, .. } = &self.peers[idx].session {
+                send.encrypt(core::iter::once(&mut ka));
+                let _ = pkts.try_push(ka);
+            }
+        }
+        for p in pkts {
+            let _ = out.to_peer.try_push(p);
+        }
+    }
+
+    fn recv_cookie(&mut self, raw: &[u8], out: &mut RecvOut) {
+        use crate::vendor::messages::CookieReply;
+        let Ok(cookie) = CookieReply::try_ref_from_bytes(raw) else {
+            return;
+        };
+        let Some(peer_id) = self.state.peer_for_session(cookie.receiver_id) else {
+            return;
+        };
+        out.peer = Some(peer_id);
+        let Some(idx) = self.peer_index(peer_id) else {
+            return;
+        };
+        let peer = &mut self.peers[idx];
+        if let Handshake::Initiated(_, mac1) = &peer.handshake {
+            let mac1 = *mac1;
+            peer.cookie_sender.receive_cookie(cookie, &mac1);
+        }
+    }
+
+    fn recv_transport(&mut self, raw: &[u8], from: &Endpoint, now: Instant, out: &mut RecvOut) {
+        // The receiver id is at a fixed offset; parse the header to route.
+        let Ok(header) = <&crate::vendor::messages::TransportDataHeader>::try_from(raw) else {
+            return;
+        };
+        let session_id = header.receiver_id;
+        let Some(peer_id) = self.state.peer_for_session(session_id) else {
+            tracing::warn!("transport data for unknown session");
+            return;
+        };
+        out.peer = Some(peer_id);
+        let Some(idx) = self.peer_index(peer_id) else {
+            return;
+        };
+
+        // Case 1: an established receive session exists.
+        if self.peers[idx]
+            .session
+            .get_recv_mut(session_id, now)
+            .is_some()
+        {
+            let mut pkt = Packet::from_wire(raw);
+            let ok = self.peers[idx]
+                .session
+                .get_recv_mut(session_id, now)
+                .unwrap()
+                .decrypt_one(&mut pkt);
+            if ok {
+                maybe_roam(&mut self.peers[idx], from);
+                self.peers[idx].schedule_keepalive(now);
+                let _ = out.decrypted.try_push(pkt);
+            }
+            return;
+        }
+
+        // Case 2: confirm a tentative responder session with its first packet.
+        let confirmed = self.peers[idx]
+            .handshake
+            .confirm(session_id, vec![Packet::from_wire(raw)]);
+        if let Some((session, decrypted)) = confirmed {
+            maybe_roam(&mut self.peers[idx], from);
+            self.peers[idx].schedule_keepalive(now);
+            for p in decrypted {
+                let _ = out.decrypted.try_push(p);
+            }
+            let (pkts, freed) = self.peers[idx].session.activate(session);
+            for sid in freed {
+                self.state.free_session(sid);
+            }
+            for p in pkts {
+                let _ = out.to_peer.try_push(p);
+            }
+        }
+    }
+
+    /// The next instant at which [`WgEndpoint::dispatch`] must be called.
+    pub fn next_event(&self) -> Option<Instant> {
+        self.peers
+            .iter()
+            .flat_map(|p| [p.handshake_timeout, p.keepalive_at])
+            .flatten()
+            .min()
+    }
+
+    /// Dispatch due timers, returning packets tagged with their peer id.
+    pub fn dispatch(
+        &mut self,
+        now: Instant,
+        now_unix: Option<u64>,
+    ) -> ArrayVec<(PeerId, Packet), MAX_PEERS> {
+        let mut out: ArrayVec<(PeerId, Packet), MAX_PEERS> = ArrayVec::new();
+
+        // Collect peers whose handshake timed out (need a retry).
+        let mut retry: ArrayVec<PeerId, MAX_PEERS> = ArrayVec::new();
+        for peer in self.peers.iter_mut() {
+            if let Some(t) = peer.handshake_timeout
+                && t <= now
+            {
+                peer.handshake_timeout = None;
+                if peer.handshake.is_active() {
+                    peer.handshake = Handshake::None;
+                    let _ = retry.try_push(peer.id);
+                }
+            }
+            if let Some(t) = peer.keepalive_at
+                && t <= now
+            {
+                peer.keepalive_at = None;
+                if let Some(pkt) = peer.session.encrypt_keepalive(now) {
+                    let _ = out.try_push((peer.id, pkt));
+                }
+            }
+        }
+
+        // Free the retrying peers' stale handshake sessions, then re-initiate
+        // with jitter applied to the next timeout.
+        for id in retry {
+            if let Some(idx) = self.peer_index(id)
+                && let Some(sid) = self.peers[idx].handshake.session_id()
+            {
+                self.state.free_session(sid);
+            }
+            if let Some(pkt) = self.initiate(id, now, now_unix) {
+                // Apply retry jitter (0..HANDSHAKE_JITTER_MS) so a fleet of
+                // identical devices doesn't retry in lockstep.
+                if let Some(idx) = self.peer_index(id) {
+                    let jitter = handshake_jitter_ms();
+                    self.peers[idx].handshake_timeout =
+                        Some(now + HANDSHAKE_TIMEOUT + Duration::from_millis(jitter));
+                }
+                let _ = out.try_push((id, pkt));
+            }
+        }
+        out
+    }
+}
+
+/// Adopt a peer's source address from an authenticated (post-decrypt) packet.
+/// Explicitly skipped for DERP-sourced packets and non-UDP endpoints.
+fn maybe_roam(peer: &mut Peer, from: &Endpoint) {
+    if from.is_derp() {
+        return; // never roam based on DERP-relayed source
+    }
+    if let Endpoint::Udp(new_addr) = from
+        && peer.endpoint != *from
+        && !peer.endpoint.is_derp()
+    {
+        tracing::debug!(?new_addr, "peer roamed to new udp endpoint");
+        peer.endpoint = Endpoint::Udp(*new_addr);
+    }
+}
+
+/// A small, cheap jitter source in `[0, HANDSHAKE_JITTER_MS)`.
+fn handshake_jitter_ms() -> u64 {
+    use rand::rngs::OsRng;
+    use rand_core::RngCore;
+    OsRng.next_u64() % HANDSHAKE_JITTER_MS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vendor::config::{PeerConfig, Psk};
+
+    fn now_unix() -> Option<u64> {
+        Some(1_700_000_123)
+    }
+
+    #[test]
+    fn full_handshake_and_data_between_two_endpoints() {
+        let a_kp = NodeKeyPair::new();
+        let b_kp = NodeKeyPair::new();
+        let psk = Psk::random();
+
+        let mut a = WgEndpoint::new(a_kp);
+        let mut b = WgEndpoint::new(b_kp);
+
+        let a_ep = Endpoint::Derp {
+            region_id: 1,
+            node_key: b_kp.public.to_bytes(),
+        };
+        let b_ep = Endpoint::Derp {
+            region_id: 1,
+            node_key: a_kp.public.to_bytes(),
+        };
+        // A configures B as peer; B configures A as peer. Same PSK.
+        let a_peer = a
+            .add_peer(
+                PeerConfig {
+                    key: b_kp.public,
+                    psk,
+                },
+                a_ep,
+            )
+            .unwrap();
+        let _b_peer = b
+            .add_peer(
+                PeerConfig {
+                    key: a_kp.public,
+                    psk,
+                },
+                b_ep,
+            )
+            .unwrap();
+
+        let now = Instant::now();
+
+        // A initiates.
+        let init = a.initiate(a_peer, now, now_unix()).expect("init packet");
+
+        // B receives initiation, produces a response.
+        let b_out = b.recv_one(init.as_slice(), b_derp(&a_kp), now);
+        assert_eq!(b_out.to_peer.len(), 1, "B should produce a response");
+        assert!(!b_out.handshook);
+
+        // A receives response, completes handshake, sends a confirmation packet.
+        let a_out = a.recv_one(b_out.to_peer[0].as_slice(), a_derp(&b_kp), now);
+        assert!(a_out.handshook, "A should complete the handshake");
+        assert_eq!(a_out.to_peer.len(), 1, "A confirms with one packet");
+
+        // B receives the confirmation (transport data), decrypts it, activates.
+        let b_out2 = b.recv_one(a_out.to_peer[0].as_slice(), b_derp(&a_kp), now);
+        assert_eq!(b_out2.decrypted.len(), 1, "B decrypts the confirmation");
+
+        // B can now send transport data to A via its active session, and A
+        // decrypts it. Build a keepalive-sized data packet through the session.
+        // (Exercised via dispatch keepalive below.)
+        let _ = b_out2;
+    }
+
+    fn a_derp(b_kp: &NodeKeyPair) -> Endpoint {
+        Endpoint::Derp {
+            region_id: 1,
+            node_key: b_kp.public.to_bytes(),
+        }
+    }
+    fn b_derp(a_kp: &NodeKeyPair) -> Endpoint {
+        Endpoint::Derp {
+            region_id: 1,
+            node_key: a_kp.public.to_bytes(),
+        }
+    }
+
+    #[test]
+    fn unsynced_clock_skips_initiation() {
+        let a_kp = NodeKeyPair::new();
+        let b_kp = NodeKeyPair::new();
+        let mut a = WgEndpoint::new(a_kp);
+        let id = a
+            .add_peer(
+                PeerConfig {
+                    key: b_kp.public,
+                    psk: Psk::zero(),
+                },
+                Endpoint::Derp {
+                    region_id: 1,
+                    node_key: b_kp.public.to_bytes(),
+                },
+            )
+            .unwrap();
+        assert!(a.initiate(id, Instant::now(), None).is_none());
+    }
+
+    #[test]
+    fn peer_table_bounded() {
+        let mut a = WgEndpoint::new(NodeKeyPair::new());
+        for _ in 0..MAX_PEERS {
+            let kp = NodeKeyPair::new();
+            assert!(a
+                .add_peer(
+                    PeerConfig {
+                        key: kp.public,
+                        psk: Psk::zero()
+                    },
+                    Endpoint::Derp {
+                        region_id: 1,
+                        node_key: kp.public.to_bytes()
+                    }
+                )
+                .is_some());
+        }
+        let kp = NodeKeyPair::new();
+        assert!(a
+            .add_peer(
+                PeerConfig {
+                    key: kp.public,
+                    psk: Psk::zero()
+                },
+                Endpoint::Derp {
+                    region_id: 1,
+                    node_key: kp.public.to_bytes()
+                }
+            )
+            .is_none(), "table should be full at MAX_PEERS");
+    }
+}

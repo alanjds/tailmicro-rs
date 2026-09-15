@@ -212,6 +212,9 @@ impl Runtime {
         let our_pub = config.node_state.node_key.public();
         tracing::debug!("Runtime::join() - node key extracted (32 bytes)");
         let disco_key = config.node_state.disco_key.clone();
+        // WireGuard static key == the node key (captured before node_state is
+        // moved into ControlActor below).
+        let wg_priv = *config.node_state.node_key.as_bytes();
         tracing::debug!("Runtime::join() - disco key extracted (32 bytes)");
         
         #[cfg(target_os = "espidf")]
@@ -265,7 +268,7 @@ impl Runtime {
         }
 
         tracing::debug!("Runtime::join() - creating WgActor");
-        let wg_actor = WgActor::new(config.priority_peer);
+        let wg_actor = WgActor::new(wg_priv, config.priority_peer);
         
         #[cfg(target_os = "espidf")]
         {
@@ -441,6 +444,9 @@ impl Runtime {
 
         let our_pub = config.node_state.node_key.public();
         let disco_key = config.node_state.disco_key.clone();
+        // WireGuard static key == the node key (captured before node_state is
+        // moved into ControlActor below).
+        let wg_priv = *config.node_state.node_key.as_bytes();
 
         let control_actor = ControlActor::new(config.control, config.node_state);
         tokio::spawn(control_actor.run(ctrl_rx, ctrl_ev_tx));
@@ -451,7 +457,7 @@ impl Runtime {
         let disco_actor = DiscoActor::new(disco_key);
         tokio::spawn(disco_actor.run(disco_rx, _disco_ev_tx));
 
-        let wg_actor = WgActor::new(config.priority_peer);
+        let wg_actor = WgActor::new(wg_priv, config.priority_peer);
         tokio::spawn(wg_actor.run(wg_rx, _wg_ev_tx));
 
         // ── Event router task ─────────────────────────────────────────────────
