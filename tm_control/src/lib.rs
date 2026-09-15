@@ -71,14 +71,24 @@ pub struct MapState<const MAX_PEERS: usize = 8, const MAX_REGIONS: usize = 4> {
 /// Conservative version: avoids PeerChangesDelta (cap 72+).
 pub const CAPABILITY_VERSION: u16 = 72;
 
-/// HTTP/2 stream IDs for this connection's two requests. Each new
+/// HTTP/2 stream IDs for this connection's three requests. Each new
 /// client-initiated HTTP/2 request must use its own, incrementing odd
 /// stream ID (RFC 7540 SS5.1.1) - these are not interchangeable or reusable,
 /// which is why parse_frame/WINDOW_UPDATE need the right one passed in
 /// explicitly rather than assuming "1" everywhere. See
 /// docs/noise-handshake-wire-format.md.
+///
+/// A third stream was added (disco/control-plane bring-up, Kanban
+/// t_c414048d): a non-streaming ("write") MapRequest that actually
+/// publishes Hostinfo/DiscoKey/Endpoints, sent before the existing
+/// streaming poll — see `ControlActor::connect_and_poll`'s "Step 7.5" and
+/// docs/wg-dataplane-notes.md Bug 3. The streaming poll's stream ID moved
+/// from 3 to 5 to make room for it, matching
+/// `tools/wg_validator/ts_control.py`'s stream ordering (register,
+/// write-map, then the streaming poll).
 const REGISTER_STREAM_ID: u32 = 1;
-const MAP_STREAM_ID: u32 = 3;
+const MAP_PUBLISH_STREAM_ID: u32 = 3;
+const MAP_STREAM_ID: u32 = 5;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -168,6 +178,20 @@ struct RegisterResponse {
 struct MapRequest<'a> {
     version: u16, compress: &'a str, keep_alive: bool,
     node_key: &'a str, endpoints: &'a [&'a str], stream: bool,
+    // Both added for the non-streaming "publish" MapRequest (disco/
+    // control-plane bring-up, Bug 3): a Stream=true request is read-only on
+    // the control server - cap version >= 68 ignores Hostinfo/DiscoKey/
+    // Endpoints on it entirely (confirmed via tools/wg_validator/
+    // ts_control.py against a live server: our disco key propagated to
+    // peers as all-zeros from a streaming request). `skip_serializing_if`
+    // keeps the existing streaming MapRequest call (which still passes
+    // `None` for both) byte-identical to before this change - this struct
+    // change is purely additive for the new publish call. Matches
+    // ts_control.py::write_map's JSON body field-for-field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disco_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hostinfo: Option<HostInfo<'a>>,
 }
 
 
@@ -266,11 +290,52 @@ impl ControlActor {
             info!("Tailscale Step 4: registration complete, node_key_expired={}, machine_authorized={}", reg.node_key_expired, reg.machine_authorized);
         }
 
-        // Step 8 & 9: MapRequest + streaming response
+        // Step 7.5 (new): publish Hostinfo/DiscoKey/Endpoints via a
+        // non-streaming MapRequest before opening the streaming poll.
+        //
+        // A Stream=true MapRequest (below) is read-only on the control
+        // server for cap version >= 68: Hostinfo/DiscoKey/Endpoints are
+        // silently ignored on it, so without this step our disco key never
+        // reaches peers (they see it as all-zeros) and real peers never
+        // mark our endpoint active, so they drop our WireGuard handshake.
+        // Hostinfo is also unconditionally required by the server (400
+        // otherwise) on every MapRequest, streaming or not. Matches
+        // tools/wg_validator/ts_control.py's write_map(), which published
+        // successfully against the real control server. See
+        // docs/wg-dataplane-notes.md Bug 3.
+        //
+        // Strictly additive: the streaming MapRequest immediately below is
+        // unchanged except for its stream ID (3 -> 5, freed by this new
+        // request taking stream 3).
+        info!("Tailscale Step 7.5: publishing Hostinfo/DiscoKey/Endpoints (non-streaming MapRequest)");
+        {
+            let disco_key_hex = self.node_state.disco_key.public().to_hex();
+            let publish_body = serde_json::to_vec(&MapRequest {
+                version: CAPABILITY_VERSION, compress: "", keep_alive: false,
+                node_key: node_key_hex.as_str(), endpoints: &[], stream: false,
+                disco_key: Some(disco_key_hex.as_str()),
+                hostinfo: Some(HostInfo { os: "embedded", hostname: "esp32c3" }),
+            }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
+
+            let publish_req = build_h2_post("/machine/map", host, MAP_PUBLISH_STREAM_ID, &publish_body);
+            noise.write_all(&mut main_conn, &publish_req).await?;
+        }
+        {
+            // Drain the publish response fully (a full MapResponse body,
+            // same 4-byte-LE-length-prefixed shape the streaming poll uses
+            // per ts_control.py::write_map). We don't need its content here
+            // - the streaming poll immediately below delivers a fresh full
+            // snapshot - only that the request round-tripped.
+            let publish_resp = read_one_h2_body(&mut main_conn, &mut noise, &mut h2, MAP_PUBLISH_STREAM_ID).await?;
+            info!("Tailscale Step 7.5: publish MapRequest response received, {} bytes", publish_resp.len());
+        }
+
+        // Step 8 & 9: streaming MapRequest + streaming response
         {
             let map_body = serde_json::to_vec(&MapRequest {
                 version: CAPABILITY_VERSION, compress: "", keep_alive: true,
                 node_key: node_key_hex.as_str(), endpoints: &[], stream: true,
+                disco_key: None, hostinfo: None,
             }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
 
             let map_req = build_h2_post("/machine/map", host, MAP_STREAM_ID, &map_body);
