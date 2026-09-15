@@ -26,7 +26,7 @@
 //! This reduces memory usage for ESP32-C3 at the cost of lower throughput.
   
 use tm_control::{ControlActor, ControlCmd, ControlEvent, Config as ControlConfig};
-use tm_derp::{DerpActor, DerpCmd, DerpEvent};
+use tm_derp::{DerpActor, DerpCmd, DerpEvent, MAX_DERP_PAYLOAD};
 use tm_disco::{DiscoActor, DiscoCmd, DiscoEvent};
 use tm_wg::{WgActor, WgCmd, WgEvent};
 use tm_keys::{NodeState, NodePublicKey};
@@ -269,14 +269,18 @@ impl Runtime {
 
         tracing::debug!("Runtime::join() - creating WgActor");
         let wg_actor = WgActor::new(wg_priv, config.priority_peer);
-        
+
         #[cfg(target_os = "espidf")]
         {
             unsafe {
                 let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
                 let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
                 let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                tracing::debug!("Runtime::join() - heap after WgActor: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+                // Total-free heap (plan Part 2 finding #4): reportable against
+                // the 40-60 KB tm_wg target / 90 KB ceiling without a fresh
+                // live-run investigation each time.
+                let total_free = esp_idf_sys::esp_get_free_heap_size();
+                info!("Runtime::join() - HEAP after WgActor: total_free={} bytes, largest_block: internal={} 8bit={} default={}", total_free, free_internal, free_8bit, free_default);
             }
         }
 
@@ -329,7 +333,15 @@ impl Runtime {
                         match evt {
                             Ok(evt) => match evt {
                                 DerpEvent::PacketReceived { src_key, payload } => {
-                                    if !payload.is_empty() && payload[0] == 0x6d {
+                                    // Demux disco vs WireGuard by the real wire
+                                    // discriminator: a disco datagram starts
+                                    // with the 6-byte "TS💬" magic; a WireGuard
+                                    // message starts with a type byte in 1..=4.
+                                    // (The previous `payload[0] == 0x6d` matched
+                                    // neither — disco magic byte 0 is 0x54.)
+                                    let is_disco = payload.len() >= 6
+                                        && &payload[..6] == tm_disco::DISCO_MAGIC;
+                                    if is_disco {
                                         let mut data = heapless::Vec::new();
                                         let _ = data.extend_from_slice(&payload);
                                         let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
@@ -367,6 +379,64 @@ impl Runtime {
                             }
                         }
                     }
+                    // ── WireGuard data-plane events (previously dropped) ──────
+                    evt = _wg_ev_rx.recv() => {
+                        match evt {
+                            Ok(WgEvent::OutboundPacket { dst_key, payload }) => {
+                                // The outbound WireGuard path: handshake
+                                // initiations, keepalives and transport data
+                                // leave tm_wg here and are handed to DERP for
+                                // relay to the peer. (DERP transport is a stub
+                                // today — see docs/wg-dataplane-notes.md — so
+                                // these are dropped by the DerpActor for now;
+                                // the wiring is correct and observable.)
+                                info!("Runtime::join() - WgEvent::OutboundPacket {} bytes -> DERP peer {:02x}{:02x}..", payload.len(), dst_key[0], dst_key[1]);
+                                let mut buf: heapless::Vec<u8, MAX_DERP_PAYLOAD> = heapless::Vec::new();
+                                if buf.extend_from_slice(&payload).is_ok() {
+                                    let _ = derp_tx2.send(DerpCmd::SendPacket {
+                                        dst_key: NodePublicKey::from_bytes(dst_key),
+                                        payload: Box::new(buf),
+                                    }).await;
+                                }
+                                #[cfg(target_os = "espidf")]
+                                tokio_freertos_yield().await;
+                            }
+                            Ok(WgEvent::InboundDecrypted { src_key, payload }) => {
+                                // Decrypted inbound app data destined for the
+                                // local netstack. tm_netstack has no on-device
+                                // lwIP injection path yet (it is a stub), so we
+                                // surface it here; this is the seam where a
+                                // transport round-trip becomes observable.
+                                info!("Runtime::join() - WgEvent::InboundDecrypted {} bytes from peer {:02x}{:02x}..", payload.len(), src_key[0], src_key[1]);
+                            }
+                            Ok(WgEvent::PeerHandshook(key)) => {
+                                info!("Runtime::join() - WgEvent::PeerHandshook with peer {:02x}{:02x}..", key[0], key[1]);
+                            }
+                            Err(_) => {
+                                info!("Runtime::join() - wg event channel closed, breaking");
+                                break;
+                            }
+                        }
+                    }
+                    // ── DISCO events ──────────────────────────────────────────
+                    evt = _disco_ev_rx.recv() => {
+                        match evt {
+                            Ok(DiscoEvent::SendPong { payload, .. }) => {
+                                // A wire-correct PONG must be sealed and
+                                // addressed to the peer over DERP; that is
+                                // gated on the DERP transport (stub). Surface
+                                // it so a real PING-from-peer is observable.
+                                info!("Runtime::join() - DiscoEvent::SendPong (tx_id {:02x}{:02x}..) [not relayed: DERP stub]", payload[0], payload[1]);
+                            }
+                            Ok(DiscoEvent::PingFrom(key)) => {
+                                info!("Runtime::join() - DiscoEvent::PingFrom peer {:02x}{:02x}..", key[0], key[1]);
+                            }
+                            Err(_) => {
+                                info!("Runtime::join() - disco event channel closed, breaking");
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             info!("Runtime::join() - event_router task exiting");
@@ -398,7 +468,8 @@ impl Runtime {
                 let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
                 let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
                 let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                tracing::debug!("Runtime::join() - heap before tokio::join!: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
+                let total_free = esp_idf_sys::esp_get_free_heap_size();
+                info!("Runtime::join() - HEAP before tokio::join! (all actors constructed): total_free={} bytes, largest_block: internal={} 8bit={} default={}", total_free, free_internal, free_8bit, free_default);
             }
         }
 
