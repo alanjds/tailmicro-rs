@@ -39,10 +39,18 @@ pub enum DerpFrameType {
     PeerPresent    = 0x09,
     WatchConns     = 0x10,
     ClosePeer      = 0x11,
-    Ping           = 0x40,
-    Pong           = 0x41,
-    Health         = 0x42,
-    Restarting     = 0x43,
+    // Authoritative values from tailscale/derp/derp.go (frameXxx constants),
+    // cross-checked against tools/wg_validator/derp_client.py's
+    // FRAME_PING..FRAME_RESTARTING, which interoperated with a real DERP
+    // server. These previously jumped to 0x40-0x43, which do not match any
+    // real DERP frame type -- a real server's Ping/Pong/Health/Restarting
+    // frames would have been silently misidentified (TryFrom would even
+    // reject them, since 0x12-0x15 had no match arms at all). See
+    // docs/wg-dataplane-notes.md.
+    Ping           = 0x12,
+    Pong           = 0x13,
+    Health         = 0x14,
+    Restarting     = 0x15,
 }
 
 impl TryFrom<u8> for DerpFrameType {
@@ -58,8 +66,12 @@ impl TryFrom<u8> for DerpFrameType {
             0x07 => Ok(Self::NotePreferred),
             0x08 => Ok(Self::PeerGone),
             0x09 => Ok(Self::PeerPresent),
-            0x40 => Ok(Self::Ping),
-            0x41 => Ok(Self::Pong),
+            0x10 => Ok(Self::WatchConns),
+            0x11 => Ok(Self::ClosePeer),
+            0x12 => Ok(Self::Ping),
+            0x13 => Ok(Self::Pong),
+            0x14 => Ok(Self::Health),
+            0x15 => Ok(Self::Restarting),
             _ => Err(()),
         }
     }
