@@ -5,8 +5,12 @@ edition.workspace = true
 
 [dependencies]
 tm_keys.workspace   = true
-chacha20poly1305    = "0.11.0-rc.3"
-x25519-dalek        = { version = "2", default-features = false }
+# NaCl crypto_box (X25519 + XSalsa20-Poly1305) — the actual primitive real
+# Tailscale disco uses, replacing the previous (wrong) XChaCha20Poly1305.
+# Version pinned to match the authoritative `ts_disco_protocol` /
+# `ts_keys` reference in tailscale-rs (`crypto_box = { version = "0.9" }`).
+# See docs/wg-dataplane-notes.md.
+crypto_box          = { version = "0.9", default-features = false, features = ["alloc", "salsa20"] }
 heapless            = { workspace = true }
 arrayvec            = { workspace = true }
 tokio               = { workspace = true, features = ["sync"] }
