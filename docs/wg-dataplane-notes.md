@@ -299,6 +299,35 @@ node named `wg-validator-probe`; with the current (non-ephemeral) auth key
 these persist and should be removed from
 `https://login.tailscale.com/admin/machines`.
 
+## Fixes applied (disco/control-plane bring-up, Kanban t_c414048d)
+
+Tracking fixes for three findings above (#5, #4, #1+#2) that block `tm_wg`
+from completing a live handshake with a real peer, in safest-first order.
+Each fix is verified against its already-working from-spec Python reference
+in `tools/wg_validator/` (which interoperated with a real Tailscale peer), or
+against authoritative upstream Tailscale source where noted.
+
+### Bug 1 — `tm_derp` frame-type constants (finding #5 above)
+
+`tm_derp/src/lib.rs:42-45` had `Ping=0x40, Pong=0x41, Health=0x42,
+Restarting=0x43`. The enum otherwise runs `WatchConns=0x10, ClosePeer=0x11`
+and then wrongly jumped to `0x40`. Fixed to the authoritative
+`tailscale/derp/derp.go` frame constants `Ping=0x12, Pong=0x13, Health=0x14,
+Restarting=0x15`, matching `tools/wg_validator/derp_client.py`'s
+`FRAME_PING=0x12` / `FRAME_PONG=0x13` / `FRAME_HEALTH=0x14` /
+`FRAME_RESTARTING=0x15` (that client interoperated with a real DERP server).
+
+Also fixed `TryFrom<u8>` (`tm_derp/src/lib.rs:61-66`), which mapped the old
+0x40/0x41 values and had no arms at all for Health/Restarting or, pre-existing
+independent of this bug, for `WatchConns` (0x10) / `ClosePeer` (0x11) despite
+both being declared in the enum — any of those frame types arriving on the
+wire would have hit the `_ => Err(())` catch-all. All eight declared variants
+now round-trip through `TryFrom`.
+
+Verified with `cargo build -p tm_derp` on host and by diffing the constants
+1:1 against `derp_client.py`'s `FRAME_*` block; see the following commit for
+the build output.
+
 ## Out of scope for this run (needs hardware)
 
 - Wokwi/ESP live run and the MicroLink interop bench (plan checklist #3):
