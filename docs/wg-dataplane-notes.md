@@ -328,6 +328,54 @@ Verified with `cargo build -p tm_derp` on host and by diffing the constants
 1:1 against `derp_client.py`'s `FRAME_*` block; see the following commit for
 the build output.
 
+### Bug 2 — `tm_disco` wrong AEAD (finding #4 above)
+
+`tm_disco/src/lib.rs` sealed/opened disco payloads with XChaCha20-Poly1305:
+it fed the raw X25519 Diffie-Hellman shared secret straight into
+`chacha20poly1305::XChaCha20Poly1305` as the AEAD key. Real Tailscale disco
+uses NaCl `crypto_box` = X25519 + XSalsa20-Poly1305 with a 24-byte nonce,
+where `crypto_box` additionally runs the DH output through an HSalsa20
+subkey-derivation step before it becomes the cipher key — a different cipher
+core (Salsa20 vs ChaCha20) *and* a different key derivation, so the previous
+code could not open a real peer's disco messages at all.
+`tools/wg_validator/disco.py` uses `nacl.public.Box` (pynacl's crypto_box)
+and interoperated with a real peer; the authoritative upstream reference
+`~/src/tailscale-rs/ts_disco_protocol/src/packet.rs` builds
+`crypto_box::SalsaBox::new(&receiver.into(), &secret.into())` for exactly
+this purpose, pinned to `crypto_box = { version = "0.9" }`.
+
+Replaced the AEAD in `DiscoActor::process` (`tm_disco/src/lib.rs`) with the
+RustCrypto `crypto_box` crate's `SalsaBox` (same `0.9` line as the upstream
+reference): `crypto_box::SalsaBox::new(&sender_pub, &our_secret)` (this call
+does both the X25519 DH *and* the HSalsa20 derivation), then
+`.decrypt(&nonce, ciphertext)` via the crate's re-exported `aead::Aead`
+trait — this mirrors `ts_disco_protocol::packet::Packet::decrypt_in_place`'s
+construction exactly, modulo that reference's zerocopy in-place framing.
+`tm_disco/Cargo.toml` drops the unused `chacha20poly1305`/`x25519-dalek`
+direct dependencies (the DH is now internal to `SalsaBox::new`) in favor of
+`crypto_box = "0.9"`.
+
+Verified: (1) `cargo build -p tm_disco` on host — clean, no errors; (2) a
+new `#[cfg(test)]` in `tm_disco/src/lib.rs`
+(`aead_crosscheck::salsa_box_decrypts_pynacl_sealed_payload`) decrypts a
+payload sealed by `pynacl.public.Box` with fixed keys/nonce and asserts the
+plaintext matches byte-for-byte; `cargo test -p tm_disco` passes. The pynacl
+vector (fixed `sender_priv=01..20`, `receiver_priv=21..40` hex, fixed
+24-byte nonce `01..18` hex) was generated with a one-off script using the
+`nacl.public.Box` API `disco.py` itself uses (the workstream's environment
+had no `pynacl` preinstalled; installed into a throwaway venv against
+Python 3.12 only for generating this test vector — no live network peer was
+contacted).
+
+Note (not fixed, out of scope for this AEAD-only bug): `tm_disco::process`
+also assumes the wire payload starts directly with the sender's disco public
+key, with no leading 6-byte `"TS💬"` magic (`disco.py`'s `MAGIC`,
+`DISCO_MAGIC` in `tm_disco` is declared but never checked), and its PING
+branch reads the 12-byte transaction ID starting at `plaintext[1]` (the
+version byte's position per `disco.py`) instead of `plaintext[2]`. Both look
+like real framing bugs but are a separate finding from the AEAD swap;
+flagging here for a follow-up card rather than folding into this fix.
+
 ## Out of scope for this run (needs hardware)
 
 - Wokwi/ESP live run and the MicroLink interop bench (plan checklist #3):
