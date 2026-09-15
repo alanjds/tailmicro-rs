@@ -33,6 +33,69 @@ struct SessionKeys {
     responder_to_initiator: chacha20poly1305::Key,
 }
 
+/// Test/vector seam: abstracts over the two x25519-dalek ephemeral secret
+/// types so the mix-chain has a single source of truth. Production uses
+/// `ReusableSecret` (whose scalar bytes deliberately can't leak); the
+/// deterministic reference-vector emitters (`initiate_handshake_with_ephemeral`,
+/// `ReceivedHandshake::respond_vector`) use `StaticSecret`, which *is*
+/// constructible from a fixed scalar, so an independent Python oracle can
+/// reproduce the exact wire bytes. Both call the same `build_*` cores below,
+/// so a vector can never validate against stale handshake logic.
+trait EphemeralSecret {
+    fn public_key(&self) -> x25519_dalek::PublicKey;
+    fn dh(&self, peer: &x25519_dalek::PublicKey) -> [u8; 32];
+}
+
+impl EphemeralSecret for x25519_dalek::ReusableSecret {
+    fn public_key(&self) -> x25519_dalek::PublicKey {
+        x25519_dalek::PublicKey::from(self)
+    }
+    fn dh(&self, peer: &x25519_dalek::PublicKey) -> [u8; 32] {
+        self.diffie_hellman(peer).to_bytes()
+    }
+}
+
+impl EphemeralSecret for x25519_dalek::StaticSecret {
+    fn public_key(&self) -> x25519_dalek::PublicKey {
+        x25519_dalek::PublicKey::from(self)
+    }
+    fn dh(&self, peer: &x25519_dalek::PublicKey) -> [u8; 32] {
+        self.diffie_hellman(peer).to_bytes()
+    }
+}
+
+/// Shared initiator mix-chain core (single source of truth for the initiation
+/// wire bytes and post-initiation handshake state).
+fn build_initiation<E: EphemeralSecret>(
+    endpoint_static: NodePrivateKey,
+    peer_static: NodePublicKey,
+    session_id: SessionId,
+    timestamp: TAI64N,
+    ephemeral: &E,
+) -> (HandshakeState, HandshakeInitiation) {
+    let ephemeral_pub = ephemeral.public_key();
+    let endpoint_static_pub = NodePublicKey::from(endpoint_static);
+
+    let mut pkt = HandshakeInitiation {
+        sender_id: session_id,
+        ephemeral_pub: ephemeral_pub.to_bytes(),
+        ..Default::default()
+    };
+
+    let ss = x25519_dalek::StaticSecret::from(endpoint_static)
+        .diffie_hellman(&peer_static.into())
+        .to_bytes();
+    let handshake = HandshakeState::new(peer_static)
+        .mix_hash(ephemeral_pub.as_bytes()) // e
+        .mix_key(ephemeral_pub.as_bytes()) // e (extra mixing required by psk variant)
+        .mix_key(&ephemeral.dh(&peer_static.into())) // es
+        .encrypt(endpoint_static_pub.as_bytes(), &mut pkt.static_pub_sealed) // s
+        .mix_key(&ss) // ss
+        .encrypt(timestamp.as_bytes(), &mut pkt.timestamp_sealed); // payload
+
+    (handshake, pkt)
+}
+
 /// The state of a partially processed handshake.
 #[derive(Clone)]
 struct HandshakeState {
@@ -205,16 +268,15 @@ impl ReceivedHandshake {
         })
     }
 
-    /// Finalize the handshake, producing a HandshakeResponse packet.
-    pub fn respond(
-        self,
+    /// Shared responder mix-chain core (single source of truth for the response
+    /// wire bytes and derived session keys).
+    fn build_response<E: EphemeralSecret>(
+        &self,
         session_id: SessionId,
         psk: &Psk,
-        macs: &MACSender,
-        now: Instant,
-    ) -> (SessionPair, Packet) {
-        let my_ephemeral = x25519_dalek::ReusableSecret::random_from_rng(OsRng);
-        let my_ephemeral_pub = x25519_dalek::PublicKey::from(&my_ephemeral);
+        ephemeral: &E,
+    ) -> (SessionKeys, HandshakeResponse) {
+        let my_ephemeral_pub = ephemeral.public_key();
         let mut response = HandshakeResponse {
             sender_id: session_id,
             receiver_id: self.send_id,
@@ -224,17 +286,28 @@ impl ReceivedHandshake {
 
         let session_keys = self
             .handshake
+            .clone()
             .mix_hash(&my_ephemeral_pub.to_bytes()) // e
             .mix_key(&my_ephemeral_pub.to_bytes()) // e (extra mixing required by psk variant)
-            .mix_key(my_ephemeral.diffie_hellman(&self.peer_ephemeral).as_bytes()) // ee
-            .mix_key(
-                my_ephemeral
-                    .diffie_hellman(&self.peer_static.into())
-                    .as_bytes(),
-            ) // se (reversed: responder)
+            .mix_key(&ephemeral.dh(&self.peer_ephemeral)) // ee
+            .mix_key(&ephemeral.dh(&self.peer_static.into())) // se (reversed: responder)
             .mix_psk(psk) // psk
             .encrypt(&[], &mut response.auth_tag) // payload (empty; must encrypt to produce auth tag)
             .finish();
+
+        (session_keys, response)
+    }
+
+    /// Finalize the handshake, producing a HandshakeResponse packet.
+    pub fn respond(
+        self,
+        session_id: SessionId,
+        psk: &Psk,
+        macs: &MACSender,
+        now: Instant,
+    ) -> (SessionPair, Packet) {
+        let my_ephemeral = x25519_dalek::ReusableSecret::random_from_rng(OsRng);
+        let (session_keys, response) = self.build_response(session_id, psk, &my_ephemeral);
 
         // Responder: send = responder_to_initiator, recv = initiator_to_responder.
         let send = TransmitSession::new(
@@ -250,6 +323,27 @@ impl ReceivedHandshake {
         (SessionPair { send, recv }, pkt)
     }
 
+    /// Deterministic reference-vector emitter for the responder path. Returns
+    /// `(initiator_to_responder, responder_to_initiator, response)` for a fixed
+    /// responder ephemeral scalar, so an independent oracle can reproduce and
+    /// verify the response bytes and both derived transport keys. Not used in
+    /// production. Runs the same `build_response` core as `respond`.
+    #[doc(hidden)]
+    pub fn respond_vector(
+        &self,
+        session_id: SessionId,
+        psk: &Psk,
+        ephemeral_scalar: [u8; 32],
+    ) -> (chacha20poly1305::Key, chacha20poly1305::Key, HandshakeResponse) {
+        let ephemeral = x25519_dalek::StaticSecret::from(ephemeral_scalar);
+        let (keys, response) = self.build_response(session_id, psk, &ephemeral);
+        (
+            keys.initiator_to_responder,
+            keys.responder_to_initiator,
+            response,
+        )
+    }
+
     pub fn peer_static(&self) -> NodePublicKey {
         self.peer_static
     }
@@ -263,26 +357,8 @@ pub fn initiate_handshake(
     timestamp: TAI64N,
 ) -> (SentHandshake, HandshakeInitiation) {
     let ephemeral = x25519_dalek::ReusableSecret::random_from_rng(OsRng);
-    let ephemeral_pub = x25519_dalek::PublicKey::from(&ephemeral);
-    let endpoint_static_pub = NodePublicKey::from(endpoint_static);
-
-    let mut pkt = HandshakeInitiation {
-        sender_id: session_id,
-        ephemeral_pub: ephemeral_pub.to_bytes(),
-        ..Default::default()
-    };
-
-    let handshake = HandshakeState::new(peer_static)
-        .mix_hash(ephemeral_pub.as_bytes()) // e
-        .mix_key(ephemeral_pub.as_bytes()) // e (extra mixing required by psk variant)
-        .mix_key(ephemeral.diffie_hellman(&peer_static.into()).as_bytes()) // es
-        .encrypt(endpoint_static_pub.as_bytes(), &mut pkt.static_pub_sealed) // s
-        .mix_key(
-            x25519_dalek::StaticSecret::from(endpoint_static)
-                .diffie_hellman(&peer_static.into())
-                .as_bytes(),
-        ) // ss
-        .encrypt(timestamp.as_bytes(), &mut pkt.timestamp_sealed); // payload
+    let (handshake, pkt) =
+        build_initiation(endpoint_static, peer_static, session_id, timestamp, &ephemeral);
 
     let ret = SentHandshake {
         id: session_id,
@@ -292,6 +368,25 @@ pub fn initiate_handshake(
     };
 
     (ret, pkt)
+}
+
+/// Deterministic reference-vector emitter: identical to `initiate_handshake`
+/// but with a caller-supplied ephemeral scalar, so an independent oracle can
+/// reproduce the exact 148-byte initiation. Not used in production (which must
+/// use a fresh random ephemeral). Runs the same `build_initiation` core, so it
+/// exercises the real wire encoding, not a re-implementation.
+#[doc(hidden)]
+pub fn initiate_handshake_with_ephemeral(
+    endpoint_static: NodePrivateKey,
+    peer_static: NodePublicKey,
+    session_id: SessionId,
+    timestamp: TAI64N,
+    ephemeral_scalar: [u8; 32],
+) -> HandshakeInitiation {
+    let ephemeral = x25519_dalek::StaticSecret::from(ephemeral_scalar);
+    let (_handshake, pkt) =
+        build_initiation(endpoint_static, peer_static, session_id, timestamp, &ephemeral);
+    pkt
 }
 
 /// A partially completed sent handshake.

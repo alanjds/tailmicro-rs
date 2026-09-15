@@ -1,0 +1,19 @@
+# Detached from the tailmicro-rs workspace on purpose (own empty [workspace]),
+# so pulling in boringtun for an interop oracle never touches the firmware
+# dependency graph. Build with CARGO_TARGET_DIR set outside the repo.
+[package]
+name = "boringtun_peer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# Use boringtun's own re-exported x25519 types (it pins a specific dalek
+# pre-release); do not add a conflicting x25519-dalek of our own.
+boringtun = "0.6"
+
+[[bin]]
+name = "boringtun_peer"
+path = "src/main.rs"
