@@ -496,6 +496,16 @@ async fn read_one_h2_body<S: IoStream>(
         match tm_h2::parse_frame(&hdr, &fb[..blen], expected_stream, h2)? {
             FrameAction::Data { payload, end_stream } => {
                 for b in payload { let _ = body.push(*b); }
+                // Flow control: without this, any response body over one
+                // stream window (tm_h2::INITIAL_WINDOW = 4096) stalls forever.
+                // The register response fits in one window so it never needed
+                // it; the Step 7.5 publish MapResponse is ~29 KB (live-measured)
+                // and hung here. Same accounting stream_map_response already
+                // does. Stream-level update must target `expected_stream`
+                // (this drains stream 1 for register, 3 for the publish).
+                let (cwu, swu) = h2.consumed(payload.len() as u32);
+                if cwu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,0,cwu); noise.write_all(stream,&b).await?; }
+                if swu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,expected_stream,swu); noise.write_all(stream,&b).await?; }
                 if end_stream { return Ok(body); }
             }
             FrameAction::SendSettingsAck => { let mut a=[0u8;9]; write_settings_ack(&mut a); noise.write_all(stream,&a).await?; }
