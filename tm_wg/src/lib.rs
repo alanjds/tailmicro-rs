@@ -68,7 +68,14 @@ pub enum WgEvent {
 // ── WgActor ───────────────────────────────────────────────────────────────────
 
 pub struct WgActor {
-    endpoint: WgEndpoint,
+    // Boxed: `WgEndpoint` is ~28 KB (fixed peer table + session state). Kept
+    // by value it was embedded — and duplicated — inside the `run()` async
+    // state machine, ballooning that future to ~90 KB. `Box::pin`-ing the
+    // future at spawn time then tried to build all ~90 KB on the ESP32-C3's
+    // 32 KB main-task stack, hitting a Guru Meditation stack-protection fault
+    // in Runtime::join. Boxing the endpoint keeps only an 8-byte pointer in
+    // the future. See docs/wg-dataplane-notes.md.
+    endpoint: Box<WgEndpoint>,
     /// Never-evicted peer (MicroLink: priority_peer). Retained for API
     /// compatibility; the fixed `MAX_PEERS` table currently rejects overflow
     /// rather than LRU-evicting.
@@ -80,7 +87,7 @@ impl WgActor {
     pub fn new(node_priv: [u8; 32], priority_peer: Option<[u8; 32]>) -> Self {
         let kp = NodeKeyPair::from_private(NodePrivateKey(node_priv));
         Self {
-            endpoint: WgEndpoint::new(kp),
+            endpoint: Box::new(WgEndpoint::new(kp)),
             priority_peer,
         }
     }
@@ -97,15 +104,21 @@ impl WgActor {
             tokio::select! {
                 cmd = cmds.recv() => {
                     match cmd {
-                        Ok(WgCmd::ApplyMap(map)) => self.apply_map(&map, &events).await,
+                        // Box::pin the per-command handlers so their (multi-KB)
+                        // futures are heap-allocated on demand instead of being
+                        // inlined into this `run()` state machine. Without this
+                        // the `run` future embeds on_inbound/apply_map/on_tick
+                        // by value (~90 KB total) and building it on the 32 KB
+                        // main-task stack faults. See docs/wg-dataplane-notes.md.
+                        Ok(WgCmd::ApplyMap(map)) => Box::pin(self.apply_map(&map, &events)).await,
                         Ok(WgCmd::InboundPacket { src_key, payload }) => {
-                            self.on_inbound(src_key, &payload, &events).await;
+                            Box::pin(self.on_inbound(src_key, &payload, &events)).await;
                         }
                         Ok(WgCmd::Shutdown) | Err(_) => break,
                     }
                 }
                 _ = ticker.tick() => {
-                    self.on_tick(&events).await;
+                    Box::pin(self.on_tick(&events)).await;
                 }
             }
         }
@@ -186,39 +199,49 @@ impl WgActor {
             region_id: 0,
             node_key: src_key,
         };
-        let out = self.endpoint.recv_one(payload, from, Instant::now());
+        // Box the RecvOut (~12 KB of packet buffers) before it crosses the
+        // `drain_recv` await boundary: kept by value it was held twice (as the
+        // captured argument and a moved-out local) plus a multi-KB consuming
+        // iterator, ~33 KB on the stack. Boxed, only an 8-byte pointer lives
+        // in the future.
+        let out = Box::new(self.endpoint.recv_one(payload, from, Instant::now()));
         self.drain_recv(src_key, out, events).await;
     }
 
     async fn on_tick(&mut self, events: &async_channel::Sender<WgEvent>) {
         let now = Instant::now();
         // next_event is advisory; we always tick, and only act on due timers.
-        let outbound = self.endpoint.dispatch(now, now_unix());
-        for (id, pkt) in outbound {
-            self.emit_to_peer(id, pkt, events).await;
+        // Box the dispatch output (ArrayVec of (PeerId, Packet), ~12 KB) so it
+        // does not live as an owning iterator on the stack across the
+        // emit_to_peer awaits; iterate by reference and clone each packet.
+        let outbound = Box::new(self.endpoint.dispatch(now, now_unix()));
+        for (id, pkt) in outbound.iter() {
+            self.emit_to_peer(*id, pkt.clone(), events).await;
         }
     }
 
-    async fn drain_recv(&self, src_key: [u8; 32], out: RecvOut, events: &async_channel::Sender<WgEvent>) {
+    async fn drain_recv(&self, src_key: [u8; 32], out: Box<RecvOut>, events: &async_channel::Sender<WgEvent>) {
         let dst_key = out
             .peer
             .and_then(|id| self.endpoint.peer_key(id))
             .map(|k| k.to_bytes())
             .unwrap_or(src_key);
 
-        for pkt in out.to_peer {
+        // Iterate by reference: moving the ArrayVecs out would reintroduce the
+        // multi-KB owning iterator on the stack that boxing `out` removed.
+        for pkt in out.to_peer.iter() {
             let _ = events
                 .send(WgEvent::OutboundPacket {
                     dst_key,
-                    payload: pkt_to_box(&pkt),
+                    payload: pkt_to_box(pkt),
                 })
                 .await;
         }
-        for pkt in out.decrypted {
+        for pkt in out.decrypted.iter() {
             let _ = events
                 .send(WgEvent::InboundDecrypted {
                     src_key: dst_key,
-                    payload: pkt_to_box(&pkt),
+                    payload: pkt_to_box(pkt),
                 })
                 .await;
         }
