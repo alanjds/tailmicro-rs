@@ -44,7 +44,311 @@ pub async fn tokio_freertos_yield() {
 #[cfg(target_os = "espidf")]
 use esp_idf_sys;
 
+/// A type-erased, heap-pinned actor future.
+type BoxActorFut = core::pin::Pin<Box<dyn core::future::Future<Output = ()>>>;
 
+/// Log the current largest-free-block / total-free heap, tagged.
+///
+/// `#[inline(never)]`: the `info!`/`heap_caps_*` format temporaries would
+/// otherwise be reserved (once per call site, no slot reuse in the debug
+/// build) inside the single `Runtime::join` poll frame. With ~15 heap-probe
+/// call sites that alone pushed the frame well past the 32 KB main-task
+/// stack. Kept in its own (reused) frame here instead. See
+/// docs/wg-dataplane-notes.md.
+#[cfg(target_os = "espidf")]
+#[inline(never)]
+fn log_heap(tag: &str) {
+    unsafe {
+        let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+        let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
+        let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
+        let total_free = esp_idf_sys::esp_get_free_heap_size();
+        info!("Runtime::join() - heap [{}]: total_free={} bytes, largest_block: internal={} 8bit={} default={}", tag, total_free, free_internal, free_8bit, free_default);
+    }
+}
+#[cfg(not(target_os = "espidf"))]
+#[inline(never)]
+fn log_heap(_tag: &str) {}
+
+// ── Actor future boxing helpers ─────────────────────────────────────────────
+//
+// Each helper constructs one actor's `run()` future and moves it onto the
+// heap (`Box::pin`), returning only an 8-byte pointer.
+//
+// Why `#[inline(never)]`, and why one function per actor: in the ESP32-C3
+// debug build the compiler does NOT reuse stack slots, so if these
+// `Box::pin(...)` expressions sat inline in `Runtime::join`, every actor's
+// run-future temporary (built on the stack before `Box::new` copies it to
+// the heap) would be reserved *simultaneously* in the single `join` poll
+// frame, alongside the `tokio::join!` machinery and the event-router body.
+// That summed to a ~55 KB frame -- larger than the 32 KB main-task stack --
+// and faulted in `join`'s prologue (Guru Meditation, stack protection)
+// before any actor ran. Building each future inside its own non-inlinable
+// function keeps that transient in a frame that is freed on return, so
+// `join` only ever holds the returned pointers. See
+// docs/wg-dataplane-notes.md.
+
+// Each helper also does the `Actor::new(..)` construction itself (rather
+// than taking an already-built actor struct as a parameter). This matters
+// for `WgActor`: `WgActor::new` builds a ~28 KB `WgEndpoint` on the stack
+// before `Box`-ing it (see `tm_wg::WgActor::endpoint`'s doc comment). A
+// plain (non-`#[inline(never)]`) constructor called from `join` was itself
+// being MIR-inlined into `join` at this workspace's `opt-level = "z"` +
+// `lto = true` dev profile, dragging that 28 KB stack temporary along with
+// it -- this was the dominant contributor to the ~55 KB frame observed even
+// after the event-router extraction and future-boxing alone. Keeping
+// construction *and* future-building inside the same non-inlinable helper
+// keeps both off `join`'s frame.
+
+#[inline(never)]
+fn spawn_control(
+    config: ControlConfig,
+    node_state: NodeState,
+    rx: async_channel::Receiver<ControlCmd>,
+    tx: async_channel::Sender<ControlEvent>,
+) -> BoxActorFut {
+    let actor = ControlActor::new(config, node_state);
+    Box::pin(actor.run(rx, tx))
+}
+
+#[inline(never)]
+fn spawn_derp(
+    our_key: NodePublicKey,
+    rx: async_channel::Receiver<DerpCmd>,
+    tx: async_channel::Sender<DerpEvent>,
+) -> BoxActorFut {
+    let actor = DerpActor::new(our_key);
+    Box::pin(actor.run(rx, tx))
+}
+
+#[inline(never)]
+fn spawn_disco(
+    our_disco_key: tm_keys::DiscoPrivateKey,
+    rx: async_channel::Receiver<DiscoCmd>,
+    tx: async_channel::Sender<DiscoEvent>,
+) -> BoxActorFut {
+    let actor = DiscoActor::new(our_disco_key);
+    Box::pin(actor.run(rx, tx))
+}
+
+#[inline(never)]
+fn spawn_wg(
+    node_priv: [u8; 32],
+    priority_peer: Option<[u8; 32]>,
+    rx: async_channel::Receiver<WgCmd>,
+    tx: async_channel::Sender<WgEvent>,
+) -> BoxActorFut {
+    let actor = WgActor::new(node_priv, priority_peer);
+    Box::pin(actor.run(rx, tx))
+}
+
+/// Log a received `ControlEvent::Error`. `#[inline(never)]` so its `Debug`
+/// format temporary is not reserved inside `event_router_task`'s frame
+/// alongside every other branch's temporaries (debug build: no stack-slot
+/// reuse). Mirrors the rationale for `log_heap` above.
+#[inline(never)]
+fn log_control_error(e: &tm_control::ControlError) {
+    error!("Runtime::join() - received ControlEvent::Error: {:?}", e);
+}
+
+/// Log a received `DerpEvent::Error`. See `log_control_error`.
+#[inline(never)]
+fn log_derp_error(e: &tm_derp::DerpError) {
+    error!("Runtime::join() - received DerpEvent::Error: {:?}", e);
+}
+
+/// The event-router loop, extracted to a top-level `async fn`.
+///
+/// This used to be an `async move { .. }` block declared as a local inside
+/// `Runtime::join`. Even after that local was `Box::pin`-ed at the
+/// `tokio::join!` call site, the block's body was still materialized as a
+/// local variable in `join`'s own generator state (and, transitively, in
+/// its poll stack frame) because it was constructed inline. Moving the loop
+/// into its own top-level `async fn`, built off-frame via
+/// `spawn_event_router` below (same pattern as the actor futures), is the
+/// piece that actually keeps its large `tokio::select!` body -- four branches
+/// each with heapless::Vec construction and multi-field `info!` calls -- out
+/// of `join`'s frame.
+async fn event_router_task(
+    mut ctrl_ev_rx: async_channel::Receiver<ControlEvent>,
+    mut derp_ev_rx: async_channel::Receiver<DerpEvent>,
+    mut disco_ev_rx: async_channel::Receiver<DiscoEvent>,
+    mut wg_ev_rx: async_channel::Receiver<WgEvent>,
+    ctrl_tx3: async_channel::Sender<ControlCmd>,
+    derp_tx2: async_channel::Sender<DerpCmd>,
+    wg_tx2: async_channel::Sender<WgCmd>,
+    disco_tx2: async_channel::Sender<DiscoCmd>,
+    our_ip_tx: Option<OurIpSender>,
+) {
+    info!("Runtime::join() - event_router task started");
+    loop {
+        #[cfg(target_os = "espidf")]
+        tokio_freertos_yield().await;
+        tokio::select! {
+            evt = ctrl_ev_rx.recv() => {
+                match evt {
+                    Ok(evt) => match evt {
+                        ControlEvent::MapUpdate(map) => {
+                            info!("Runtime::join() - received ControlEvent::MapUpdate");
+                            let _ = wg_tx2.send(WgCmd::ApplyMap(map)).await;
+                        }
+                        ControlEvent::OurIpAssigned(ip) => {
+                            info!("Runtime::join() - received ControlEvent::OurIpAssigned: {}.{}.{}.{}", ip.0[0], ip.0[1], ip.0[2], ip.0[3]);
+                            #[cfg(target_os = "espidf")]
+                            if let Some(ref tx) = our_ip_tx {
+                                #[cfg(target_os = "espidf")]
+                                tokio_freertos_yield().await;
+                                let _ = tx.send(ip.to_ipv4()).await;
+                            }
+                        }
+                        ControlEvent::KeyExpiry => {
+                            let _ = ctrl_tx3.send(ControlCmd::Reauth).await;
+                            #[cfg(target_os = "espidf")]
+                            tokio_freertos_yield().await;
+                        }
+                        ControlEvent::Error(e) => {
+                            log_control_error(&e);
+                        }
+                    }
+                    Err(_) => {
+                        info!("Runtime::join() - control event channel closed, breaking");
+                        break;
+                    }
+                }
+            }
+            evt = derp_ev_rx.recv() => {
+                match evt {
+                    Ok(evt) => match evt {
+                        DerpEvent::PacketReceived { src_key, payload } => {
+                            // Demux disco vs WireGuard by the real wire
+                            // discriminator: a disco datagram starts
+                            // with the 6-byte "TS💬" magic; a WireGuard
+                            // message starts with a type byte in 1..=4.
+                            // (The previous `payload[0] == 0x6d` matched
+                            // neither -- disco magic byte 0 is 0x54.)
+                            let is_disco = payload.len() >= 6
+                                && &payload[..6] == tm_disco::DISCO_MAGIC;
+                            if is_disco {
+                                let mut data = heapless::Vec::new();
+                                let _ = data.extend_from_slice(&payload);
+                                let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
+                                    src_ip:   [0; 4],
+                                    src_port: 0,
+                                    data: Box::new(data),
+                                }).await;
+                                #[cfg(target_os = "espidf")]
+                                tokio_freertos_yield().await;
+                            } else {
+                                let mut pkt = heapless::Vec::new();
+                                let _ = pkt.extend_from_slice(&payload);
+                                let _ = wg_tx2.send(WgCmd::InboundPacket {
+                                    src_key: *src_key.as_bytes(),
+                                    payload: Box::new(pkt),
+                                }).await;
+                                #[cfg(target_os = "espidf")]
+                                tokio_freertos_yield().await;
+                            }
+                        }
+                        DerpEvent::Connected => {
+                            tracing::debug!("DERP connected");
+                        }
+                        DerpEvent::PingReceived => {}
+                        DerpEvent::Disconnected => {
+                            tracing::debug!("DERP disconnected");
+                        }
+                        DerpEvent::Error(e) => {
+                            log_derp_error(&e);
+                        }
+                    }
+                    Err(_) => {
+                        info!("Runtime::join() - derp event channel closed, breaking");
+                        break;
+                    }
+                }
+            }
+            // ── WireGuard data-plane events (previously dropped) ──────
+            evt = wg_ev_rx.recv() => {
+                match evt {
+                    Ok(WgEvent::OutboundPacket { dst_key, payload }) => {
+                        // The outbound WireGuard path: handshake
+                        // initiations, keepalives and transport data
+                        // leave tm_wg here and are handed to DERP for
+                        // relay to the peer. (DERP transport is a stub
+                        // today -- see docs/wg-dataplane-notes.md -- so
+                        // these are dropped by the DerpActor for now;
+                        // the wiring is correct and observable.)
+                        info!("Runtime::join() - WgEvent::OutboundPacket {} bytes -> DERP peer {:02x}{:02x}..", payload.len(), dst_key[0], dst_key[1]);
+                        let mut buf: heapless::Vec<u8, MAX_DERP_PAYLOAD> = heapless::Vec::new();
+                        if buf.extend_from_slice(&payload).is_ok() {
+                            let _ = derp_tx2.send(DerpCmd::SendPacket {
+                                dst_key: NodePublicKey::from_bytes(dst_key),
+                                payload: Box::new(buf),
+                            }).await;
+                        }
+                        #[cfg(target_os = "espidf")]
+                        tokio_freertos_yield().await;
+                    }
+                    Ok(WgEvent::InboundDecrypted { src_key, payload }) => {
+                        // Decrypted inbound app data destined for the
+                        // local netstack. tm_netstack has no on-device
+                        // lwIP injection path yet (it is a stub), so we
+                        // surface it here; this is the seam where a
+                        // transport round-trip becomes observable.
+                        info!("Runtime::join() - WgEvent::InboundDecrypted {} bytes from peer {:02x}{:02x}..", payload.len(), src_key[0], src_key[1]);
+                    }
+                    Ok(WgEvent::PeerHandshook(key)) => {
+                        info!("Runtime::join() - WgEvent::PeerHandshook with peer {:02x}{:02x}..", key[0], key[1]);
+                    }
+                    Err(_) => {
+                        info!("Runtime::join() - wg event channel closed, breaking");
+                        break;
+                    }
+                }
+            }
+            // ── DISCO events ──────────────────────────────────────────
+            evt = disco_ev_rx.recv() => {
+                match evt {
+                    Ok(DiscoEvent::SendPong { payload, .. }) => {
+                        // A wire-correct PONG must be sealed and
+                        // addressed to the peer over DERP; that is
+                        // gated on the DERP transport (stub). Surface
+                        // it so a real PING-from-peer is observable.
+                        info!("Runtime::join() - DiscoEvent::SendPong (tx_id {:02x}{:02x}..) [not relayed: DERP stub]", payload[0], payload[1]);
+                    }
+                    Ok(DiscoEvent::PingFrom(key)) => {
+                        info!("Runtime::join() - DiscoEvent::PingFrom peer {:02x}{:02x}..", key[0], key[1]);
+                    }
+                    Err(_) => {
+                        info!("Runtime::join() - disco event channel closed, breaking");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    info!("Runtime::join() - event_router task exiting");
+}
+
+/// Build the event-router future off-frame. See `event_router_task` and the
+/// `spawn_*` actor helpers above for why this must not be inlined into
+/// `Runtime::join`.
+#[inline(never)]
+fn spawn_event_router(
+    ctrl_ev_rx: async_channel::Receiver<ControlEvent>,
+    derp_ev_rx: async_channel::Receiver<DerpEvent>,
+    disco_ev_rx: async_channel::Receiver<DiscoEvent>,
+    wg_ev_rx: async_channel::Receiver<WgEvent>,
+    ctrl_tx3: async_channel::Sender<ControlCmd>,
+    derp_tx2: async_channel::Sender<DerpCmd>,
+    wg_tx2: async_channel::Sender<WgCmd>,
+    disco_tx2: async_channel::Sender<DiscoCmd>,
+    our_ip_tx: Option<OurIpSender>,
+) -> BoxActorFut {
+    Box::pin(event_router_task(
+        ctrl_ev_rx, derp_ev_rx, disco_ev_rx, wg_ev_rx,
+        ctrl_tx3, derp_tx2, wg_tx2, disco_tx2, our_ip_tx,
+    ))
+}
 
 /// Channel capacity for all inter-actor queues.
 /// Small = bounded memory, back-pressure propagates naturally.
@@ -84,401 +388,87 @@ impl Runtime {
     /// This is the recommended method for ESP32-C3.
     pub async fn join(mut config: RuntimeConfig) -> Self {
         tracing::debug!("Runtime::join() - starting actor runtime");
-        
-        // ── Log heap before channel allocation ──────────────────────────────────
-        #[cfg(target_os = "espidf")]
-        {
-            unsafe {
-                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
-                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
-                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                let free_all = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_SPIRAM | esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT);
-                tracing::debug!("Runtime::join() - heap before channel allocation: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default, {} bytes total largest", free_internal, free_8bit, free_default, free_all);
-            }
-        }
-        
+
+        // ── Channel allocation ──────────────────────────────────────────────
+        // Heap probes routed through `log_heap` (see its doc comment): kept
+        // out of this frame via #[inline(never)] so their format temporaries
+        // do not accumulate here across ~15 call sites.
+        log_heap("before channel allocation");
+
         tokio_freertos_yield().await;
-        tracing::debug!("Runtime::join() - allocating ControlCmd channel");
         let (ctrl_tx,  ctrl_rx)  = async_channel::bounded::<ControlCmd>(CHAN_CAP);
         tokio_freertos_yield().await;
-        
-        #[cfg(target_os = "espidf")]
-        {
-            unsafe {
-                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
-                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
-                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                tracing::debug!("Runtime::join() - heap after ControlCmd channel: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
-            }
-        }
-        tracing::debug!("Runtime::join() - allocating ControlEvent channel");
-        let (ctrl_ev_tx, mut ctrl_ev_rx) = async_channel::bounded::<ControlEvent>(CHAN_CAP);
+        log_heap("after ControlCmd channel");
+
+        let (ctrl_ev_tx, ctrl_ev_rx) = async_channel::bounded::<ControlEvent>(CHAN_CAP);
         tokio_freertos_yield().await;
+        log_heap("after ControlEvent channel");
 
-        #[cfg(target_os = "espidf")]
-        {
-            unsafe {
-                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
-                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
-                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                tracing::debug!("Runtime::join() - heap after ControlEvent channel: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
-            }
-        }
-
-        tracing::debug!("Runtime::join() - allocating DerpCmd channel");
         let (derp_tx,  derp_rx)  = async_channel::bounded::<DerpCmd>(CHAN_CAP);
         tokio_freertos_yield().await;
+        log_heap("after DerpCmd channel");
 
-        #[cfg(target_os = "espidf")]
-        {
-            unsafe {
-                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
-                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
-                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                tracing::debug!("Runtime::join() - heap after DerpCmd channel: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
-            }
-        }
-
-        tracing::debug!("Runtime::join() - allocating DerpEvent channel");
-        let (derp_ev_tx, mut derp_ev_rx) = async_channel::bounded::<DerpEvent>(CHAN_CAP);
+        let (derp_ev_tx, derp_ev_rx) = async_channel::bounded::<DerpEvent>(CHAN_CAP);
         tokio_freertos_yield().await;
+        log_heap("after DerpEvent channel");
 
-        #[cfg(target_os = "espidf")]
-        {
-            unsafe {
-                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
-                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
-                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                tracing::debug!("Runtime::join() - heap after DerpEvent channel: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
-            }
-        }
-
-        tracing::debug!("Runtime::join() - allocating DiscoCmd channel");
         let (disco_tx, disco_rx) = async_channel::bounded::<DiscoCmd>(CHAN_CAP);
         tokio_freertos_yield().await;
+        log_heap("after DiscoCmd channel");
 
-        #[cfg(target_os = "espidf")]
-        {
-            unsafe {
-                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
-                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
-                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                tracing::debug!("Runtime::join() - heap after DiscoCmd channel: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
-            }
-        }
-
-        tracing::debug!("Runtime::join() - allocating DiscoEvent channel");
-        let (_disco_ev_tx, mut _disco_ev_rx) = async_channel::bounded::<DiscoEvent>(CHAN_CAP);
+        let (disco_ev_tx, disco_ev_rx) = async_channel::bounded::<DiscoEvent>(CHAN_CAP);
         tokio_freertos_yield().await;
+        log_heap("after DiscoEvent channel");
 
-        #[cfg(target_os = "espidf")]
-        {
-            unsafe {
-                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
-                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
-                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                tracing::debug!("Runtime::join() - heap after DiscoEvent channel: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
-            }
-        }
-
-        tracing::debug!("Runtime::join() - allocating WgCmd channel");
         let (wg_tx,    wg_rx)    = async_channel::bounded::<WgCmd>(CHAN_CAP);
         tokio_freertos_yield().await;
+        log_heap("after WgCmd channel");
 
-        #[cfg(target_os = "espidf")]
-        {
-            unsafe {
-                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
-                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
-                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                tracing::debug!("Runtime::join() - heap after WgCmd channel: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
-            }
-        }
-
-        tracing::debug!("Runtime::join() - allocating WgEvent channel");
-        let (_wg_ev_tx, mut _wg_ev_rx) = async_channel::bounded::<WgEvent>(CHAN_CAP);
+        let (wg_ev_tx, wg_ev_rx) = async_channel::bounded::<WgEvent>(CHAN_CAP);
         tokio_freertos_yield().await;
+        log_heap("after WgEvent channel");
 
-        #[cfg(target_os = "espidf")]
-        {
-            unsafe {
-                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
-                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
-                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                tracing::debug!("Runtime::join() - heap after WgEvent channel: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
-            }
-        }
-
+        // ── Key extraction ───────────────────────────────────────────────────
         let our_pub = config.node_state.node_key.public();
-        tracing::debug!("Runtime::join() - node key extracted (32 bytes)");
         let disco_key = config.node_state.disco_key.clone();
         // WireGuard static key == the node key (captured before node_state is
-        // moved into ControlActor below).
+        // moved into spawn_control below).
         let wg_priv = *config.node_state.node_key.as_bytes();
-        tracing::debug!("Runtime::join() - disco key extracted (32 bytes)");
-        
-        #[cfg(target_os = "espidf")]
-        {
-            unsafe {
-                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
-                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
-                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                tracing::debug!("Runtime::join() - heap before ControlActor: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
-            }
-        }
+        let priority_peer = config.priority_peer;
+        let our_ip_tx = config.our_ip_tx.take();
+        log_heap("before actor construction");
 
-        tracing::debug!("Runtime::join() - creating ControlActor");
-        let control_actor = ControlActor::new(config.control, config.node_state);
-
-
-        #[cfg(target_os = "espidf")]
-        {
-            unsafe {
-                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
-                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
-                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                tracing::debug!("Runtime::join() - heap after ControlActor: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
-            }
-        }
-
-        tracing::debug!("Runtime::join() - creating DerpActor");
-        let derp_actor = DerpActor::new(our_pub);
-        
-        #[cfg(target_os = "espidf")]
-        {
-            unsafe {
-                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
-                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
-                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                tracing::debug!("Runtime::join() - heap after DerpActor: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
-            }
-        }
-
-        tracing::debug!("Runtime::join() - creating DiscoActor");
-        let disco_actor = DiscoActor::new(disco_key);
-        
-        #[cfg(target_os = "espidf")]
-        {
-            unsafe {
-                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
-                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
-                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                tracing::debug!("Runtime::join() - heap after DiscoActor: {} bytes contiguous internal, {} bytes contiguous 8bit, {} bytes contiguous default", free_internal, free_8bit, free_default);
-            }
-        }
-
-        tracing::debug!("Runtime::join() - creating WgActor");
-        let wg_actor = WgActor::new(wg_priv, config.priority_peer);
-
-        #[cfg(target_os = "espidf")]
-        {
-            unsafe {
-                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
-                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
-                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                // Total-free heap (plan Part 2 finding #4): reportable against
-                // the 40-60 KB tm_wg target / 90 KB ceiling without a fresh
-                // live-run investigation each time.
-                let total_free = esp_idf_sys::esp_get_free_heap_size();
-                info!("Runtime::join() - HEAP after WgActor: total_free={} bytes, largest_block: internal={} 8bit={} default={}", total_free, free_internal, free_8bit, free_default);
-            }
-        }
-
-        tracing::debug!("Runtime::join() - cloning sender channels");
         let ctrl_tx3 = ctrl_tx.clone();
         let ctrl_tx4 = ctrl_tx.clone();
         let derp_tx2  = derp_tx.clone();
         let wg_tx2    = wg_tx.clone();
         let disco_tx2 = disco_tx.clone();
 
-        info!("Runtime::join() - creating event_router task");
-        let event_router = async move {
-            info!("Runtime::join() - event_router task started");
-            loop {
-                #[cfg(target_os = "espidf")]
-                tokio_freertos_yield().await;
-                tokio::select! {
-                    evt = ctrl_ev_rx.recv() => {
-                        match evt {
-                            Ok(evt) => match evt {
-                                ControlEvent::MapUpdate(map) => {
-                                    info!("Runtime::join() - received ControlEvent::MapUpdate");
-                                    let _ = wg_tx2.send(WgCmd::ApplyMap(map)).await;
-                                }
-                                ControlEvent::OurIpAssigned(ip) => {
-                                    info!("Runtime::join() - received ControlEvent::OurIpAssigned: {}.{}.{}.{}", ip.0[0], ip.0[1], ip.0[2], ip.0[3]);
-                                    #[cfg(target_os = "espidf")]
-                                    if let Some(ref tx) = config.our_ip_tx {
-                                        #[cfg(target_os = "espidf")]
-                                        tokio_freertos_yield().await;
-                                        let _ = tx.send(ip.to_ipv4()).await;
-                                    }
-                                }
-                                ControlEvent::KeyExpiry => {
-                                    let _ = ctrl_tx3.send(ControlCmd::Reauth).await;
-                                    #[cfg(target_os = "espidf")]
-                                    tokio_freertos_yield().await;
-                                }
-                                ControlEvent::Error(e) => {
-                                    error!("Runtime::join() - received ControlEvent::Error: {:?}", e);
-                                }
-                            }
-                            Err(_) => {
-                                info!("Runtime::join() - control event channel closed, breaking");
-                                break;
-                            }
-                        }
-                    }
-                    evt = derp_ev_rx.recv() => {
-                        match evt {
-                            Ok(evt) => match evt {
-                                DerpEvent::PacketReceived { src_key, payload } => {
-                                    // Demux disco vs WireGuard by the real wire
-                                    // discriminator: a disco datagram starts
-                                    // with the 6-byte "TS💬" magic; a WireGuard
-                                    // message starts with a type byte in 1..=4.
-                                    // (The previous `payload[0] == 0x6d` matched
-                                    // neither — disco magic byte 0 is 0x54.)
-                                    let is_disco = payload.len() >= 6
-                                        && &payload[..6] == tm_disco::DISCO_MAGIC;
-                                    if is_disco {
-                                        let mut data = heapless::Vec::new();
-                                        let _ = data.extend_from_slice(&payload);
-                                        let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
-                                            src_ip:   [0; 4],
-                                            src_port: 0,
-                                            data: Box::new(data),
-                                        }).await;
-                                        #[cfg(target_os = "espidf")]
-                                        tokio_freertos_yield().await;
-                                    } else {
-                                        let mut pkt = heapless::Vec::new();
-                                        let _ = pkt.extend_from_slice(&payload);
-                                        let _ = wg_tx2.send(WgCmd::InboundPacket {
-                                            src_key: *src_key.as_bytes(),
-                                            payload: Box::new(pkt),
-                                        }).await;
-                                        #[cfg(target_os = "espidf")]
-                                        tokio_freertos_yield().await;
-                                    }
-                                }
-                                DerpEvent::Connected => {
-                                    tracing::debug!("DERP connected");
-                                }
-                                DerpEvent::PingReceived => {}
-                                DerpEvent::Disconnected => {
-                                    tracing::debug!("DERP disconnected");
-                                }
-                                DerpEvent::Error(e) => {
-                                    error!("Runtime::join() - received DerpEvent::Error: {:?}", e);
-                                }
-                            }
-                            Err(_) => {
-                                info!("Runtime::join() - derp event channel closed, breaking");
-                                break;
-                            }
-                        }
-                    }
-                    // ── WireGuard data-plane events (previously dropped) ──────
-                    evt = _wg_ev_rx.recv() => {
-                        match evt {
-                            Ok(WgEvent::OutboundPacket { dst_key, payload }) => {
-                                // The outbound WireGuard path: handshake
-                                // initiations, keepalives and transport data
-                                // leave tm_wg here and are handed to DERP for
-                                // relay to the peer. (DERP transport is a stub
-                                // today — see docs/wg-dataplane-notes.md — so
-                                // these are dropped by the DerpActor for now;
-                                // the wiring is correct and observable.)
-                                info!("Runtime::join() - WgEvent::OutboundPacket {} bytes -> DERP peer {:02x}{:02x}..", payload.len(), dst_key[0], dst_key[1]);
-                                let mut buf: heapless::Vec<u8, MAX_DERP_PAYLOAD> = heapless::Vec::new();
-                                if buf.extend_from_slice(&payload).is_ok() {
-                                    let _ = derp_tx2.send(DerpCmd::SendPacket {
-                                        dst_key: NodePublicKey::from_bytes(dst_key),
-                                        payload: Box::new(buf),
-                                    }).await;
-                                }
-                                #[cfg(target_os = "espidf")]
-                                tokio_freertos_yield().await;
-                            }
-                            Ok(WgEvent::InboundDecrypted { src_key, payload }) => {
-                                // Decrypted inbound app data destined for the
-                                // local netstack. tm_netstack has no on-device
-                                // lwIP injection path yet (it is a stub), so we
-                                // surface it here; this is the seam where a
-                                // transport round-trip becomes observable.
-                                info!("Runtime::join() - WgEvent::InboundDecrypted {} bytes from peer {:02x}{:02x}..", payload.len(), src_key[0], src_key[1]);
-                            }
-                            Ok(WgEvent::PeerHandshook(key)) => {
-                                info!("Runtime::join() - WgEvent::PeerHandshook with peer {:02x}{:02x}..", key[0], key[1]);
-                            }
-                            Err(_) => {
-                                info!("Runtime::join() - wg event channel closed, breaking");
-                                break;
-                            }
-                        }
-                    }
-                    // ── DISCO events ──────────────────────────────────────────
-                    evt = _disco_ev_rx.recv() => {
-                        match evt {
-                            Ok(DiscoEvent::SendPong { payload, .. }) => {
-                                // A wire-correct PONG must be sealed and
-                                // addressed to the peer over DERP; that is
-                                // gated on the DERP transport (stub). Surface
-                                // it so a real PING-from-peer is observable.
-                                info!("Runtime::join() - DiscoEvent::SendPong (tx_id {:02x}{:02x}..) [not relayed: DERP stub]", payload[0], payload[1]);
-                            }
-                            Ok(DiscoEvent::PingFrom(key)) => {
-                                info!("Runtime::join() - DiscoEvent::PingFrom peer {:02x}{:02x}..", key[0], key[1]);
-                            }
-                            Err(_) => {
-                                info!("Runtime::join() - disco event channel closed, breaking");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            info!("Runtime::join() - event_router task exiting");
-        };
-
+        // ── Build every task's future off-frame ─────────────────────────────
+        // Each actor is constructed AND its run() future built+boxed inside
+        // its own #[inline(never)] spawn_* helper (see their doc comments
+        // above). Neither the actor struct nor the future's build temporary
+        // (notably WgActor::new's ~28 KB WgEndpoint) ever becomes a local in
+        // this frame -- this is what keeps `join` under the 32 KB main-task
+        // stack.
         tracing::debug!("Runtime::join() - preparing actor tasks");
-        #[cfg(target_os = "espidf")]
-        tokio_freertos_yield().await;
-        
-        let control_task = control_actor.run(ctrl_rx, ctrl_ev_tx);
-        #[cfg(target_os = "espidf")]
-        tokio_freertos_yield().await;
-        
-        let derp_task = derp_actor.run(derp_rx, derp_ev_tx);
-        #[cfg(target_os = "espidf")]
-        tokio_freertos_yield().await;
-        
-        let disco_task = disco_actor.run(disco_rx, _disco_ev_tx);
-        #[cfg(target_os = "espidf")]
-        tokio_freertos_yield().await;
-        
-        let wg_task = wg_actor.run(wg_rx, _wg_ev_tx);
-        #[cfg(target_os = "espidf")]
-        tokio_freertos_yield().await;
-        
-        #[cfg(target_os = "espidf")]
-        {
-            unsafe {
-                let free_internal = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
-                let free_8bit = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT);
-                let free_default = esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT);
-                let total_free = esp_idf_sys::esp_get_free_heap_size();
-                info!("Runtime::join() - HEAP before tokio::join! (all actors constructed): total_free={} bytes, largest_block: internal={} 8bit={} default={}", total_free, free_internal, free_8bit, free_default);
-            }
-        }
+        let control_task = spawn_control(config.control, config.node_state, ctrl_rx, ctrl_ev_tx);
+        log_heap("after ControlActor spawn");
+        let derp_task = spawn_derp(our_pub, derp_rx, derp_ev_tx);
+        log_heap("after DerpActor spawn");
+        let disco_task = spawn_disco(disco_key, disco_rx, disco_ev_tx);
+        log_heap("after DiscoActor spawn");
+        let wg_task = spawn_wg(wg_priv, priority_peer, wg_rx, wg_ev_tx);
+        log_heap("after WgActor spawn");
+        let event_router = spawn_event_router(
+            ctrl_ev_rx, derp_ev_rx, disco_ev_rx, wg_ev_rx,
+            ctrl_tx3, derp_tx2, wg_tx2, disco_tx2, our_ip_tx,
+        );
+
+        log_heap("before tokio::join! (all actors constructed)");
 
         tracing::debug!("Runtime::join() - sending ControlCmd::Start");
-        #[cfg(target_os = "espidf")]
-        tokio_freertos_yield().await;
         let _ = ctrl_tx4.send(ControlCmd::Start { auth_key: config.auth_key.clone() }).await;
-        #[cfg(target_os = "espidf")]
-        tokio_freertos_yield().await;
 
         tracing::debug!("Runtime::join() - joining actor tasks with tokio::join!");
         // Run all actors together. The event_router loop runs indefinitely until a channel error occurs.

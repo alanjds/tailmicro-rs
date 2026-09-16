@@ -87,7 +87,10 @@ impl WgActor {
     pub fn new(node_priv: [u8; 32], priority_peer: Option<[u8; 32]>) -> Self {
         let kp = NodeKeyPair::from_private(NodePrivateKey(node_priv));
         Self {
-            endpoint: Box::new(WgEndpoint::new(kp)),
+            // `new_boxed` builds+boxes in its own #[inline(never)] frame;
+            // see its doc comment for why `Box::new(WgEndpoint::new(..))`
+            // inline here was still overflowing the main-task stack.
+            endpoint: WgEndpoint::new_boxed(kp),
             priority_peer,
         }
     }

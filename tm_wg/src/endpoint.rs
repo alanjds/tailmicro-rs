@@ -288,6 +288,56 @@ impl WgEndpoint {
         }
     }
 
+    /// Construct directly on the heap, field-by-field, via a raw pointer
+    /// into an uninitialized `Box` allocation.
+    ///
+    /// `Self` is ~28 KB (`peers: ArrayVec<Peer, MAX_PEERS>` dominates).
+    /// `Box::new(WgEndpoint::new(..))` builds the whole ~28 KB value as a
+    /// temporary, THEN copies it into the heap allocation -- at this
+    /// workspace's `opt-level = "z"` + `lto = true` dev profile the
+    /// compiler was not eliding that temporary (observed as two ~28 KB
+    /// copies, a ~55 KB frame, wherever the call ended up after inlining).
+    ///
+    /// Even writing the field directly via `addr_of_mut!(..).write(..)`
+    /// with `ArrayVec::new()` as the source measured ~27 KB here: the
+    /// compiler still materialized an "empty" `ArrayVec` as a genuine
+    /// stack-sized value before `memcpy`-ing it into place (`ArrayVec::new`
+    /// is not `const`, so nothing forces it into rodata). Using
+    /// `ArrayVec::new_const()` into a top-level `static` instead -- exactly
+    /// the pattern arrayvec's own docs recommend for this ("place a large
+    /// ArrayVec in a static to avoid stack overflow") -- makes the "empty"
+    /// value a fixed rodata/bss address that `memcpy` sources FROM,
+    /// eliminating the stack temporary entirely.
+    #[inline(never)]
+    pub fn new_boxed(my_key: NodeKeyPair) -> Box<Self> {
+        static EMPTY_PEERS: ArrayVec<Peer, MAX_PEERS> = ArrayVec::new_const();
+        static EMPTY_SESSIONS: ArrayVec<(SessionId, PeerId), SESSION_MAP_CAP> = ArrayVec::new_const();
+
+        let mut b = Box::<Self>::new_uninit();
+        let ptr = b.as_mut_ptr();
+        // SAFETY: `ptr` is a valid, suitably-aligned pointer to
+        // uninitialized memory sized for `Self`. Each field is written
+        // exactly once, in full, before `assume_init()`, so every field of
+        // `Self` ends up initialized and no field is read before its write.
+        unsafe {
+            // Raw `copy_nonoverlapping` (not `.clone()`/`.write(value)`):
+            // both sources are fixed `static` addresses, so this lowers to
+            // a plain memcpy with no intermediate Rust value to construct
+            // -- `Clone::clone` or moving `EMPTY_PEERS` by value would
+            // reintroduce exactly the stack temporary this function exists
+            // to avoid. Safe because both fields are POD-ish "all bytes
+            // valid" data (`MaybeUninit` elements, a `len` of 0): the byte
+            // copy fully initializes them and no live resource is aliased.
+            core::ptr::addr_of_mut!((*ptr).state.sessions).copy_from_nonoverlapping(&EMPTY_SESSIONS, 1);
+            core::ptr::addr_of_mut!((*ptr).state.my_key).write(my_key);
+            core::ptr::addr_of_mut!((*ptr).state.my_cookie).write(MACReceiver::new(&my_key.public));
+            core::ptr::addr_of_mut!((*ptr).state.timestamps).write(TAI64NClock::new());
+            core::ptr::addr_of_mut!((*ptr).state.next_peer_id).write(0);
+            core::ptr::addr_of_mut!((*ptr).peers).copy_from_nonoverlapping(&EMPTY_PEERS, 1);
+            b.assume_init()
+        }
+    }
+
     fn peer_index(&self, id: PeerId) -> Option<usize> {
         self.peers.iter().position(|p| p.id == id)
     }

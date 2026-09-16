@@ -62,6 +62,30 @@ pub use tm_runtime::{tokio_freertos_yield, OurIpReceiver, OurIpSender};
 pub mod config;
 mod error;
 
+/// Build the `Runtime::join` future and move it onto the heap, off-frame.
+///
+/// `#[inline(never)]`: at this crate's `dev` profile (`opt-level = "z"`,
+/// `lto = true` — see tasmolike-rs/Cargo.toml), the compiler MIR-inlines
+/// async fns aggressively across crate boundaries. Without this boundary,
+/// `Runtime::join`'s state machine (channels, actor structs, boxed-future
+/// pointers) got folded straight into `Device::new`'s own state machine,
+/// and the combined frame was observed at ~55 KB in
+/// `<Timeout<Device::new::{closure#0}> as Future>::poll` — still enough to
+/// blow the 32 KB main-task stack with a Guru Meditation "Stack protection
+/// fault" even after `Runtime::join` itself was slimmed down (see
+/// docs/wg-dataplane-notes.md). `Box::pin` behind a non-inlinable function
+/// forces a real (non-inlined) call boundary: `Device::new` only ever holds
+/// the 16-byte `Pin<Box<dyn Future>>` across the `.await`, and `join`'s
+/// state machine is built in its own frame that is freed once the pointer
+/// is returned.
+#[cfg(target_os = "espidf")]
+#[inline(never)]
+fn spawn_runtime_join(
+    rt_config: tm_runtime::RuntimeConfig,
+) -> core::pin::Pin<Box<dyn core::future::Future<Output = tm_runtime::Runtime>>> {
+    Box::pin(tm_runtime::Runtime::join(rt_config))
+}
+
 /// Mirrors `tailscale::Device` exactly.
 pub struct Device {
     runtime: tm_runtime::Runtime,
@@ -101,7 +125,7 @@ impl Device {
         };
 
         #[cfg(target_os = "espidf")]
-        let runtime = tm_runtime::Runtime::join(rt_config).await;
+        let runtime = spawn_runtime_join(rt_config).await;
 
         #[cfg(not(target_os = "espidf"))]
         let runtime = tm_runtime::Runtime::spawn(rt_config).await;
