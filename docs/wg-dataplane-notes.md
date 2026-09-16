@@ -552,3 +552,82 @@ SendPacket/RecvPacket framing) and wiring `DerpCmd::Connect` from the
 MapResponse DERPMap. That is a substantial net-new device implementation and is
 the honest remaining work; it is documented here rather than hidden behind an
 inferred rung.
+
+---
+
+## UPDATE (2026-09-16): no-TLS direction — DERP requires TLS; direct-UDP blocked by NAT/path-selection
+
+The device path deliberately avoids TLS (control plane is plain TCP + Noise_IK,
+pinned by the control key). The section above recommending a `tm_tls`-based DERP
+client is therefore **superseded**: the direction is to eliminate TLS, not
+replicate it. Two Python-first spikes (repo methodology) were run against the
+REAL live tailnet to decide the transport. Both are reproducible under
+`tools/wg_validator/`.
+
+### Spike 1 — no-TLS DERP: REJECTED by real Tailscale DERP
+`tools/wg_validator/derp_notls_spike.py`, against `derp{1,2,10}.tailscale.com`:
+
+| attempt | result |
+|---|---|
+| plain TCP `:80` `GET /derp` | `HTTP/1.1 302 Found`, `Location: https://<host>/derp` (refuses plaintext upgrade) |
+| plaintext `:443` `GET /derp` | `HTTP/1.0 400 Bad Request` (TLS listener) |
+| TLS `:443` `GET /derp` | `HTTP/1.1 101 Switching Protocols` + DERP ServerKey frame (`01 00000028 44455250f09f9491…`) |
+
+Conclusion: hosted Tailscale DERP has **no non-TLS `/derp` path**. Per the
+"do not implement TLS" directive, a DERP relay client is not pursued.
+
+### Spike 2 — direct UDP (skip DERP): disco works, WireGuard handshake does not complete
+`tools/wg_validator/udp_recon.py` + `validate_live_udp.py`. Recon of the live
+MapResponse: several online peers advertise PUBLIC IPv4 UDP endpoints
+(`lenovopill 177.162.84.64:1024`, `alanjds-s25 189.98.243.233:63935`,
+`bospill 177.162.84.64:41641`), all in DERP region 11 with disco keys. But every
+one is a **NAT-mapped** address (home/mobile), not a server with an open port.
+
+Sending WG Handshake Initiations (and disco PINGs) straight to those public
+endpoints from an external initiator got **no response of any kind** — the
+peers' NATs drop unsolicited datagrams (symmetric/port-restricted; the inbound
+mapping is normally opened by disco call-me-maybe, which rides DERP).
+
+To isolate NAT from the protocol, the same drive was run on the peers' LAN
+(the runner shares `192.168.15.0/24` with `lenovopill`, `INCLUDE_PRIVATE=1`):
+- **disco PING/PONG round-tripped directly over UDP** with `lenovopill`
+  (`192.168.15.139:41641`) — we received both disco `type=2` (PONG) and `type=1`
+  (PING) from it. So the disco `crypto_box`/SalsaBox layer works over plain UDP
+  against a real peer (effectively the rung-4 crypto, no DERP, no TLS).
+- **still no WireGuard type-2 response**, even on the LAN. Tailscale's responder
+  sends the WG handshake response over its currently *preferred* path, which
+  stays DERP until the disco direct-path upgrade completes in both directions
+  over several seconds; without a DERP leg we are not reachable on that path, so
+  the response is never delivered to us.
+
+### Conclusion / open architecture decision (for the user)
+Against arbitrary REAL Tailscale peers, completing a WireGuard handshake needs
+DERP as the NAT-traversal + path-selection bootstrap, and hosted DERP needs TLS.
+So "no TLS anywhere in the device path" and "acceptance test against an
+arbitrary live Tailscale peer" are in tension. Options, none implemented here:
+1. Allow TLS **only** for the DERP leg (isolated to `tm_derp`; all relayed
+   payloads are already E2E-encrypted by WireGuard + disco). Smallest change.
+2. Provision a peer with a genuinely internet-reachable UDP endpoint (public
+   host / port-forward / full-cone NAT) so the device can handshake it directly,
+   no DERP. Then implement the on-device path over UDP (`tm_netstack`), no TLS.
+3. Run a self-hosted `derper` in plaintext/HTTP mode on a reachable host and
+   point the DERPMap at it (no public-Tailscale TLS involved).
+
+Per the "stop rather than reach for TLS" instruction, work paused here for the
+decision. The disco-over-UDP result (spike 2) shows the crypto path is sound;
+what is missing is a reachable peer + a path the responder will actually use.
+
+### Orthogonal, TLS-independent boot fix landed in the working tree
+While investigating, a real on-device boot blocker was root-caused (independent
+of the transport decision): `WgActor::run`'s async future was ~90 KB because
+`WgEndpoint` (~28 KB) was embedded by value (and duplicated across suspend
+states) and `RecvOut` (~12 KB) was doubled through `drain_recv`. Boxing
+`WgEndpoint` in `WgActor`, taking `Box<RecvOut>` in `drain_recv` (iterating by
+reference), boxing the `dispatch` output in `on_tick`, and `Box::pin`-ing the
+per-command handlers in `run()` drops the future to **336 bytes**
+(`-Zprint-type-sizes`), fixing the original "memory allocation of ~230 KB
+failed" abort (a single alloc larger than the ESP32-C3's ~138 KB largest block).
+A residual debug-build stack-frame issue in `Runtime::join` remains (see the
+`log_heap`/`spawn_*` `#[inline(never)]` helpers added there); it is unrelated to
+the transport decision and is the next on-device step once the architecture is
+chosen.
