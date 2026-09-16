@@ -751,3 +751,109 @@ instruction to stop at rung 3 and not touch the control/transport protocol
 logic. Rung 3 (control-plane connect confirmed; disco key sent; DERPMap/peers
 not yet observed) is therefore reached up to registration + map-publish, but
 not fully confirmed by a `MapUpdate`/`DERPMap` log line.
+
+## DERP TLS leg: embedded-tls (locked decision, 2026-09-16)
+
+Transport is unpaused with a locked decision: the on-device DERP client's TLS
+leg is `embedded-tls` (pure-Rust, no_std, TLS 1.3-only), optimized for the
+SMALLEST possible RAM. NOT mbedTLS/esp-tls, NOT rustls. Isolated inside
+`tm_derp` (feature `etls`); the rest of the firmware stays mbedTLS-free on this
+path.
+
+### Config (smallest-RAM, non-negotiable)
+- TLS 1.3 only (embedded-tls is 1.3-only by construction).
+- Certificate verification DISABLED: `UnsecureProvider` wires `NoVerify` +
+  `NoSign` (no CA, no webpki, no hostname check). Safe by design: every byte
+  DERP relays is already E2E-encrypted (WireGuard transport + disco
+  `crypto_box`), so a MITM on the TLS hop sees only ciphertext; it can DoS but
+  cannot read or forge tunnel contents. We DO advertise RSA signature schemes
+  (`TlsConfig::enable_rsa_signatures`) so the RSA-certificated DERP server can
+  choose a `CertificateVerify` scheme; we simply never check the signature (no
+  rsa crate pulled in).
+- Single cipher suite `TLS_CHACHA20_POLY1305_SHA256` (0x1303). embedded-tls
+  0.19 ships only AES suites, so the suite is a custom `TlsCipherSuite` impl
+  (`tm_derp::tls::Chacha20Poly1305Sha256`) reusing the RustCrypto
+  `chacha20poly1305` + `sha2` crates already compiled for Noise/WireGuard: zero
+  extra AEAD/hash flash, and ChaCha is the fast path on the ESP32-C3 (no AES
+  accel wired here).
+- RFC 6066 `max_fragment_length = 2048` advertised (`MaxFragmentLength::Bits11`).
+  Go's `crypto/tls` server ignores it today so it does not shrink inbound
+  handshake records, but it is free and future-proof.
+
+### Python parity (proven against live derp1.tailscale.com)
+`tools/wg_validator/derp_client.py` gained `connect(minimal_tls=True)` (TLS 1.3
+only, `CERT_NONE`, no hostname check). It completes the full DERP handshake
+through ServerInfo (crypto_box round-trip returns `{'version': 2}`) and pulls
+the real ServerKey `69dcb903...4b817171`. Python's stdlib ssl cannot restrict
+the TLS 1.3 ciphersuite set, so the single-ChaCha half was proven with
+`openssl s_client -tls1_3 -ciphersuites TLS_CHACHA20_POLY1305_SHA256`: with ONLY
+ChaCha offered and verification off, the server returns
+`HTTP/1.1 101 Switching Protocols` + `Derp-Version: 2` followed by the ServerKey
+frame `01 00000028 44455250f09f9491 <serverkey>`.
+
+### Wire measurement that sets the read-buffer floor
+Live TLS 1.3 handshake trace (`openssl s_client -trace`) to derp1.tailscale.com:
+the server `Certificate` handshake message is 4444 bytes (a 4-cert RSA chain,
+1286 + 1247 + 1528 + 359), sent in a single ~4.47 KB TLS record. embedded-tls
+decrypts records in place, so the read buffer must hold the largest inbound
+record whole. `max_fragment_length` does not help (Go server ignores it). This
+sets `RECORD_READ_BUF = 5120` (confirmed: a live handshake with exactly 5120 B
+succeeds).
+
+### RAM HEADLINE
+embedded-tls takes caller-provided record buffers; those buffers plus the small
+connection state ARE the whole steady-state cost. Measured with the exact
+suite/verifier/buffer config in a real Rust handshake to derp1.tailscale.com
+(host spike, embedded-tls 0.19):
+
+| Term | Bytes |
+|---|---|
+| `TlsConnection` fixed state (key schedule, traffic secrets, running SHA-256 transcript, cipher keys/IVs, record reader/writer), excl. buffers | 1384 |
+| `RECORD_READ_BUF` (floor from measured 4444 B cert record) | 5120 |
+| `RECORD_WRITE_BUF` (covers ~1500 B WG packet + framing + 128 B TLS overhead) | 2048 |
+| **Total steady-state TLS session heap** | **8552 (~8.5 KB)** |
+
+Handshake peak equals steady-state: embedded-tls runs the handshake inside these
+same fixed buffers with no heap spike, and NoVerify skips the one large
+transient (signature verification). Against the budget: ~8.5 KB is ~6.5% of the
+~130 KB free heap and is dwarfed by tm_wg's ~28 KB `WgEndpoint`. An
+mbedTLS/esp-tls session would instead cost 40-70 KB. This is exactly why
+embedded-tls was chosen.
+
+HONEST CAVEAT: the 8.5 KB is measured from (a) the real embedded-tls 0.19 API
+(`core::mem::size_of` of the connection state), (b) the caller-controlled buffer
+sizes, and (c) a live-wire cert measurement, all cross-checked by a real Rust
+handshake that completes against derp1.tailscale.com. It is NOT yet an
+on-device `esp_get_free_heap_size()` before/after delta: a full firmware build
+(embedded-tls + deps on the riscv32imc-esp-espidf target) + Wokwi run to a TLS
+handshake was not completed in this session. The buffer terms (7168 B) are
+architecture-independent; the 1384 B fixed state is host-measured (x86-64,
+8-byte pointers) and is marginally SMALLER on the 32-bit target, so the
+on-device figure should land within a few hundred bytes of 8.5 KB.
+
+### embedded-tls integration (files/functions)
+- `tm_derp/Cargo.toml`: new `etls` feature (default OFF) gating optional deps
+  embedded-tls 0.19, embedded-io-async/adapters, chacha20poly1305, crypto_box,
+  sha2, digest, typenum, rand_core. Default build (feature off) is unchanged, so
+  the firmware's esp build is not disturbed until `etls` is enabled and run.
+- `tm_derp/src/tls.rs` (feature `etls`): `Chacha20Poly1305Sha256` custom suite;
+  `RECORD_READ_BUF`/`RECORD_WRITE_BUF` constants; `DerpTls::connect(...)` doing
+  the TLS 1.3 open (no-verify) + `GET /derp` upgrade + ServerKey/ClientInfo/
+  ServerInfo handshake; `send_packet`, `read_frame`, `pong`. DERP framing and
+  the SalsaBox handshake are reused field-for-field from the paused stash's
+  DERP client (`stash@{0}`), which itself mirrors derp_client.py; only the TLS
+  backend changed (rustls/tm_tls -> embedded-tls). Generic over
+  `S: embedded_io_async::Read + Write` (on device:
+  `embedded_io_adapters::tokio_1::FromTokio<tokio::net::TcpStream>`, since the
+  control plane already dials plain TCP via tokio there).
+- `tm_derp/src/lib.rs`: `DERP_MAGIC` corrected to the 8-byte `DERP` + U+1F511
+  literal and made `pub`; `pub mod tls` added under the `etls` feature.
+
+### Remaining
+- Turn on `etls` in the firmware, add the `esp_get_free_heap_size()` +
+  largest-contiguous probe immediately before/after `DerpTls::connect`, build
+  twice, `elf2image`, `wokwi-cli`, and record the live heap delta to close the
+  loop on the headline number.
+- Wire `DerpCmd::Connect` in `tm_runtime` to `DerpTls`, thread the MapResponse
+  DERPMap (region -> hostname), and land the disco PONG sealing (available in
+  the stash's `tm_disco`) for the disco ping/pong over DERP (rung 4).
