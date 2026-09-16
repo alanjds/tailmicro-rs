@@ -2,3 +2,6 @@
 
 # Ed25519 signing seed produced by tools/gen_fingerprint.py -- secret, never commit.
 tm_signing_key.bin
+
+# Wokwi serial logs may contain the live auth key in plaintext — never commit
+tools/wokwi_run_*.log
