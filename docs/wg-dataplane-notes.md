@@ -631,3 +631,123 @@ A residual debug-build stack-frame issue in `Runtime::join` remains (see the
 `log_heap`/`spawn_*` `#[inline(never)]` helpers added there); it is unrelated to
 the transport decision and is the next on-device step once the architecture is
 chosen.
+
+## `Runtime::join` stack-overflow fix (transport-independent, boot to rung 3)
+
+Follow-up to the previous section: the residual `Runtime::join` stack-frame
+issue is now root-caused and fixed. This section documents it independently of
+the (paused) TLS/DERP transport decision above — nothing here touches
+`tm_derp`, `tm_tls`, or implements any transport.
+
+### Symptom
+A live Wokwi run crashed with a Guru Meditation "Stack protection fault" in
+`Runtime::join`'s `{closure#0}` (the state machine backing `tokio::join!` of
+the four actors), on the ESP32-C3 main task's 32000-byte stack, before any
+actor started running.
+
+### Root cause (compound, three layers)
+1. **`Runtime::join` itself**: `-Zprint-type-sizes` showed the generator's own
+   captured-across-await state was only 928 bytes, but the live/objdump frame
+   was **56432 bytes** (`addi sp,sp,-256` + `sub sp,sp,0xdb70`). At this
+   crate's `dev` profile (`opt-level = "z"`, `lto = true`,
+   `tasmolike-rs/Cargo.toml`), the compiler does not reuse stack slots across
+   the function's ~15 inline heap-probe blocks, ~33 tracing-macro format
+   temporaries, and the inline `event_router` `async move` block — all of that
+   transient (non-persisted) local state gets its own slot, additively.
+2. **LTO re-inlining across the fix**: extracting the event-router into a
+   top-level `async fn` and moving the per-actor heap-probe/error-log code
+   into `#[inline(never)]` helpers shrank `join`'s state, but `join` then
+   *disappeared* as a standalone symbol — LTO+opt-z folded it wholesale into
+   its caller, `tailmicro::Device::new`, whose combined `Timeout<...>::poll`
+   frame was still ~55.7 KB. `#[inline(never)]` on `join` itself does not
+   stop the *caller* from inlining it in; only a `#[inline(never)]` boundary
+   at the *call site* does.
+3. **`WgActor::new`/`WgEndpoint::new`**: once `join`'s own frame was forced
+   into isolation (see fix below), the ~28 KB cost relocated rather than
+   disappeared — first into `spawn_wg` (56032 bytes: `WgActor::new`, a small
+   plain function, was inlined into `spawn_wg` despite `spawn_wg` itself being
+   `#[inline(never)]`, since that attribute only stops *its caller* from
+   inlining it, not what it calls), then into `WgEndpoint::new_boxed` after
+   isolating that (55952 bytes: `Box::new(Self::new(..))` still built the
+   ~28 KB `WgEndpoint` — dominated by `ArrayVec<Peer, 8>` at 27656 bytes — on
+   the stack before moving it into the `Box`, a genuine double-copy).
+
+### Fix
+- `tm_runtime/src/lib.rs`: extracted the inline `event_router` closure into a
+  top-level `async fn event_router_task(...)`; added an `#[inline(never)] fn
+  log_heap(tag: &str)` helper replacing all ~15 inline heap-probe blocks, plus
+  `log_control_error`/`log_derp_error` helpers for the remaining `debug!`/
+  `info!` format temporaries; added `#[inline(never)] fn spawn_control/
+  spawn_derp/spawn_disco/spawn_wg/spawn_event_router(...) -> Pin<Box<dyn
+  Future<Output = ()>>>` helpers that construct the actor **and** `Box::pin`
+  its `run()` future inside the *same* non-inlinable function (constructing
+  the actor in `join` and passing it into a spawn helper was not enough — see
+  layer 3 above). `Runtime::join`'s body now only allocates channels
+  (`log_heap`'d between each), calls the five `spawn_*` helpers, sends
+  `ControlCmd::Start`, and awaits `tokio::join!` on the five boxed futures.
+- `src/lib.rs` (tailmicro crate): added `#[inline(never)] fn
+  spawn_runtime_join(rt_config) -> Pin<Box<dyn Future<Output = Runtime>>>`
+  wrapping `Box::pin(Runtime::join(rt_config))`, and call it from
+  `Device::new` instead of awaiting `Runtime::join` directly — this is the
+  call-site boundary needed to stop LTO from re-merging `join` into
+  `Device::new` (layer 2 above).
+- `tm_wg/src/endpoint.rs`: added `WgEndpoint::new_boxed(my_key) -> Box<Self>`,
+  `#[inline(never)]`, using `Box::<Self>::new_uninit()` +
+  `core::ptr::addr_of_mut!` field writes. The `peers: ArrayVec<Peer, 8>` and
+  `state.sessions: ArrayVec<_, SESSION_MAP_CAP>` fields are written via
+  `core::ptr::copy_from_nonoverlapping` from `static EMPTY_PEERS`/
+  `static EMPTY_SESSIONS` (built with `arrayvec`'s `ArrayVec::new_const()`,
+  the crate's own documented pattern for large const-initialized
+  `ArrayVec`s) rather than `.clone()`/`.write(value)` — a raw memcpy from a
+  fixed `static` address needs no stack-resident source value, whereas
+  `ArrayVec::new()` is not `const fn` and still materialized a fresh ~27.6 KB
+  value on the stack when used as a `.write()` argument. `nm` confirmed
+  `EMPTY_PEERS` lands in `.bss` at a fixed address, not on the stack.
+- `tm_wg/src/lib.rs`: `WgActor::new` now calls `WgEndpoint::new_boxed(kp)`
+  instead of `Box::new(WgEndpoint::new(kp))`.
+
+### Evidence (objdump prologue sizes, `riscv32-esp-elf-objdump -d`, RISC-V
+`addi sp,sp,-N` / `sub sp,sp,-M` prologue arithmetic; toolchain at
+`~/.espressif/tools/riscv32-esp-elf/esp-14.2.0_20251107/...`)
+
+| Function | Before | After |
+|---|---|---|
+| `Runtime::join::{closure#0}` | 56432 B (baseline) / 56720 B (mid-fix, still merged into `Device::new`) | **672 B** |
+| `Device::new`'s `Timeout<...>::poll` (LTO-merged frame) | ~55.7 KB (merged with `join`) | 800 B (standalone once `spawn_runtime_join` added) |
+| `spawn_wg` | n/a (didn't exist) | 96 B (after actor-construction moved fully inside it) |
+| `WgEndpoint::new_boxed` | 55952 B (iter. 1: `Box::new(Self::new())`) → 27696 B (iter. 2: `new_uninit` + `.write(value)`) | **64 B** (iter. 3: `new_uninit` + static + `copy_nonoverlapping`) |
+| `spawn_control` / `spawn_derp` / `spawn_disco` / `spawn_event_router` | n/a | 160 B / 32 B / 32 B / 64 B |
+
+`-Zprint-type-sizes` (`/tmp/typesizes.log`, not committed) cross-checks:
+`{async fn body of Runtime::join()}` = 928 B (confirms the 56432 B live frame
+was transient/non-reused locals, not captured state);
+`tm_wg::endpoint::WgEndpoint` = 27968 B, dominated by
+`ArrayVec<Peer, 8>` = 27656 B.
+
+### Live Wokwi verification
+With the fix landed, a live Wokwi run no longer crashes at any of the three
+former fault points (`Runtime::join`, the `Device::new`-merged frame, or
+`WgEndpoint` construction). The boot now reaches: all four actors + event
+router constructed and spawned, `ControlCmd::Start` sent, `tokio::join!`
+entered, TCP connect to `login.tailscale.com:80`, Noise IK handshake against
+the **verified, non-expired control-key pin** (Noise handshake failure is the
+documented symptom of an expired pin — this did not occur), node
+registration (`machine_authorized=true`), and the Step 7.5 non-streaming
+MapRequest (Hostinfo + DiscoKey + Endpoints) being sent. See
+`tools/wokwi_run_20260916_141831.log` and `tools/wokwi_run_20260916_142008.log`.
+
+**Honest gap**: neither run observed the Step 7.5 response, the streaming
+MapRequest/response, or a `DERPMap`/peers-seen log before the run ended (a
+60-real-second Wokwi wall-clock timeout in the first case; the app's own
+60-device-second `Device::new` timeout — `src/tailscale_rust.rs` — in the
+second, longer run). This stall is **downstream of, and unrelated to, the
+stack-overflow bug fixed above** (heap stayed flat and healthy throughout —
+~120 KB free — ruling out a heap/stack fault; the fixed code is not on this
+path at all past the initial `join`/`spawn_*` calls). Diagnosing it
+(real network latency in Wokwi's simulated internet vs. a genuine protocol
+stall in `stream_map_response`/`read_one_h2_body`) is out of scope for this
+transport-independent boot fix and was not pursued further, per the
+instruction to stop at rung 3 and not touch the control/transport protocol
+logic. Rung 3 (control-plane connect confirmed; disco key sent; DERPMap/peers
+not yet observed) is therefore reached up to registration + map-publish, but
+not fully confirmed by a `MapUpdate`/`DERPMap` log line.
