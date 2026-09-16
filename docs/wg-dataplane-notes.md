@@ -857,3 +857,50 @@ on-device figure should land within a few hundred bytes of 8.5 KB.
 - Wire `DerpCmd::Connect` in `tm_runtime` to `DerpTls`, thread the MapResponse
   DERPMap (region -> hostname), and land the disco PONG sealing (available in
   the stash's `tm_disco`) for the disco ping/pong over DERP (rung 4).
+
+## Step 7.5 stall ROOT CAUSE (2026-09-16, live-observed): HTTP/2 flow control in `read_one_h2_body`
+
+The "Honest gap" above (firmware sends the Step 7.5 non-streaming MapRequest
+then never observes its response, the streaming poll, or `DERPMap`/peers) is
+now root-caused against the LIVE control server, Python-first, no inference.
+
+### Direct observation (`tools/wg_validator/`, ephemeral registration)
+A probe that reuses `ts_control.py` to register + `write_map()` and instruments
+the `h2` driver to record every DATA-frame size on the map stream measured, on
+the live `login.tailscale.com`:
+
+- non-streaming `/machine/map` response body = **29404 bytes across 9 DATA
+  frames**, arriving in **4096-byte chunks** (first six frames: 4096 each).
+
+The server caps its DATA frames to our advertised
+`SETTINGS_INITIAL_WINDOW_SIZE` and, after it has sent one stream-window's
+worth (`tm_h2::INITIAL_WINDOW = 4096`) and one connection-window's worth
+(`CONN_WINDOW = 32 KB`), it **stops and waits for a `WINDOW_UPDATE`** before
+sending more. The Python client keeps the stream flowing purely because its
+`h2` driver calls `acknowledge_received_data()` after each frame, which emits
+`WINDOW_UPDATE`s (`_pump()` in `ts_control.py`).
+
+### The bug
+`tm_control::read_one_h2_body` (used to drain BOTH the register response and
+the Step 7.5 publish response) never emits any `WINDOW_UPDATE`: its Data arm
+only appends payload and handles SETTINGS/PING acks. It does NOT call
+`H2State::consumed()` nor `write_window_update()` the way `stream_map_response`
+does. So:
+
+- the register response (< 4096 bytes) drained fine — under one window, no
+  update ever needed. This is why registration always succeeded.
+- the Step 7.5 publish response (29 KB) delivers its first 4096 bytes, then the
+  server blocks on flow control forever; `read_one_h2_body` sits in
+  `noise.read_exact` waiting for a DATA frame the server will never send until
+  granted window. **Permanent hang.** Exactly the observed symptom.
+
+This is a genuine protocol stall (not Wokwi network latency), and it is
+independent of, and downstream of, the earlier stack-overflow fix.
+
+### Fix
+Give `read_one_h2_body` the same flow-control accounting `stream_map_response`
+already has: after each `FrameAction::Data`, call `h2.consumed(payload.len())`
+and write the connection-level (stream 0) and stream-level (`expected_stream`)
+`WINDOW_UPDATE` frames it returns. Purely additive; the register path is
+unaffected (it never crosses a window boundary). Unblocks the Step 7.5
+response, the streaming poll, and the `DERPMap`/peers parse (rung 3).
