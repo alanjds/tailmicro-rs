@@ -22,7 +22,15 @@ use async_channel;
 
 // ── DERP frame types (from Tailscale DERP spec) ───────────────────────────────
 
-const DERP_MAGIC: &[u8] = b"DERP";
+/// The 8-byte ServerKey-frame magic: the literal `DERP🔑`. Cross-checked
+/// against `tools/wg_validator/derp_client.py`'s `DERP_MAGIC` (was a 4-byte
+/// `b"DERP"` while the client was a stub).
+pub const DERP_MAGIC: &[u8; 8] = &[0x44, 0x45, 0x52, 0x50, 0xF0, 0x9F, 0x94, 0x91];
+
+/// On-device DERP TLS leg (embedded-tls, TLS 1.3, ChaCha-only, no-verify).
+/// Feature-gated so the firmware's default build is unaffected until enabled.
+#[cfg(feature = "etls")]
+pub mod tls;
 
 /// Frame type bytes
 #[repr(u8)]

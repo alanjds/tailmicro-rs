@@ -86,9 +86,52 @@ class DerpClient:
         self.sock.sendall(bytes([ftype]) + struct.pack(">I", len(body)) + body)
 
     # ── handshake ──────────────────────────────────────────────────────────────
-    def connect(self) -> None:
+    def _tls_context(self) -> ssl.SSLContext:
+        """Default TLS context: full verification, whatever suite OpenSSL picks."""
+        return ssl.create_default_context()
+
+    def _tls_context_minimal(self) -> ssl.SSLContext:
+        """Smallest-RAM parity context for the on-device embedded-tls DERP leg.
+
+        Mirrors the Rust `tm_derp` TLS config exactly:
+          * TLS 1.3 ONLY (min == max == TLSv1_3), no 1.2 fallback baggage.
+          * Certificate verification DISABLED (no CA, no hostname check).
+            Safe by design: every byte DERP relays is already E2E-encrypted
+            (WireGuard transport + disco crypto_box), so a MITM on the TLS hop
+            sees only ciphertext.
+
+        NOTE on the cipher suite: Python's stdlib `ssl` cannot restrict the
+        TLS 1.3 ciphersuite set (no `SSL_CTX_set_ciphersuites` binding), so
+        this in-process path lets OpenSSL pick (observed: AES-128-GCM). The
+        single-ChaCha20-Poly1305-suite half of the parity config was proven
+        separately with `openssl s_client` against the live server:
+
+            printf 'GET /derp HTTP/1.1\\r\\nHost: derp1.tailscale.com\\r\\n'\\
+                   'Connection: Upgrade\\r\\nUpgrade: DERP\\r\\n\\r\\n' | \\
+              openssl s_client -connect derp1.tailscale.com:443 \\
+                -servername derp1.tailscale.com \\
+                -tls1_3 -ciphersuites TLS_CHACHA20_POLY1305_SHA256 -quiet
+
+        RESULT (2026-09-16, derp1.tailscale.com): with ONLY
+        TLS_CHACHA20_POLY1305_SHA256 offered and verification off, the server
+        completes the TLS 1.3 handshake and returns
+            HTTP/1.1 101 Switching Protocols / Derp-Version: 2
+        immediately followed by the ServerKey frame
+            01 00000028 44455250f09f9491 <32-byte serverkey>
+        (serverkey 69dcb903...4b817171, matching the Derp-Public-Key header).
+        => The smallest-RAM Rust config (TLS 1.3, no-verify,
+           single ChaCha20-Poly1305 suite) is a proven-working DERP client.
+        """
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    def connect(self, minimal_tls: bool = False) -> None:
         raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
-        ctx = ssl.create_default_context()
+        ctx = self._tls_context_minimal() if minimal_tls else self._tls_context()
         self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
         self.sock.settimeout(self.timeout)
 

@@ -133,6 +133,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base16ct"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -443,6 +449,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
+name = "crypto-bigint"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0dc92fb57ca44df6db8059111ab3af99a63d5d0f8375d9972e319a379c6bab76"
+dependencies = [
+ "generic-array",
+ "rand_core",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -619,6 +637,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
+ "const-oid",
  "crypto-common",
  "subtle",
 ]
@@ -628,6 +647,19 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "ecdsa"
+version = "0.16.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee27f32b5c5292967d2d4a9d7f1e0b0aed2c15daded5a60300e4abb9d8020bca"
+dependencies = [
+ "der",
+ "digest",
+ "elliptic-curve",
+ "rfc6979",
+ "signature",
+]
 
 [[package]]
 name = "ed25519"
@@ -660,6 +692,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
+name = "elliptic-curve"
+version = "0.13.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5e6043086bf7973472e0c7dff2142ea0b680d30e18d9cc40f267efbf222bd47"
+dependencies = [
+ "base16ct",
+ "crypto-bigint",
+ "digest",
+ "ff",
+ "generic-array",
+ "group",
+ "hkdf",
+ "rand_core",
+ "sec1",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "embassy-futures"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -673,10 +724,10 @@ checksum = "73974a3edbd0bd286759b3d483540f0ebef705919a5f56f4fc7709066f71689b"
 dependencies = [
  "cfg-if",
  "critical-section",
- "embedded-io-async",
+ "embedded-io-async 0.6.1",
  "futures-core",
  "futures-sink",
- "heapless",
+ "heapless 0.8.0",
 ]
 
 [[package]]
@@ -730,12 +781,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
+name = "embedded-io"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb1aa714776b75c7e67e1da744b81a129b3ff919c8712b5e1b32252c1f07cc7"
+
+[[package]]
+name = "embedded-io-adapters"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c900a1c087f1f7d17cdc84a1290df91521cd90933efa76d68e568385d889f2f4"
+dependencies = [
+ "embedded-io 0.7.1",
+ "embedded-io-async 0.7.0",
+ "tokio",
+]
+
+[[package]]
 name = "embedded-io-async"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ff09972d4073aa8c299395be75161d582e7629cd663171d62af73c8d50dba3f"
 dependencies = [
- "embedded-io",
+ "embedded-io 0.6.1",
+]
+
+[[package]]
+name = "embedded-io-async"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2564b9f813c544241430e147d8bc454815ef9ac998878d30cc3055449f7fd4c0"
+dependencies = [
+ "embedded-io 0.7.1",
 ]
 
 [[package]]
@@ -745,13 +822,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7770e30ab55cfbf954c00019522490d6ce26a3334bede05a732ba61010e98e0"
 dependencies = [
  "defmt 0.3.100",
- "embedded-io",
- "embedded-io-async",
+ "embedded-io 0.6.1",
+ "embedded-io-async 0.6.1",
  "enumset",
- "heapless",
+ "heapless 0.8.0",
  "num_enum",
  "serde",
  "strum 0.25.0",
+]
+
+[[package]]
+name = "embedded-tls"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ff3c16c9cedcab3ef5c79fd46349152adbb98f997b937cb1ead7655f5c07e43"
+dependencies = [
+ "aes-gcm",
+ "digest",
+ "ecdsa",
+ "embedded-io 0.7.1",
+ "embedded-io-async 0.7.0",
+ "generic-array",
+ "heapless 0.9.3",
+ "hkdf",
+ "hmac",
+ "p256",
+ "portable-atomic",
+ "rand_core",
+ "sha2",
+ "signature",
+ "typenum",
 ]
 
 [[package]]
@@ -837,12 +937,12 @@ dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-async",
  "embedded-hal-nb",
- "embedded-io",
- "embedded-io-async",
+ "embedded-io 0.6.1",
+ "embedded-io-async 0.6.1",
  "embuild",
  "enumset",
  "esp-idf-sys",
- "heapless",
+ "heapless 0.8.0",
  "log",
  "nb 1.1.0",
 ]
@@ -859,7 +959,7 @@ dependencies = [
  "enumset",
  "esp-idf-hal",
  "futures-io",
- "heapless",
+ "heapless 0.8.0",
  "log",
  "num_enum",
  "uncased",
@@ -909,6 +1009,16 @@ name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
+name = "ff"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0b50bfb653653f9ca9095b427bed08ab8d75a137839d9ad64eb11810d5b6393"
+dependencies = [
+ "rand_core",
+ "subtle",
+]
 
 [[package]]
 name = "fiat-crypto"
@@ -1068,6 +1178,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "group"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0f9ef7462f7c099f518d754361858f86d8a07af53ba9af0fe635bbccb151a63"
+dependencies = [
+ "ff",
+ "rand_core",
+ "subtle",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1087,6 +1208,16 @@ name = "heapless"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
+dependencies = [
+ "hash32",
+ "stable_deref_trait",
+]
+
+[[package]]
+name = "heapless"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
 dependencies = [
  "hash32",
  "stable_deref_trait",
@@ -1409,6 +1540,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "p256"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
+dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "primeorder",
+ "sha2",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1460,6 +1603,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
 name = "ppv-lite86"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1476,6 +1625,15 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "primeorder"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "353e1ca18966c16d9deb1c69278edbc5f194139612772bd9537af60ac231e1e6"
+dependencies = [
+ "elliptic-curve",
 ]
 
 [[package]]
@@ -1582,6 +1740,16 @@ dependencies = [
  "libc",
  "normpath",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "rfc6979"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dd2a808d456c4a54e300a23e9f5a67e122c3024119acbfd73e3bf664491cb2"
+dependencies = [
+ "hmac",
+ "subtle",
 ]
 
 [[package]]
@@ -1701,6 +1869,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sec1"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3e97a565f76233a6003f9f5c54be1d9c5bdfa3eccfb189469f11ec4901c47dc"
+dependencies = [
+ "base16ct",
+ "der",
+ "generic-array",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1791,6 +1972,7 @@ version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
+ "digest",
  "rand_core",
 ]
 
@@ -1939,7 +2121,7 @@ dependencies = [
  "embedded-svc",
  "esp-idf-hal",
  "esp-idf-svc",
- "heapless",
+ "heapless 0.8.0",
  "log",
  "serde",
  "serde_json",
@@ -2022,7 +2204,7 @@ dependencies = [
  "arrayvec",
  "async-channel",
  "chacha20poly1305",
- "heapless",
+ "heapless 0.8.0",
  "httparse",
  "log",
  "serde",
@@ -2042,11 +2224,20 @@ version = "0.1.0"
 dependencies = [
  "arrayvec",
  "async-channel",
- "heapless",
+ "chacha20poly1305",
+ "crypto_box",
+ "digest",
+ "embedded-io-adapters",
+ "embedded-io-async 0.7.0",
+ "embedded-tls",
+ "heapless 0.8.0",
+ "rand_core",
+ "sha2",
  "thiserror 1.0.69",
  "tm_keys",
  "tokio",
  "tracing",
+ "typenum",
 ]
 
 [[package]]
@@ -2056,7 +2247,7 @@ dependencies = [
  "arrayvec",
  "async-channel",
  "crypto_box",
- "heapless",
+ "heapless 0.8.0",
  "tm_keys",
  "tokio",
 ]
@@ -2070,7 +2261,7 @@ name = "tm_keys"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
- "heapless",
+ "heapless 0.8.0",
  "rand",
  "rand_core",
  "serde",
@@ -2091,7 +2282,7 @@ dependencies = [
  "async-channel",
  "esp-idf-svc",
  "esp-idf-sys",
- "heapless",
+ "heapless 0.8.0",
  "log",
  "tm_control",
  "tm_derp",
@@ -2108,7 +2299,7 @@ version = "0.1.0"
 dependencies = [
  "esp-idf-svc",
  "esp-idf-sys",
- "heapless",
+ "heapless 0.8.0",
  "rustls",
  "sha2",
  "thiserror 1.0.69",
@@ -2128,7 +2319,7 @@ dependencies = [
  "async-channel",
  "blake2",
  "chacha20poly1305",
- "heapless",
+ "heapless 0.8.0",
  "hkdf",
  "rand",
  "rand_core",
