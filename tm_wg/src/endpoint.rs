@@ -430,6 +430,53 @@ impl WgEndpoint {
         Some(pkt)
     }
 
+    /// Encrypt and enqueue an outbound transport (app-data) `payload` for the
+    /// peer identified by `dst_key`.
+    ///
+    /// If the peer has an active, non-expired send session the ciphertext (with
+    /// its 16-byte transport-data header) is written into `out.to_peer` and
+    /// `true` is returned. If no session is active yet the plaintext is queued
+    /// and flushed automatically when the session activates (`false` returned,
+    /// meaning "not sent yet"). Returns `false` for an unknown peer or a stale
+    /// send session (the caller should re-handshake).
+    ///
+    /// This is the outbound app-data seam (rung 6a): the runtime drives an ICMP
+    /// echo request through here after `PeerHandshook` so the peer replies and
+    /// an inbound transport packet becomes observable.
+    pub fn send_data(
+        &mut self,
+        dst_key: &[u8; 32],
+        payload: &[u8],
+        now: Instant,
+        out: &mut RecvOut,
+    ) -> bool {
+        let k = NodePublicKey::from_bytes(*dst_key);
+        let Some(idx) = self.peer_index_by_key(&k) else {
+            tracing::warn!("send_data to unknown peer");
+            return false;
+        };
+        out.peer = Some(self.peers[idx].id);
+        let mut pkt = Packet::from_plaintext(payload);
+        let peer = &mut self.peers[idx];
+        // Compute activeness first so the immutable `send` borrow ends before we
+        // need `&mut peer` again for the keepalive schedule.
+        let active =
+            matches!(&peer.session, SessionState::Active { send, .. } if !send.expired(now));
+        if active {
+            if let SessionState::Active { send, .. } = &peer.session {
+                send.encrypt(core::iter::once(&mut pkt));
+            }
+            let _ = out.to_peer.try_push(pkt);
+            peer.schedule_keepalive(now);
+            true
+        } else if let SessionState::None(queue) = &mut peer.session {
+            queue_push(queue, pkt);
+            false
+        } else {
+            false
+        }
+    }
+
     /// Process one inbound packet arriving over `from`.
     /// Process one inbound packet, returning a fresh [`RecvOut`] by value.
     ///
@@ -856,6 +903,65 @@ mod tests {
             a_ok.handshook,
             "the response to the current initiation must complete the handshake"
         );
+    }
+
+    #[test]
+    fn send_data_encrypts_over_active_session_and_queues_without_one() {
+        // Rung-6a: after a handshake completes, `send_data` must encrypt an
+        // app-data (IP) payload into `out.to_peer` under the active session, and
+        // the peer must decrypt it back to the exact plaintext. Before a session
+        // exists, the payload is queued (not sent) and no ciphertext is emitted.
+        let a_kp = NodeKeyPair::new();
+        let b_kp = NodeKeyPair::new();
+        let psk = Psk::zero();
+
+        let mut a = WgEndpoint::new(a_kp);
+        let mut b = WgEndpoint::new(b_kp);
+        let b_key = b_kp.public.to_bytes();
+
+        let a_peer = a
+            .add_peer(PeerConfig { key: b_kp.public, psk }, a_derp(&b_kp))
+            .unwrap();
+        b.add_peer(PeerConfig { key: a_kp.public, psk }, b_derp(&a_kp))
+            .unwrap();
+
+        let now = Instant::now();
+
+        // No session yet: send_data queues, emits nothing.
+        let mut out0 = RecvOut::default();
+        let sent0 = a.send_data(&b_key, &[0xde, 0xad, 0xbe, 0xef], now, &mut out0);
+        assert!(!sent0, "no active session -> not sent (queued)");
+        assert!(out0.to_peer.is_empty(), "nothing on the wire before a session");
+
+        // Establish A->B session.
+        let init = a.initiate(a_peer, now, now_unix()).expect("init");
+        let b_out = b.recv_one(init.as_slice(), b_derp(&a_kp), now);
+        let a_out = a.recv_one(b_out.to_peer[0].as_slice(), a_derp(&b_kp), now);
+        assert!(a_out.handshook, "A completes the handshake");
+        // Deliver A's confirmation so B's session activates (queued data flushes).
+        let b_out2 = b.recv_one(a_out.to_peer[0].as_slice(), b_derp(&a_kp), now);
+        assert_eq!(b_out2.decrypted.len(), 1, "B decrypts the confirmation");
+
+        // Now send real app data over the active session.
+        let payload = [0x45u8, 0x00, 0x00, 0x1c, 0x11, 0x22, 0x33, 0x44];
+        let mut out = RecvOut::default();
+        let sent = a.send_data(&b_key, &payload, now, &mut out);
+        assert!(sent, "active session -> sent");
+        assert_eq!(out.to_peer.len(), 1, "one encrypted transport packet emitted");
+
+        // B receives and decrypts it to the exact plaintext.
+        let b_recv = b.recv_one(out.to_peer[0].as_slice(), b_derp(&a_kp), now);
+        assert_eq!(b_recv.decrypted.len(), 1, "B decrypts the app data");
+        assert_eq!(
+            b_recv.decrypted[0].as_slice(),
+            &payload,
+            "decrypted plaintext must equal what A sent"
+        );
+
+        // Unknown peer key -> not sent.
+        let mut out_unknown = RecvOut::default();
+        let sent_unknown = a.send_data(&[0u8; 32], &payload, now, &mut out_unknown);
+        assert!(!sent_unknown, "send_data to unknown peer is a no-op");
     }
 
     #[test]

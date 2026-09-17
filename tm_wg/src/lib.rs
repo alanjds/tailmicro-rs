@@ -47,6 +47,16 @@ pub enum WgCmd {
         src_key: [u8; 32],
         payload: Box<heapless::Vec<u8, 1500>>,
     },
+    /// Encrypt and send an outbound transport (app-data) IP packet to a peer.
+    ///
+    /// The `payload` is a plaintext IP packet (e.g. an ICMP echo request); it is
+    /// encrypted under the peer's active send session and emitted as a
+    /// [`WgEvent::OutboundPacket`] for DERP relay. Boxed for the same
+    /// stack-frame reason as the other multi-KB variants above.
+    SendData {
+        dst_key: [u8; 32],
+        payload: Box<heapless::Vec<u8, 1500>>,
+    },
     Shutdown,
 }
 
@@ -139,6 +149,9 @@ impl WgActor {
                         Ok(WgCmd::ApplyMap(map)) => Box::pin(self.apply_map(&map, &events)).await,
                         Ok(WgCmd::InboundPacket { src_key, payload }) => {
                             Box::pin(self.on_inbound(src_key, &payload, &events)).await;
+                        }
+                        Ok(WgCmd::SendData { dst_key, payload }) => {
+                            Box::pin(self.on_send_data(dst_key, &payload, &events)).await;
                         }
                         Ok(WgCmd::Shutdown) | Err(_) => break,
                     }
@@ -244,6 +257,29 @@ impl WgActor {
         let mut out = Box::new(crate::endpoint::RecvOut::default());
         self.endpoint().recv_one_into(payload, from, Instant::now(), &mut out);
         self.drain_recv(src_key, out, events).await;
+    }
+
+    async fn on_send_data(
+        &mut self,
+        dst_key: [u8; 32],
+        payload: &heapless::Vec<u8, 1500>,
+        events: &async_channel::Sender<WgEvent>,
+    ) {
+        // No endpoint means no sessions; nothing to send (and we must not force
+        // the ~28 KB lazy allocation for a stray send).
+        if self.endpoint.is_none() {
+            return;
+        }
+        // Same stack discipline as on_inbound: fill a pre-boxed RecvOut so its
+        // ~12 KB of inline packet buffers never lands on the main-task stack.
+        let mut out = Box::new(crate::endpoint::RecvOut::default());
+        let sent = self
+            .endpoint()
+            .send_data(&dst_key, payload, Instant::now(), &mut out);
+        if !sent {
+            tracing::debug!("send_data queued (no active session yet) or dropped");
+        }
+        self.drain_recv(dst_key, out, events).await;
     }
 
     async fn on_tick(&mut self, events: &async_channel::Sender<WgEvent>) {

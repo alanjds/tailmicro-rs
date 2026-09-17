@@ -158,6 +158,53 @@ fn log_derp_error(e: &tm_derp::DerpError) {
     error!("Runtime::join() - received DerpEvent::Error: {:?}", e);
 }
 
+/// Internet checksum (RFC 1071): ones-complement sum of 16-bit words.
+fn inet_checksum(bytes: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        sum += u16::from_be_bytes([bytes[i], bytes[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < bytes.len() {
+        sum += (bytes[i] as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Build a minimal ICMPv4 echo request (an IP packet: 20-byte IPv4 header +
+/// 8-byte ICMP echo header, no payload) from `src` to `dst`. This is the
+/// rung-6a elicitor: sent as WireGuard transport data, the peer's kernel
+/// answers with an echo reply that returns as an inbound transport packet.
+fn build_icmp_echo_request(src: [u8; 4], dst: [u8; 4], ident: u16, seq: u16) -> [u8; 28] {
+    let mut pkt = [0u8; 28];
+    // ── IPv4 header (20 bytes) ──
+    pkt[0] = 0x45; // version 4, IHL 5 (20 bytes)
+    pkt[1] = 0x00; // DSCP/ECN
+    pkt[2..4].copy_from_slice(&28u16.to_be_bytes()); // total length
+    pkt[4..6].copy_from_slice(&0u16.to_be_bytes()); // identification
+    pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // flags: don't fragment
+    pkt[8] = 64; // TTL
+    pkt[9] = 1; // protocol: ICMP
+    // pkt[10..12] header checksum, filled below
+    pkt[12..16].copy_from_slice(&src);
+    pkt[16..20].copy_from_slice(&dst);
+    let ip_csum = inet_checksum(&pkt[0..20]);
+    pkt[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+    // ── ICMP echo request (8 bytes) ──
+    pkt[20] = 8; // type: echo request
+    pkt[21] = 0; // code
+    // pkt[22..24] ICMP checksum, filled below
+    pkt[24..26].copy_from_slice(&ident.to_be_bytes());
+    pkt[26..28].copy_from_slice(&seq.to_be_bytes());
+    let icmp_csum = inet_checksum(&pkt[20..28]);
+    pkt[22..24].copy_from_slice(&icmp_csum.to_be_bytes());
+    pkt
+}
+
 /// The event-router loop, extracted to a top-level `async fn`.
 ///
 /// This used to be an `async move { .. }` block declared as a local inside
@@ -182,6 +229,12 @@ async fn event_router_task(
     our_ip_tx: Option<OurIpSender>,
 ) {
     info!("Runtime::join() - event_router task started");
+    // Rung-6a addressing state: our tailnet IPv4 and each peer's tailnet IPv4
+    // keyed by node key, captured from MapUpdate. Used to synthesize the ICMP
+    // echo request we drive through tm_wg after PeerHandshook so the peer
+    // replies and an inbound transport packet becomes observable.
+    let mut our_ip: [u8; 4] = [0; 4];
+    let mut peer_ips: heapless::Vec<([u8; 32], [u8; 4]), 8> = heapless::Vec::new();
     loop {
         #[cfg(target_os = "espidf")]
         tokio_freertos_yield().await;
@@ -227,6 +280,13 @@ async fn event_router_task(
                                     #[cfg(target_os = "espidf")]
                                     tokio_freertos_yield().await;
                                 }
+                            }
+                            // Capture addressing for rung-6a BEFORE the map is
+                            // moved into ApplyMap.
+                            our_ip = map.our_ip.0;
+                            peer_ips.clear();
+                            for p in map.peers.iter() {
+                                let _ = peer_ips.push((p.node_key, p.tailnet_ip.0));
                             }
                             let _ = wg_tx2.send(WgCmd::ApplyMap(map)).await;
                         }
@@ -336,6 +396,31 @@ async fn event_router_task(
                     }
                     Ok(WgEvent::PeerHandshook(key)) => {
                         info!("Runtime::join() - WgEvent::PeerHandshook with peer {:02x}{:02x}..", key[0], key[1]);
+                        // Rung-6a: now that a session is active, drive an ICMP
+                        // echo request to the peer's tailnet IP. tailscaled/its
+                        // kernel answers pings to its own tailnet address with
+                        // no listening app, so the echo reply comes back as an
+                        // inbound transport packet -> WgEvent::InboundDecrypted.
+                        if let Some((_, dst_ip)) = peer_ips.iter().find(|(k, _)| *k == key) {
+                            if our_ip != [0; 4] {
+                                let echo = build_icmp_echo_request(our_ip, *dst_ip, 0x7361, 1);
+                                info!("Runtime::join() - rung6a: sending ICMP echo {}.{}.{}.{} -> {}.{}.{}.{} ({} bytes) to peer {:02x}{:02x}..",
+                                    our_ip[0], our_ip[1], our_ip[2], our_ip[3],
+                                    dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3],
+                                    echo.len(), key[0], key[1]);
+                                let mut buf: heapless::Vec<u8, 1500> = heapless::Vec::new();
+                                if buf.extend_from_slice(&echo).is_ok() {
+                                    let _ = wg_tx2.send(WgCmd::SendData {
+                                        dst_key: key,
+                                        payload: Box::new(buf),
+                                    }).await;
+                                    #[cfg(target_os = "espidf")]
+                                    tokio_freertos_yield().await;
+                                }
+                            } else {
+                                info!("Runtime::join() - rung6a: our tailnet IP not yet known; skipping echo");
+                            }
+                        }
                     }
                     Err(_) => {
                         info!("Runtime::join() - wg event channel closed, breaking");
