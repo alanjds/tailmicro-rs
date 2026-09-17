@@ -904,3 +904,127 @@ and write the connection-level (stream 0) and stream-level (`expected_stream`)
 `WINDOW_UPDATE` frames it returns. Purely additive; the register path is
 unaffected (it never crosses a window boundary). Unblocks the Step 7.5
 response, the streaming poll, and the `DERPMap`/peers parse (rung 3).
+
+## Step 7.5 continued: three more live bugs behind the netmap parse (2026-09-16)
+
+With the `WINDOW_UPDATE` fix above the 29 KB publish response finally arrived
+on-device, which surfaced three further bugs, each root-caused on hardware with
+direct serial evidence (no inference). All are fixed; rung 3 is now reached.
+
+### Bug A — `arrayvec::push` panics on window overflow
+`read_one_h2_body` accumulated the body into a fixed `ArrayVec<u8, 4096>` with
+`.push()`. Once the response exceeded 4096 bytes (it is 29 KB) the first byte
+past the cap hit `CapacityError` and `push` **panics/aborts**. Fixed by draining
+into a growable buffer and using `try_push`/`extend` so an over-cap body can
+never abort the task.
+
+### Bug B — the MapResponse body is 4-byte-LE length-prefixed, not raw JSON
+Both the non-streaming publish response and the streaming poll frame each
+MapResponse as `u32-LE length + JSON` (confirmed against
+`ts_control.py::read_full_body`/`read_stream_message`, whose `write_map` unpacks
+`struct.unpack("<I", resp[:4])`). The firmware had been feeding the whole body —
+prefix bytes included — straight to the JSON parser, so it never parsed. Fixed
+by buffering DATA payloads and de-framing every complete `4 + len` message before
+parsing (`stream_map_response`, shared by the publish and the streaming poll).
+
+### Bug C — the hand-rolled `map_parser` mis-parses the real response
+The streaming `MapParser` extracted 0 peers / 0 regions / no IP from the live
+34 KB response. Its own unit tests fail on the committed code: the root `{`
+skipped the whole document, its skip logic was not string-aware, and array-
+element strings were misclassified as object keys. Because device RAM is ample
+for this small tailnet (tens of KB body vs ~120 KB free heap), it was replaced
+with `map_serde.rs`: buffer the de-prefixed JSON and parse with `serde_json`
+(already a dependency), borrowing `&str` for the escape-free fields we read.
+`map_parser.rs` was removed (see git history); `map_serde`'s unit test parses a
+real-shaped response including the `{}[],`-bearing skipped subtrees that broke
+the old parser.
+
+### Two heap hazards found while wiring `map_serde` in
+- **`Vec` doubling OOM.** Accumulating a 34 KB message by `Vec` doubling steps
+  through a 64 KB reservation; on the fragmented ESP heap (largest contiguous
+  ~69 KB, and the old buffer is still held across `realloc`) that step aborts
+  ("memory allocation of 65536 bytes failed"). Fixed by `reserve_exact` for the
+  exact `4 + len` once the length prefix is known — one ~34 KB allocation fits.
+- **Garbage length prefix on the streaming keepalive → 1.95 GB reserve abort.**
+  After rung 3 succeeded via the publish response, the follow-on `Stream=true`
+  keepalive poll read a desynced/garbage 4-byte prefix (seen live as
+  `1953722188`) and `reserve_exact` OOM-aborted. Guarded with `MAX_MAP_MSG`
+  (512 KB): any prefix beyond a plausible netmap means the stream is desynced,
+  so `stream_map_response` logs and returns `Ok(())` gracefully rather than
+  aborting. The authoritative netmap already came from the publish response, so
+  the keepalive bailing does not lose peers/DERPMap. (The keepalive framing
+  itself is left for a later pass; it is not needed for rungs 3–6 bring-up,
+  during which the freshly delivered map keeps us online.)
+
+### Rung 3 REACHED — live serial evidence
+A clean Wokwi run (live `login.tailscale.com`, ephemeral registration) shows:
+
+- `Tailscale OurIpAssigned event sent: 100.90.118.17`
+- `Tailscale MapUpdate event sent (8 peers, 4 DERP regions)`
+- `Runtime::join() - MapUpdate: 8 peers, 4 DERP regions, our_ip=100.90.118.17`
+- DERP regions with real hostnames: region 1 (nyc) `derp1g.tailscale.com`,
+  10 (sea), 11 (sao) `derp11e.tailscale.com`, 12 (ord)
+- 8 peers enumerated (e.g. `raspill derp_region=11 ip=100.123.201.53`)
+
+i.e. control connect + Noise/H2 + register + **disco key published** +
+**MapResponse/DERPMap/peers parsed and delivered to the runtime** — the rung-3
+bar. Next: wire `DerpCmd::Connect` over `etls` to the target peer's home region
+(rung 4).
+
+## Step 7.5 RESOLUTION: the real OOM root cause was heap budget vs map size (2026-09-17)
+
+The `MAX_MAP_MSG` cap and the prefix/body reassembly above stopped OUR code from
+aborting, but the device still crash-looped with a constant `memory allocation
+of 12100 bytes failed` — an abort from a DIFFERENT component, not our map
+buffer. Root-caused on hardware with the runtime's per-step heap probes:
+
+- The live netmap had grown to ~40 KB (`mlen` seen live: 40178, 40948, 41679,
+  climbing per boot as ephemeral test-nodes from repeated registrations
+  accumulate; a fresh `ts_control.py` probe measured 29404 B — the body is
+  dominated by the full public DERPMap, not by our peers).
+- By the time `connect_and_poll` runs, `Runtime::join` has already constructed
+  all actors up front, and the **WgActor's eager `WgEndpoint` (~28 KB) alone**
+  drops the largest contiguous block from ~110 KB to ~69 KB (serial:
+  `heap [after WgActor spawn]: total_free 114120 -> 85916, largest 102400 ->
+  73728`).
+- Buffering the ~40 KB map whole then cannot coexist with the rest of the
+  connection's working set in that ~69 KB fragmented budget. It is a genuine
+  catch-22: allocate the map buffer LATE (during the read) and a concurrent
+  ~12 KB alloc fails once our buffer takes the last big block; allocate it
+  EARLY (before the handshake) and the Noise handshake's own ~12 KB alloc
+  starves instead. Neither ordering fits.
+- When the map was small (~12 KB, an earlier boot) everything fit and rung 3
+  was reached — confirming size, not logic, was the gate.
+
+### Fix — allocate the WgEndpoint lazily (frees the ~28 KB when the map needs it)
+`WgActor::endpoint` became `Option<Box<WgEndpoint>>`, built on first use
+(`apply_map` / inbound packet) instead of at construction. `apply_map` runs only
+AFTER the control plane has parsed the netmap and freed its buffer, so the
+~28 KB is allocated exactly when it is free to take — and stays out of the heap
+during the control read, giving the map buffer room. `on_tick` returns early
+while the endpoint is `None` so a timer tick never forces the allocation.
+
+Purely a lifetime change; all 21 `tm_wg` unit tests still pass.
+
+### Clean run — live serial evidence (single boot, no crash-loop)
+- `Tailscale OurIpAssigned event sent: 100.96.169.109`
+- `Tailscale MapUpdate event sent (8 peers, 4 DERP regions)`
+- `Runtime::join() - MapUpdate: 8 peers, 4 DERP regions, our_ip=100.96.169.109`
+  with DERP regions 1 (nyc) `derp1g.tailscale.com`, 10 (sea) `derp10b`,
+  11 (sao) `derp11e`, 12 (ord) `derp12d`, and 8 peers enumerated.
+- `tm_wg: WgActor: allocating WgEndpoint (~28 KB) on first use` — the deferred
+  allocation, happening after the map is delivered.
+- The `Stream=true` keepalive's garbage length is caught: `stream_map_response:
+  implausible message length 1953722184 on stream 5, ending` (graceful, no OOM).
+- The device then runs stably for ~40 s emitting `WgEvent::OutboundPacket 148
+  bytes -> DERP peer ...` — real WireGuard **handshake-init** messages (148 B)
+  for each peer. The outbound WG leg works; the packets are queued to the DERP
+  transport, which is not wired yet (Task 2), so they do not yet reach peers.
+
+Rung 3 is reached cleanly, and `tm_wg` is already producing WireGuard handshake
+initiations (the outbound half of rung 5). The remaining gap to rungs 4-6 is the
+DERP `etls` leg (connect to the peer's home region, relay disco ping/pong and
+the WG handshake). NB: whole-buffering a ~40 KB map is inherently tight on this
+heap; if the netmap grows further the durable fix is a streaming parse that
+extracts only the fields we keep (our IP, peers, DERP regions) without holding
+the whole body — `map_serde` is the buffered stopgap that fits today's map.
