@@ -1028,3 +1028,121 @@ the WG handshake). NB: whole-buffering a ~40 KB map is inherently tight on this
 heap; if the netmap grows further the durable fix is a streaming parse that
 extracts only the fields we keep (our IP, peers, DERP regions) without holding
 the whole body — `map_serde` is the buffered stopgap that fits today's map.
+
+## Rungs 4 → 5: DERP `etls` leg wired, live relay round-trip, WG-finish blocker
+
+The DERP transport (Task 2) is now wired end-to-end and validated live on
+ESP32-C3 in Wokwi against real Tailscale DERP and a real peer.
+
+### What was wired
+
+- **`tm_derp` `etls` enabled in the firmware** (`Cargo.toml`:
+  `tm_derp = { ..., features = ["etls"] }`). `DerpTls::connect` (embedded-tls
+  TLS 1.3, ChaCha-only, no-verify + the ServerKey/ClientInfo/ServerInfo NaCl
+  `crypto_box` handshake) was already implemented; this change makes the actor
+  actually use it.
+- **`DerpActor` now carries the node Curve25519 private key** (`node_priv`),
+  paired with `our_key` (node public) for the DERP `crypto_box` handshake.
+  `DerpActor::new(our_key, node_priv)`; the runtime passes `wg_priv` (the node
+  key) for both.
+- **`DerpActor::run_connection` (feature `etls`) is a real send/receive loop.**
+  It dials TCP via tokio, wraps it in `embedded_io_adapters::tokio_1::FromTokio`,
+  runs `DerpTls::connect`, then services a `tokio::select!` that only *decides*
+  what happened (a command arrived, or a frame was read) and performs every
+  `&mut tls` action *after* the `select!` — so the send path and the receive
+  path never borrow `tls` simultaneously. `TlsConnection::split()` was not an
+  option: it requires `Socket: Clone`, and `FromTokio<tokio::net::TcpStream>`
+  is not `Clone`.
+- **Cancellation-safe resumable frame reader** (`DerpTls::read_frame_buffered`
+  + `DerpTls::frame`). embedded-tls's record layer already retains a partial
+  *record* (`RecordReader::pending` lives in the connection), and this method
+  keeps the partial *frame* (header/body byte counters + an owned boxed body
+  buffer) in `DerpTls` itself. Dropping the read future when the command branch
+  of the `select!` wins therefore never loses bytes or desyncs framing; the
+  next call resumes at the exact byte.
+- **Runtime issues `DerpCmd::Connect` on `MapUpdate`**: it picks a target peer
+  (first online, else first) and connects to the DERP region that peer is homed
+  on, so the server can relay to it. A repeat Connect from a later map snapshot
+  is ignored while a connection is up.
+
+### Task 5: measured on-device DERP TLS RAM cost
+
+Heap probes (`esp_get_free_heap_size` + `heap_caps_get_largest_free_block`,
+`MALLOC_CAP_INTERNAL`) straddling `DerpTls::connect`, with the probe placed
+*before* the record buffers are allocated so the delta captures the full
+session (both record buffers + embedded-tls fixed state + the boxed frame
+buffer). Live serial, consistent across boots:
+
+```
+DerpActor heap [before DerpTls::connect]: total_free=52536, largest_internal_block=40960
+DerpActor heap [after  DerpTls::connect]: total_free=40708, largest_internal_block=26624
+```
+
+=> **measured ≈ 11.8 KB total-free delta** (≈ 16 KB largest-block delta from
+allocation placement/fragmentation). This is larger than the ~8.5 KB
+host-side estimate: the estimate counted the 5120+2048 record buffers and
+~1.3 KB fixed state; the on-device figure also includes the 1532-byte boxed
+frame buffer and allocator rounding/fragmentation. It remains a small fraction
+of the ~125 KB heap and an order of magnitude below an mbedTLS/esp-tls session.
+
+### Live evidence (rung 4 reached; rung 5 pipeline proven to the AEAD step)
+
+Single stable boot, no crash, ~130 s:
+
+```
+Runtime::join() - DERP connect -> region 11 (sao) host=derp11e.tailscale.com port=443 for peer lenovopill
+tm_derp: DerpActor: dialing derp11e.tailscale.com:443
+tm_derp: DerpActor: DERP handshake complete with derp11e.tailscale.com
+tm_derp: DerpActor: RecvPacket 92 bytes from 0e63..     (x7)
+tm_wg::vendor::handshake: decryption failed error=aead::Error
+tm_wg::endpoint: handshake failed to complete
+```
+
+So: DERP TLS + DERP protocol handshake **succeed** on-device; we send 148-byte
+WireGuard handshake *initiations* to peers over the relay; the target peer
+**responds** with 92-byte WireGuard handshake *responses* which the server
+relays back to us (`RecvPacket 92 bytes`); those are demuxed, routed to
+`tm_wg`, parsed as `HandshakeResponse`, and fed to `handshake.finish`. The
+**bidirectional DERP relay round-trip works** — this is rung 4, and stronger
+than the disco-ping/pong proxy originally planned for it (real WG packets both
+directions).
+
+The remaining gap to rung 5 (`PeerHandshook`) is a WireGuard **crypto interop**
+failure: `handshake.finish` fails the AEAD tag check on the response's encrypted
+empty payload (`aead::Error`), consistently (not a stale-ephemeral race — the
+re-init is gated at `HANDSHAKE_TIMEOUT` ≈ 5 s and responses arrive within a DERP
+RTT). The node keypair itself is proven valid: the DERP `crypto_box` handshake,
+which uses the *same* node Curve25519 key, succeeds. The failure is inside the
+WireGuard-specific Noise `finish` derivation. Per the project rule this is
+"new protocol behaviour" and must be pinned down **Python-first** against the
+live peer (compare our IK/response transcript and key schedule to a reference
+`wg_validator` run) before patching `tm_wg`'s handshake. That is the precise,
+narrow remaining blocker for rungs 5-6.
+
+### Stack-overflow root cause + fix (surfaced by the now-working inbound path)
+
+Wiring the relay made `tm_wg` receive real inbound packets for the first time —
+which immediately hit a `Guru Meditation ... Stack protection fault` in
+`WgEndpoint::recv_one` on task `main`. Root cause (byte-exact from the crash SP
+vs the reported stack bounds): `RecvOut` embeds two `ArrayVec<Packet, OUT_CAP>`
+(OUT_CAP=4, `Packet`≈1512 B `heapless` inline) ≈ **12 KB**, and `recv_one`
+returned it **by value**, which `on_inbound` then `Box::new`'d — materialising
+~12 KB on the stack on top of the tokio/actor poll chain and the deep
+Blake2s/HKDF handshake-finish crypto. The outbound-only rungs never exercised
+this (DERP delivered no inbound before).
+
+Two fixes, in order of preference (heap-neutral first):
+
+1. **`WgEndpoint::recv_one_into(&mut RecvOut)`** — fill a caller-provided,
+   heap-allocated `RecvOut` instead of returning 12 KB by value. `on_inbound`
+   now does `let mut out = Box::new(RecvOut::default()); recv_one_into(.., &mut
+   out)`. Removed exactly ~12 KB from the stack (crash SP moved from 22.8 KB to
+   10.7 KB past the bound). The 12 KB now lives on the heap, where the
+   post-connect largest block (~16 KB at the final stack size) has room.
+2. **`CONFIG_ESP_MAIN_TASK_STACK_SIZE` 40960 → 55296.** The residual ~10.7 KB
+   is genuine call-depth in the vendored WireGuard `handshake.finish`
+   (HKDF/HMAC-Blake2s) key schedule — not a boxable single frame. The bump is
+   sized against the heap: it keeps the post-connect largest free block
+   (~14-16 KB) above the 12 KB the boxed `RecvOut` needs, so the two-sided
+   squeeze (bigger stack vs. the heap the relay + boxed `RecvOut` need) stays
+   satisfied. With both fixes the device runs the full window with **no fault**.
