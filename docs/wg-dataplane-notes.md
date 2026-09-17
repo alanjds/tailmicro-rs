@@ -1312,3 +1312,54 @@ This is a hard monthly Wokwi CI-minute cap, not a transient rate limit. Landing
 needs one of: a Wokwi plan/quota with CI minutes available, a different Wokwi
 token, waiting for the monthly reset, or a real ESP32-C3. The code + offline
 oracles are in place; only the live serial confirmation is outstanding.
+
+## Rung 6a on real ESP32-C3 hardware: heap-OOM reboot root-caused + fixed
+
+Moving from Wokwi to a real ESP32-C3 (/dev/ttyACM0, .env.aj2004 tailnet)
+surfaced a hard-fault the emulator never hit. The board reboot-cycled every
+~22 s: WiFi -> control register -> MapUpdate -> DERP TLS connect (~19 s) ->
+sent 148-byte WG inits -> **crash before any PeerHandshook**:
+
+```
+memory allocation of 12100 bytes failed
+abort() was called at PC 0x420abd7f
+... rst:0xc (RTC_SW_CPU_RST)
+```
+
+### Root cause: transient ~12 KB allocations vs a fragmented ~8 KB heap block
+On real hardware the DERP TLS session + the live 8-peer netmap fragment the heap
+so that, post-connect, `largest_internal_block` is only ~8-9 KB (measured:
+`total_free=18888, largest_internal_block=9728` after `DerpTls::connect`), even
+though total free is ~19 KB. Two per-call allocations exceeded that single
+contiguous block:
+1. `on_inbound` / `on_send_data`: `Box::new(RecvOut::default())`. `RecvOut` =
+   `2 * OUT_CAP * ~1516 B`; with `OUT_CAP = 4` that is **~12100 B** — the exact
+   failing size. Hit first, when the first inbound WG packet arrived.
+2. `on_tick`: `Box::new(dispatch(..))`. `dispatch` returned
+   `ArrayVec<(PeerId,Packet), MAX_PEERS=8>` ≈ **12160 B**, and `Box::new`
+   allocates the full array every 100 ms tick regardless of how many entries are
+   used. Would have failed on the first post-connect tick too.
+Wokwi never hit this because its TLS/netmap left a larger contiguous block.
+
+### Fix (tm_wg only; heap-shrinking, no stack change, no tasmolike-rs change)
+- `OUT_CAP` 4 -> 2: `RecvOut` ~12.1 KB -> ~6 KB (fits the ~8 KB block). Our
+  flows emit at most 1-2 packets per recv; a rare queue-flush+keepalive overflow
+  is dropped by `try_push`.
+- `dispatch` now returns `ArrayVec<_, DISPATCH_CAP=4>` (~6 KB) and stops
+  collecting when full, leaving still-due peers' timers untouched so they are
+  serviced on the next 100 ms tick. Nothing is lost.
+- 23/23 tm_wg tests still pass.
+
+### Verified live on hardware
+After the fix: **single clean boot, zero reboots, zero OOM/abort**, board stable
+through the full ~68 s capture (was crashing at ~22 s). The heap OOM is gone.
+
+### Remaining blocker: no online peer on the .env.aj2004 tailnet
+The netmap snapshot shows **all 8 peers `online=false`** (`raspill` derp_region=11
+offline; the rest derp_region=0). We send WG inits over DERP every ~5 s but no
+peer is connected to answer, so we never reach `PeerHandshook` (the rung-5
+prerequisite) — hence no rung-6a echo either. This is a live-tailnet
+availability issue, not a firmware fault. Observing rung 6a end-to-end needs an
+**online** Tailscale peer on this tailnet at the time the board registers (the
+control path uses a non-streaming MapRequest, so the peer should be up before
+boot to appear online in the snapshot).
