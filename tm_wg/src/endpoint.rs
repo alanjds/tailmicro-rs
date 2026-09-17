@@ -92,11 +92,25 @@ impl SessionState {
         core::mem::replace(self, SessionState::None(Queue::new()))
     }
 
-    /// Activate `next`, rotating any existing session. Returns encrypted
-    /// packets to send (any that were queued), and the ids of receive sessions
-    /// that should be released from the session map.
-    fn activate(&mut self, next: SessionPair) -> (ArrayVec<Packet, OUT_CAP>, ArrayVec<SessionId, 2>) {
-        let mut out = ArrayVec::new();
+    /// Activate `next`, rotating any existing session. Encrypted packets to send
+    /// (any that were queued) are pushed into the caller-provided `out`; the ids
+    /// of receive sessions that should be released from the session map are
+    /// returned.
+    ///
+    /// `out` is written in place rather than returned by value: on the
+    /// handshake-completion path this runs deep inside `recv_one_into` (tokio
+    /// poll chain -> boxed `on_inbound` future -> `recv_response` -> `finish`'s
+    /// Blake2s/HKDF key schedule), and an `ArrayVec<Packet, OUT_CAP>` (~6 KB of
+    /// inline `heapless` packet buffers) returned by value there overflowed the
+    /// ESP32-C3 main task stack the first time a handshake actually COMPLETED
+    /// (the AEAD-failing path returned before reaching here, so only success
+    /// exposed it). The caller passes its already heap-allocated `RecvOut`
+    /// buffer, keeping those ~6 KB off the stack.
+    fn activate(
+        &mut self,
+        next: SessionPair,
+        out: &mut ArrayVec<Packet, OUT_CAP>,
+    ) -> ArrayVec<SessionId, 2> {
         let mut freed = ArrayVec::new();
         match self.take() {
             SessionState::None(queue) => {
@@ -123,7 +137,7 @@ impl SessionState {
                 };
             }
         }
-        (out, freed)
+        freed
     }
 
     fn deactivate(&mut self) -> ArrayVec<SessionId, 2> {
@@ -522,20 +536,17 @@ impl WgEndpoint {
         self.peers[idx].handshake_timeout = None;
         out.handshook = true;
 
-        let (mut pkts, freed) = self.peers[idx].session.activate(session);
+        let freed = self.peers[idx].session.activate(session, &mut out.to_peer);
         for sid in freed {
             self.state.free_session(sid);
         }
         // Initiator must send at least one packet to confirm the session.
-        if pkts.is_empty() {
+        if out.to_peer.is_empty() {
             let mut ka = Packet::new(0);
             if let SessionState::Active { send, .. } = &self.peers[idx].session {
                 send.encrypt(core::iter::once(&mut ka));
-                let _ = pkts.try_push(ka);
+                let _ = out.to_peer.try_push(ka);
             }
-        }
-        for p in pkts {
-            let _ = out.to_peer.try_push(p);
         }
     }
 
@@ -603,12 +614,9 @@ impl WgEndpoint {
             for p in decrypted {
                 let _ = out.decrypted.try_push(p);
             }
-            let (pkts, freed) = self.peers[idx].session.activate(session);
+            let freed = self.peers[idx].session.activate(session, &mut out.to_peer);
             for sid in freed {
                 self.state.free_session(sid);
-            }
-            for p in pkts {
-                let _ = out.to_peer.try_push(p);
             }
         }
     }
