@@ -1222,3 +1222,44 @@ With the guard, a response arriving within a DERP RTT of the current initiation
 (the common case once the peer's wireguard config is awake) matches and completes
 `finish()` -> `PeerHandshook`; lagging responses to rotated-out initiations are
 dropped instead of poisoning the schedule.
+
+## Rung 5 REACHED live on-device (2026-09-17) + the completion-tail stack fix
+
+With the index-matching fix above, a first Wokwi run got PAST the crypto but hit
+a NEW fault: a `Guru Meditation ... Stack protection fault` in task `main`,
+symbolized (riscv32-esp-elf-addr2line) to `SessionState::activate` called from
+`WgEndpoint::recv_one_into`. This is decisive evidence the crypto fix worked: the
+crash was NOT `aead::Error` but the handshake-COMPLETION tail. The AEAD-failing
+path returned before `activate`, so only a SUCCESSFUL `finish()` reached it -- the
+handshake now completes.
+
+Root cause of the new fault: `SessionState::activate` returned an
+`ArrayVec<Packet, OUT_CAP>` (~6 KB of inline `heapless` packet buffers) BY VALUE,
+materialised on the caller's stack deep inside the tokio poll chain ->
+boxed `on_inbound` future -> `recv_response` -> `finish` (Blake2s/HKDF). Same
+class as the earlier `RecvOut`-by-value overflow; the outbound-only and
+AEAD-failing rungs never exercised it. Fix: `activate` now writes its packets
+into the caller's already heap-allocated `RecvOut::to_peer` (passed `&mut`) and
+returns only the tiny freed-session-id list; the two callers (`recv_response`,
+`recv_transport`) were updated and their stack `pkts`/`ka` temporaries removed.
+Heap-neutral, no task-stack bump.
+
+### Live serial evidence (single clean boot, no crash, ~56 s window)
+```
+tm_runtime: Runtime::join() - DERP connect -> region 11 (sao) host=derp11e.tailscale.com port=443 for peer lenovopill
+tm_derp: DerpActor: DERP handshake complete with derp11e.tailscale.com   (24581 ms)
+tm_runtime: WgEvent::OutboundPacket 148 bytes -> DERP peer 0e63..        (148-byte WG inits)
+tm_derp: DerpActor: RecvPacket 92 bytes from 0e63..                      (29022 ms, peer's WG response)
+tm_runtime: Runtime::join() - WgEvent::PeerHandshook with peer 0e63..    (31692 ms)  <-- RUNG 5
+```
+No `aead::Error`, no `Guru Meditation`, no reboot (1 boot in the whole log); the
+device kept running and emitting outbound WG packets through ~53 s until the
+Wokwi session was closed by the harness timeout. The ~2.7 s between the first
+92-byte response and `PeerHandshook` is exactly the guard at work: responses to
+rotated-out initiations are dropped until one answers the current initiation,
+which completes. `0e63..` is the online peer `lenovopill` (region 11).
+
+Rung 6 (inbound transport round-trip) was NOT reached in this window: no
+`WgEvent::InboundDecrypted` was observed. Landing rung 5 cleanly is the honest
+outcome here; rung 6 additionally needs the peer to send transport data toward
+us and `tm_netstack`'s lwIP inbound injection (still a stub) to deliver it.
