@@ -1363,3 +1363,80 @@ availability issue, not a firmware fault. Observing rung 6a end-to-end needs an
 **online** Tailscale peer on this tailnet at the time the board registers (the
 control path uses a non-streaming MapRequest, so the peer should be up before
 boot to appear online in the snapshot).
+
+## Card t_e34afeed v1: online-only netmap + streaming-poll drain-and-discard (2026-09-17)
+
+### Symptom (live, real HW)
+With lenovopill (100.69.230.65) and bospill (100.85.218.10) confirmed online
+on the tailnet, the board's netmap still didn't contain them: `tailscale
+status` showed both up, but the board's parsed snapshot listed stale offline
+peers instead. Root causes (both confirmed against `tools/wg_validator/`):
+
+1. `map_serde::parse::<8, 4>` (map_serde.rs:108-134) stored the first 8 peers
+   as they appeared in the server's `Peers` array, regardless of `Online`.
+   The live tailnet has 12+ peers; the online ones didn't happen to be in the
+   first 8, so they were dropped.
+2. The streaming keepalive poll (`Stream:true`, MAP_STREAM_ID) desyncs its
+   4-byte-LE length-prefix framing (`implausible message length 1953722184`,
+   which is ASCII `"Host"` read as a little-endian u32) and the old code
+   bailed with `return Ok(())`, orphaning the stream. Per
+   `tools/wg_validator/ts_control.py`'s `start_keepalive_poll` docstring, the
+   control server keeps a node marked online only while it keeps draining
+   this stream; bailing likely made the board look offline to peers, so they
+   wouldn't answer its WireGuard handshake even against an online peer.
+
+### Python-first confirmation
+`tools/wg_validator/validate_live_tailnet.py` (which already filters
+`p.online` off the non-streaming write_map response) ran live against
+`.env.aj2004`'s tailnet and printed:
+
+```
+[PASS] MapResponse parsed: our_ip=100.119.119.118, 12 peers, 3 online (non-self)
+        online: lenovopill(derp11), alanjds-s25(derp11), bospill(derp11)
+```
+
+confirming (a) the non-streaming publish response carries per-peer
+`Online=true` for the live online peers, and (b) the board's existing
+`PeerR.online` field (serde `rename = "Online"`) is the right thing to filter
+on — the field is already parsed correctly, just not used to filter.
+
+### Fix 1 — online-only netmap (`tm_control/src/map_serde.rs`)
+`parse()`'s peer loop now skips any peer with `Online != true` before the
+existing `key`/`address` extraction, so the fixed-size `ArrayVec<_, MAX_PEERS>`
+only ever holds reachable peers. An offline peer can't answer a WG handshake,
+so it was dead weight that pushed out live peers under the MAX_PEERS=8 cap.
+When a peer comes online later the streaming poll (or a future re-publish)
+re-delivers its full record. An empty peer set when nobody is online is
+correct behavior, not a bug. This also reduces steady-state peer storage
+(~140 B/peer) since most tailnets have far fewer online peers than MAX_PEERS.
+New unit test `map_serde::tests::only_online_peers_are_kept` pins this against
+a 3-peer fixture (offline, online, and `Online` field absent).
+
+### Fix 2 — streaming poll drain-and-discard (`tm_control/src/lib.rs`)
+`stream_map_response` now takes note of which caller it's serving
+(`let streaming = expected_stream == MAP_STREAM_ID;`) so it can tell the
+one-shot non-streaming publish (MAP_PUBLISH_STREAM_ID, must still parse the
+snapshot and return at `end_stream`) apart from the long-lived streaming
+keepalive poll. On the length-prefix desync (`mlen > MAX_MAP_MSG`):
+
+- non-streaming (publish): unchanged, still bails with `Ok(())` (this path
+  isn't the one that desyncs in practice, and the snapshot must be trusted).
+- streaming (poll): instead of returning, sets a `discarding` flag and keeps
+  looping forever, reading H2 DATA frames, sending the proactive
+  WINDOW_UPDATEs (already unconditional), and throwing away every payload
+  byte without attempting to re-interpret it as a length prefix or body (once
+  desynced, no later byte can be trusted as a frame boundary either). This
+  keeps the HTTP/2 stream alive and drained from the server's point of view,
+  which per ts_control.py is what keeps the node marked online, without
+  reintroducing the ~2 GB `with_capacity` OOM the original cap guarded
+  against. `end_stream` is still honored (returns `Ok(())`) whether or not
+  discarding, since a real stream close from the server needs no more
+  draining. v2 (actually parsing the streaming deltas so a peer that comes
+  online after registration is picked up without a reflash) is out of scope
+  for v1; see the card (t_e34afeed) comment for the staged plan.
+
+### Tests
+`cargo test -p tm_control` (25 -> passes incl. new test) and
+`cargo test -p tm_wg` (23, unchanged) both green; no regression to the
+publish-response path or heap budget (online-only filtering can only shrink
+peer storage, never grow it).
