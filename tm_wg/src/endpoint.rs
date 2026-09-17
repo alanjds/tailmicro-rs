@@ -39,8 +39,26 @@ pub const MAX_PEERS: usize = 8;
 const QUEUE_DEPTH: usize = 2;
 /// Session-id map capacity: 3 keypairs/peer (current/previous/next).
 const SESSION_MAP_CAP: usize = 3 * MAX_PEERS;
-/// Max packets a single recv/dispatch call can emit toward one peer.
-const OUT_CAP: usize = QUEUE_DEPTH + 2;
+/// Max packets a single `recv_one` call emits (in `RecvOut::to_peer` /
+/// `decrypted`). `RecvOut` embeds two `ArrayVec<Packet, OUT_CAP>` of inline
+/// ~1516-byte packet buffers, so its size is `2 * OUT_CAP * ~1516`. On real
+/// ESP32-C3 hardware the DERP TLS session + live netmap fragment the heap down
+/// to an ~8 KB largest free block, so a per-inbound `Box<RecvOut>` MUST stay
+/// under that: `OUT_CAP = 2` -> ~6 KB (fits); the old `QUEUE_DEPTH + 2 = 4` ->
+/// ~12 KB failed to allocate (`memory allocation of 12100 bytes failed` ->
+/// abort/reboot before `PeerHandshook`). Our flows emit at most 1-2 packets per
+/// recv (handshake response/confirmation, one decrypted reply); a rare
+/// queue-flush + keepalive overflow is dropped by `try_push`. See
+/// docs/wg-dataplane-notes.md.
+const OUT_CAP: usize = 2;
+/// Max packets one `dispatch` call returns. `dispatch`'s output is
+/// `Box`-allocated every 100 ms tick by `on_tick`, and `Box::new` allocates the
+/// full `ArrayVec<(PeerId, Packet), DISPATCH_CAP>` (~`DISPATCH_CAP * 1520` B)
+/// regardless of how many entries are used — so this, like `OUT_CAP`, must stay
+/// under the ~8 KB fragmented-heap block. `DISPATCH_CAP = 4` -> ~6 KB (the old
+/// `MAX_PEERS = 8` -> ~12 KB also failed post-TLS). Peers whose timers are still
+/// due when the buffer fills are serviced on the next tick.
+const DISPATCH_CAP: usize = 4;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -682,8 +700,8 @@ impl WgEndpoint {
         &mut self,
         now: Instant,
         now_unix: Option<u64>,
-    ) -> ArrayVec<(PeerId, Packet), MAX_PEERS> {
-        let mut out: ArrayVec<(PeerId, Packet), MAX_PEERS> = ArrayVec::new();
+    ) -> ArrayVec<(PeerId, Packet), DISPATCH_CAP> {
+        let mut out: ArrayVec<(PeerId, Packet), DISPATCH_CAP> = ArrayVec::new();
 
         // Collect peers whose handshake timed out (need a retry), capturing the
         // stale handshake's session id BEFORE clearing it. The free itself must
@@ -695,8 +713,17 @@ impl WgEndpoint {
         // answering that stale init still matched `peer_for_session`, routed to
         // the peer, and was fed to `finish()` against the CURRENT (rotated)
         // ephemeral -> wrong ee/se DH -> the live `aead::Error`.
-        let mut retry: ArrayVec<(PeerId, Option<SessionId>), MAX_PEERS> = ArrayVec::new();
+        let mut retry: ArrayVec<(PeerId, Option<SessionId>), DISPATCH_CAP> = ArrayVec::new();
         for peer in self.peers.iter_mut() {
+            // Stop collecting once either buffer is full; peers whose timers are
+            // still due are picked up on the next tick (100 ms later). This
+            // bounds the returned buffer to DISPATCH_CAP so `on_tick` never boxes
+            // a MAX_PEERS-sized (~12 KB) allocation the post-DERP-TLS heap (~8 KB
+            // largest block on real hardware) cannot satisfy. Timers are left
+            // untouched for peers we skip, so nothing is lost.
+            if out.is_full() || retry.is_full() {
+                break;
+            }
             if let Some(t) = peer.handshake_timeout
                 && t <= now
             {
@@ -709,6 +736,7 @@ impl WgEndpoint {
             }
             if let Some(t) = peer.keepalive_at
                 && t <= now
+                && !out.is_full()
             {
                 peer.keepalive_at = None;
                 if let Some(pkt) = peer.session.encrypt_keepalive(now) {
