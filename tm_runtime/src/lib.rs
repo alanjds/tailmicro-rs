@@ -189,7 +189,18 @@ async fn event_router_task(
                 match evt {
                     Ok(evt) => match evt {
                         ControlEvent::MapUpdate(map) => {
-                            info!("Runtime::join() - received ControlEvent::MapUpdate");
+                            // Rung-3 evidence: MapResponse parsed, peers + DERPMap seen.
+                            info!("Runtime::join() - MapUpdate: {} peers, {} DERP regions, our_ip={}.{}.{}.{}",
+                                map.peers.len(), map.derp_regions.len(),
+                                map.our_ip.0[0], map.our_ip.0[1], map.our_ip.0[2], map.our_ip.0[3]);
+                            for r in map.derp_regions.iter() {
+                                info!("Runtime::join()   DERP region {} ({}) host={}", r.region_id, r.region_code.as_str(), r.host.as_str());
+                            }
+                            for p in map.peers.iter() {
+                                info!("Runtime::join()   peer {} derp_region={} online={} ip={}.{}.{}.{}",
+                                    p.hostname.as_str(), p.derp_region, p.is_online,
+                                    p.tailnet_ip.0[0], p.tailnet_ip.0[1], p.tailnet_ip.0[2], p.tailnet_ip.0[3]);
+                            }
                             let _ = wg_tx2.send(WgCmd::ApplyMap(map)).await;
                         }
                         ControlEvent::OurIpAssigned(ip) => {

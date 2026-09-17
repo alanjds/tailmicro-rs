@@ -12,20 +12,19 @@
 //! avoids per-task heap allocations, keeping the total memory footprint
 //! reasonable.
 pub mod noise;
-pub mod map_parser;
+pub mod map_serde;
 pub mod pin;
 mod io;
 
 use arrayvec::ArrayVec;
 use serde::{Deserialize, Serialize};
-use log::info;
+use log::{debug, info};
 use tm_h2::{
     FrameAction, FrameHeader, H2Error, H2State, MAX_FRAME_SIZE,
     write_settings, write_settings_ack, write_window_update,
     write_ping_ack, write_map_request_headers, CLIENT_PREFACE,
 };
 use tm_keys::NodeState;
-use map_parser::MapParser;
 use noise::{NoiseChannel, do_noise_handshake};
 pub use io::IoStream;
 
@@ -89,6 +88,11 @@ pub const CAPABILITY_VERSION: u16 = 72;
 const REGISTER_STREAM_ID: u32 = 1;
 const MAP_PUBLISH_STREAM_ID: u32 = 3;
 const MAP_STREAM_ID: u32 = 5;
+/// Upper bound on a single length-prefixed MapResponse message. The real
+/// non-streaming netmap for this device is tens of KB; a value larger than
+/// this means the stream is desynced (seen live: a ~1.95 GB garbage prefix on
+/// the Stream=true keepalive), so we bail rather than reserve_exact/OOM-abort.
+const MAX_MAP_MSG: usize = 512 * 1024;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -320,15 +324,16 @@ impl ControlActor {
             let publish_req = build_h2_post("/machine/map", host, MAP_PUBLISH_STREAM_ID, &publish_body);
             noise.write_all(&mut main_conn, &publish_req).await?;
         }
-        {
-            // Drain the publish response fully (a full MapResponse body,
-            // same 4-byte-LE-length-prefixed shape the streaming poll uses
-            // per ts_control.py::write_map). We don't need its content here
-            // - the streaming poll immediately below delivers a fresh full
-            // snapshot - only that the request round-tripped.
-            let publish_resp = read_one_h2_body(&mut main_conn, &mut noise, &mut h2, MAP_PUBLISH_STREAM_ID).await?;
-            info!("Tailscale Step 7.5: publish MapRequest response received, {} bytes", publish_resp.len());
-        }
+        // Parse the publish response as the authoritative netmap. The
+        // NON-streaming ("write") MapRequest returns a full MapResponse whose
+        // body carries our IP, the peer list and the DERPMap - this is the
+        // response `tools/wg_validator/ts_control.py::write_map` parses its
+        // peers from. (The later Stream=true poll is a read-only keepalive that
+        // returns an ~empty delta, so peers/DERPMap must come from here.) It is
+        // a raw JSON body with an END_STREAM, so stream_map_response parses it
+        // and returns at end_stream, emitting MapUpdate + OurIpAssigned.
+        info!("Tailscale Step 7.5: reading + parsing publish MapResponse");
+        self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_PUBLISH_STREAM_ID).await?;
 
         // Step 8 & 9: streaming MapRequest + streaming response
         {
@@ -342,24 +347,40 @@ impl ControlActor {
             noise.write_all(&mut main_conn, &map_req).await?;
         }
 
-        self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events).await
+        self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_STREAM_ID).await
     }
 
     async fn stream_map_response<S: IoStream>(
         &self, stream: &mut S, noise: &mut NoiseChannel,
         h2: &mut H2State, events: &async_channel::Sender<ControlEvent>,
+        expected_stream: u32,
     ) -> Result<(), ControlError> {
-        info!("Tailscale stream_map_response starting");
-        // Vec, not heapless::Vec: this local is live across every await in the
-        // loop below, and this whole call chain (connect_and_poll ->
-        // stream_map_response) is awaited inline with no spawn/Box::pin
-        // boundary, so a heapless (stack-inline) buffer here folds straight
-        // into the caller's combined async state machine. On the ESP32-C3's
-        // 16000-byte main task stack that overflows (confirmed live via a
-        // Guru Meditation: Stack protection fault in Wokwi); Vec keeps this
-        // 4105-byte scratch space on the heap instead.
+        info!("Tailscale stream_map_response starting on stream {}", expected_stream);
+        // Heap (Vec) not stack: this whole call chain is awaited inline with no
+        // spawn/Box::pin boundary, so a stack-inline buffer folds into the
+        // caller's combined async state machine and overflows the 16 KB main
+        // task stack (confirmed via a live Guru Meditation stack fault).
         let mut frame_buf: Vec<u8> = Vec::new();
-        let mut parser: MapParser<8, 4> = MapParser::new();
+        // Both the non-streaming publish and the streaming poll frame each
+        // MapResponse as a 4-byte-LE length prefix + JSON (per
+        // tools/wg_validator/ts_control.py's read_full_body/read_stream_message
+        // + write_map), which map_serde then parses. (The hand-rolled map_parser
+        // mis-parsed the real server response and was removed; see map_serde.)
+        //
+        // Message reassembly state. Each MapResponse is `u32-LE length + JSON`.
+        // We collect the 4-byte prefix first, then allocate the body buffer
+        // exactly once at `mlen` via a FALLIBLE reserve and append body bytes
+        // straight into it (appends never realloc, so peak transient == mlen).
+        // The reserve is fallible so an over-budget map (the live map is ~40 KB
+        // and, on a heap fragmented by the Noise handshake + actor tasks, may
+        // not have a contiguous block that big — see the notes) is handled by a
+        // graceful bail instead of an OOM abort/reboot-loop. NB: this only
+        // guards OUR allocation; the map still needs to fit the live heap budget
+        // to be delivered (rung 3). See docs/wg-dataplane-notes.md.
+        let mut msg_body: Vec<u8> = Vec::new();
+        let mut prefix = [0u8; 4];
+        let mut prefix_have = 0usize;
+        let mut cur_len: Option<usize> = None;
         let mut our_ip_sent = false;
 
         loop {
@@ -373,42 +394,89 @@ impl ControlActor {
             let blen = hdr.length as usize;
             frame_buf.resize(blen, 0);
             noise.read_exact(stream, &mut frame_buf[..blen]).await?;
-            info!("Tailscale frame received: length={}, type={}", hdr.length, hdr.frame_type);
+            debug!("Tailscale frame received: length={}, type={}", hdr.length, hdr.frame_type);
 
-            match tm_h2::parse_frame(&hdr, &frame_buf[..blen], MAP_STREAM_ID, h2)? {
+            match tm_h2::parse_frame(&hdr, &frame_buf[..blen], expected_stream, h2)? {
                 FrameAction::Data { payload, end_stream } => {
-                    info!("Tailscale Data frame: payload_len={}, end_stream={}", payload.len(), end_stream);
-                    let done = parser.feed(payload).map_err(ControlError::Json)?;
-                    info!("Tailscale parser.feed done={}", done);
+                    debug!("Tailscale Data frame: payload_len={}, end_stream={}", payload.len(), end_stream);
 
-                    // Proactive WINDOW_UPDATE (MicroLink technique)
+                    // Proactive WINDOW_UPDATE (MicroLink technique). Stream-level
+                    // update must target the stream the data arrived on.
                     let (cwu, swu) = h2.consumed(payload.len() as u32);
                     if cwu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,0,cwu); noise.write_all(stream,&b).await?; }
-                    // Stream-level WINDOW_UPDATE must target the stream the
-                    // data actually arrived on, not a hardcoded 1 - this was
-                    // fine when the map poll was (incorrectly) the only
-                    // stream ever read, but breaks now that /machine/map
-                    // correctly runs on stream 3 (see parse_frame's
-                    // expected_stream fix). See docs/noise-handshake-wire-format.md.
-                    if swu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,MAP_STREAM_ID,swu); noise.write_all(stream,&b).await?; }
+                    if swu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,expected_stream,swu); noise.write_all(stream,&b).await?; }
 
-                    if done || end_stream {
-                        info!("Tailscale parser.finish called, our_ip_sent={}", our_ip_sent);
-                        parser.finish();
-                        if !our_ip_sent && parser.out.our_ip.0 != [0u8;4] {
-                            our_ip_sent = true;
-                            info!("Tailscale OurIpAssigned event sent: {}.{}.{}.{}", parser.out.our_ip.0[0], parser.out.our_ip.0[1], parser.out.our_ip.0[2], parser.out.our_ip.0[3]);
-                            let _ = events.send(ControlEvent::OurIpAssigned(parser.out.our_ip.clone())).await;
-                        } else if our_ip_sent {
-                            info!("Tailscale IP already sent");
-                        } else {
-                            info!("Tailscale IP not assigned yet: {}.{}.{}.{}", parser.out.our_ip.0[0], parser.out.our_ip.0[1], parser.out.our_ip.0[2], parser.out.our_ip.0[3]);
+                    // Feed the payload through the prefix -> body state machine.
+                    // A single frame may finish one message and begin the next
+                    // (streaming poll), so drive it with a cursor.
+                    let mut pos = 0usize;
+                    while pos < payload.len() {
+                        // Phase 1: collect the 4-byte LE length prefix.
+                        if cur_len.is_none() {
+                            while prefix_have < 4 && pos < payload.len() {
+                                prefix[prefix_have] = payload[pos];
+                                prefix_have += 1; pos += 1;
+                            }
+                            if prefix_have < 4 { break; }
+                            let mlen = u32::from_le_bytes(prefix) as usize;
+                            // Sanity cap: a desynced stream reads a garbage length
+                            // (seen live as ~1.95 GB on the Stream=true keepalive)
+                            // that would OOM-abort with_capacity. Bail gracefully;
+                            // the netmap already came from the publish response.
+                            if mlen > MAX_MAP_MSG {
+                                info!("Tailscale stream_map_response: implausible message length {} on stream {}, ending", mlen, expected_stream);
+                                return Ok(());
+                            }
+                            // One exact, FALLIBLE allocation for the whole body;
+                            // the appends below never realloc, so peak transient
+                            // == mlen. try_reserve_exact turns an over-budget map
+                            // into a graceful bail instead of an OOM abort.
+                            msg_body = Vec::new();
+                            if msg_body.try_reserve_exact(mlen).is_err() {
+                                info!("Tailscale stream_map_response: cannot allocate {} B for map body on stream {} (heap budget), ending", mlen, expected_stream);
+                                return Ok(());
+                            }
+                            cur_len = Some(mlen);
                         }
-                        let old = core::mem::replace(&mut parser, MapParser::new());
-                        info!("Tailscale MapUpdate event sent");
-                        let _ = events.send(ControlEvent::MapUpdate(Box::new(old.out))).await;
-                        if end_stream { info!("Tailscale stream ended"); return Ok(()); }
+
+                        // Phase 2: append body bytes up to the known length.
+                        let want = cur_len.unwrap();
+                        let take = core::cmp::min(want - msg_body.len(), payload.len() - pos);
+                        msg_body.extend_from_slice(&payload[pos..pos + take]);
+                        pos += take;
+                        if msg_body.len() < want { break; }
+
+                        // Complete message: parse + emit, then reset for the next.
+                        match map_serde::parse::<8, 4>(&msg_body) {
+                            Ok(map) => {
+                                if !our_ip_sent && map.our_ip.0 != [0u8; 4] {
+                                    our_ip_sent = true;
+                                    info!("Tailscale OurIpAssigned event sent: {}.{}.{}.{}", map.our_ip.0[0], map.our_ip.0[1], map.our_ip.0[2], map.our_ip.0[3]);
+                                    let _ = events.send(ControlEvent::OurIpAssigned(map.our_ip.clone())).await;
+                                }
+                                // Skip empty snapshots (the keepalive poll returns
+                                // near-empty deltas that would clobber the netmap
+                                // the publish response already delivered).
+                                let non_empty = !map.peers.is_empty()
+                                    || map.our_ip.0 != [0u8; 4]
+                                    || !map.derp_regions.is_empty();
+                                if non_empty {
+                                    info!("Tailscale MapUpdate event sent ({} peers, {} DERP regions)", map.peers.len(), map.derp_regions.len());
+                                    let _ = events.send(ControlEvent::MapUpdate(Box::new(map))).await;
+                                } else {
+                                    info!("Tailscale MapUpdate skipped (empty snapshot)");
+                                }
+                            }
+                            Err(e) => { info!("Tailscale map_serde parse error: {:?}", e); }
+                        }
+                        // Free the body before reading the next message so two
+                        // message buffers never coexist.
+                        msg_body = Vec::new();
+                        cur_len = None;
+                        prefix_have = 0;
                     }
+
+                    if end_stream { info!("Tailscale stream ended"); return Ok(()); }
                 }
                 FrameAction::SendSettingsAck => {
                     let mut a=[0u8;9]; write_settings_ack(&mut a); noise.write_all(stream,&a).await?;
@@ -487,15 +555,26 @@ async fn read_one_h2_body<S: IoStream>(
     let mut fb: Vec<u8> = Vec::new();
     loop {
         let mut hb = [0u8; 9];
+        debug!("read_one_h2_body[{}]: awaiting frame header (body so far {} B)", expected_stream, body.len());
         noise.read_exact(stream, &mut hb).await?;
         let hdr = FrameHeader::from_bytes(&hb);
+        debug!("read_one_h2_body[{}]: frame type={} flags={} stream={} len={}", expected_stream, hdr.frame_type, hdr.flags, hdr.stream_id, hdr.length);
         if hdr.length > MAX_FRAME_SIZE { return Err(ControlError::H2(H2Error::FrameTooLarge(hdr.length))); }
         let blen = hdr.length as usize;
         fb.resize(blen, 0);
         noise.read_exact(stream, &mut fb[..blen]).await?;
         match tm_h2::parse_frame(&hdr, &fb[..blen], expected_stream, h2)? {
             FrameAction::Data { payload, end_stream } => {
-                for b in payload { let _ = body.push(*b); }
+                // try_push, NOT push: arrayvec::push PANICS on overflow. The
+                // register response fits in 4096 B, but the Step 7.5 publish
+                // MapResponse is ~29 KB (live-measured) and its body is
+                // intentionally discarded by the caller (only the round-trip /
+                // END_STREAM matters), so silently dropping the overflow is
+                // correct. Before the WINDOW_UPDATE fix above the server
+                // stalled at 4096 B so this buffer never overflowed and the
+                // panic was masked as a hang.
+                for b in payload { let _ = body.try_push(*b); }
+                debug!("read_one_h2_body[{}]: DATA payload={} end_stream={}", expected_stream, payload.len(), end_stream);
                 // Flow control: without this, any response body over one
                 // stream window (tm_h2::INITIAL_WINDOW = 4096) stalls forever.
                 // The register response fits in one window so it never needed
@@ -504,14 +583,14 @@ async fn read_one_h2_body<S: IoStream>(
                 // does. Stream-level update must target `expected_stream`
                 // (this drains stream 1 for register, 3 for the publish).
                 let (cwu, swu) = h2.consumed(payload.len() as u32);
-                if cwu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,0,cwu); noise.write_all(stream,&b).await?; }
-                if swu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,expected_stream,swu); noise.write_all(stream,&b).await?; }
-                if end_stream { return Ok(body); }
+                if cwu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,0,cwu); noise.write_all(stream,&b).await?; debug!("read_one_h2_body[{}]: sent conn WINDOW_UPDATE +{}", expected_stream, cwu); }
+                if swu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,expected_stream,swu); noise.write_all(stream,&b).await?; debug!("read_one_h2_body[{}]: sent stream WINDOW_UPDATE +{}", expected_stream, swu); }
+                if end_stream { info!("read_one_h2_body[{}]: END_STREAM, total {} B", expected_stream, body.len()); return Ok(body); }
             }
-            FrameAction::SendSettingsAck => { let mut a=[0u8;9]; write_settings_ack(&mut a); noise.write_all(stream,&a).await?; }
-            FrameAction::SendPingAck(p) => { let mut a=[0u8;17]; write_ping_ack(&mut a,&p); noise.write_all(stream,&a).await?; }
-            FrameAction::GoAway => return Err(ControlError::H2(H2Error::GoAway{last_stream:0,error_code:0})),
-            FrameAction::Ignore => {}
+            FrameAction::SendSettingsAck => { debug!("read_one_h2_body[{}]: SETTINGS -> ack", expected_stream); let mut a=[0u8;9]; write_settings_ack(&mut a); noise.write_all(stream,&a).await?; }
+            FrameAction::SendPingAck(p) => { debug!("read_one_h2_body[{}]: PING -> ack", expected_stream); let mut a=[0u8;17]; write_ping_ack(&mut a,&p); noise.write_all(stream,&a).await?; }
+            FrameAction::GoAway => { info!("read_one_h2_body[{}]: GOAWAY", expected_stream); return Err(ControlError::H2(H2Error::GoAway{last_stream:0,error_code:0})); }
+            FrameAction::Ignore => { debug!("read_one_h2_body[{}]: Ignore (type={})", expected_stream, hdr.frame_type); }
         }
     }
 }

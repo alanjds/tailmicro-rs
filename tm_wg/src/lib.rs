@@ -75,7 +75,20 @@ pub struct WgActor {
     // 32 KB main-task stack, hitting a Guru Meditation stack-protection fault
     // in Runtime::join. Boxing the endpoint keeps only an 8-byte pointer in
     // the future. See docs/wg-dataplane-notes.md.
-    endpoint: Box<WgEndpoint>,
+    //
+    // LAZY (`Option`): the ~28 KB endpoint is not allocated at construction but
+    // on first use (the first `ApplyMap`/inbound packet). Runtime::join builds
+    // all actors up front, so an eager endpoint took ~28 KB out of the heap
+    // BEFORE the control plane even connected — dropping the largest contiguous
+    // block to ~69 KB, too small to also buffer the live ~40 KB netmap during
+    // the control read (confirmed live: a concurrent "12100 bytes failed" OOM
+    // abort while our map buffer held the last big block). Deferring the
+    // allocation until `apply_map` — which runs only AFTER the control plane
+    // has parsed the netmap and freed its buffer — keeps that ~28 KB free
+    // exactly when the map read needs it. See docs/wg-dataplane-notes.md.
+    endpoint: Option<Box<WgEndpoint>>,
+    /// Node keypair, retained so the endpoint can be built lazily on first use.
+    kp: NodeKeyPair,
     /// Never-evicted peer (MicroLink: priority_peer). Retained for API
     /// compatibility; the fixed `MAX_PEERS` table currently rejects overflow
     /// rather than LRU-evicting.
@@ -83,16 +96,26 @@ pub struct WgActor {
 }
 
 impl WgActor {
-    /// Create the actor from the node's WireGuard (node) private key.
+    /// Create the actor from the node's WireGuard (node) private key. The
+    /// heavy `WgEndpoint` is allocated lazily (see `endpoint`), not here.
     pub fn new(node_priv: [u8; 32], priority_peer: Option<[u8; 32]>) -> Self {
         let kp = NodeKeyPair::from_private(NodePrivateKey(node_priv));
         Self {
-            // `new_boxed` builds+boxes in its own #[inline(never)] frame;
-            // see its doc comment for why `Box::new(WgEndpoint::new(..))`
-            // inline here was still overflowing the main-task stack.
-            endpoint: WgEndpoint::new_boxed(kp),
+            endpoint: None,
+            kp,
             priority_peer,
         }
+    }
+
+    /// Get the endpoint, allocating (and boxing) it on first use. `new_boxed`
+    /// builds+boxes in its own `#[inline(never)]` frame to keep the ~28 KB off
+    /// this caller's stack.
+    fn endpoint(&mut self) -> &mut WgEndpoint {
+        if self.endpoint.is_none() {
+            tracing::info!("WgActor: allocating WgEndpoint (~28 KB) on first use");
+            self.endpoint = Some(WgEndpoint::new_boxed(self.kp));
+        }
+        self.endpoint.as_mut().unwrap()
     }
 
     pub async fn run(
@@ -128,12 +151,17 @@ impl WgActor {
     }
 
     async fn apply_map(&mut self, map: &MapState<MAX_PEERS, 4>, events: &async_channel::Sender<WgEvent>) {
+        // Materialize the endpoint now (first ApplyMap). This is the ~28 KB
+        // allocation deferred from construction; it runs only after the control
+        // plane has already parsed and freed its netmap buffer.
+        self.endpoint();
+
         // Remove peers no longer present.
         let mut to_remove: heapless::Vec<PeerId, MAX_PEERS> = heapless::Vec::new();
         for i in 0..MAX_PEERS {
             // Walk current peers by re-querying; collect ids absent from map.
             if let Some(id) = self.endpoint_peer_ids().get(i).copied() {
-                let key = self.endpoint.peer_key(id).map(|k| k.to_bytes());
+                let key = self.endpoint().peer_key(id).map(|k| k.to_bytes());
                 if let Some(key) = key {
                     if !map.peers.iter().any(|p| p.node_key == key) {
                         let _ = to_remove.push(id);
@@ -142,12 +170,12 @@ impl WgActor {
             }
         }
         for id in to_remove {
-            self.endpoint.remove_peer(id);
+            self.endpoint().remove_peer(id);
         }
 
         // Add new peers and proactively initiate a handshake to each.
         for peer in &map.peers {
-            if self.endpoint.peer_id_by_key(&peer.node_key).is_some() {
+            if self.endpoint().peer_id_by_key(&peer.node_key).is_some() {
                 continue;
             }
             let cfg = PeerConfig {
@@ -156,9 +184,9 @@ impl WgActor {
                 psk: Psk::zero(),
             };
             let ep = Self::endpoint_for(peer);
-            if let Some(id) = self.endpoint.add_peer(cfg, ep) {
+            if let Some(id) = self.endpoint().add_peer(cfg, ep) {
                 let now = Instant::now();
-                if let Some(pkt) = self.endpoint.initiate(id, now, now_unix()) {
+                if let Some(pkt) = self.endpoint().initiate(id, now, now_unix()) {
                     self.emit_to_peer(id, pkt, events).await;
                 }
             } else {
@@ -171,9 +199,12 @@ impl WgActor {
         // Reconstruct ids by scanning known node keys via public accessors.
         // (Kept simple; the endpoint owns the authoritative table.)
         let mut ids: heapless::Vec<PeerId, MAX_PEERS> = heapless::Vec::new();
+        let Some(endpoint) = self.endpoint.as_deref() else {
+            return ids; // no endpoint yet -> no peers
+        };
         for id in 1..=(MAX_PEERS as u32 * 4) {
             let pid = PeerId(id);
-            if self.endpoint.peer_key(pid).is_some() {
+            if endpoint.peer_key(pid).is_some() {
                 let _ = ids.push(pid);
             }
             if ids.is_full() {
@@ -207,17 +238,23 @@ impl WgActor {
         // captured argument and a moved-out local) plus a multi-KB consuming
         // iterator, ~33 KB on the stack. Boxed, only an 8-byte pointer lives
         // in the future.
-        let out = Box::new(self.endpoint.recv_one(payload, from, Instant::now()));
+        let out = Box::new(self.endpoint().recv_one(payload, from, Instant::now()));
         self.drain_recv(src_key, out, events).await;
     }
 
     async fn on_tick(&mut self, events: &async_channel::Sender<WgEvent>) {
+        // No endpoint yet means no peers/sessions, so nothing to dispatch — and
+        // we must NOT allocate the ~28 KB endpoint just to service a timer tick
+        // (that would defeat the lazy allocation). Skip until it exists.
+        if self.endpoint.is_none() {
+            return;
+        }
         let now = Instant::now();
         // next_event is advisory; we always tick, and only act on due timers.
         // Box the dispatch output (ArrayVec of (PeerId, Packet), ~12 KB) so it
         // does not live as an owning iterator on the stack across the
         // emit_to_peer awaits; iterate by reference and clone each packet.
-        let outbound = Box::new(self.endpoint.dispatch(now, now_unix()));
+        let outbound = Box::new(self.endpoint().dispatch(now, now_unix()));
         for (id, pkt) in outbound.iter() {
             self.emit_to_peer(*id, pkt.clone(), events).await;
         }
@@ -226,7 +263,7 @@ impl WgActor {
     async fn drain_recv(&self, src_key: [u8; 32], out: Box<RecvOut>, events: &async_channel::Sender<WgEvent>) {
         let dst_key = out
             .peer
-            .and_then(|id| self.endpoint.peer_key(id))
+            .and_then(|id| self.endpoint.as_deref().and_then(|ep| ep.peer_key(id)))
             .map(|k| k.to_bytes())
             .unwrap_or(src_key);
 
@@ -254,7 +291,7 @@ impl WgActor {
     }
 
     async fn emit_to_peer(&self, id: PeerId, pkt: Packet, events: &async_channel::Sender<WgEvent>) {
-        if let Some(key) = self.endpoint.peer_key(id) {
+        if let Some(key) = self.endpoint.as_deref().and_then(|ep| ep.peer_key(id)) {
             let _ = events
                 .send(WgEvent::OutboundPacket {
                     dst_key: key.to_bytes(),
