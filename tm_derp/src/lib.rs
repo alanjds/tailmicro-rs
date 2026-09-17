@@ -16,9 +16,30 @@
 //! * `IoStream` trait for platform-independent I/O.
 //! * Strongly-typed message enums.
 
-use arrayvec::ArrayVec;
 use tm_keys::NodePublicKey;
 use async_channel;
+
+/// Task-5 heap probe: log total-free and largest-contiguous internal heap,
+/// tagged, so the RAM delta straddling `DerpTls::connect` is measurable from
+/// the serial log. Device-only (esp-idf-sys); a no-op elsewhere.
+#[cfg(feature = "etls")]
+#[inline(never)]
+fn heap_probe(tag: &str) {
+    #[cfg(target_os = "espidf")]
+    unsafe {
+        let total_free = esp_idf_sys::esp_get_free_heap_size();
+        let largest_internal =
+            esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL);
+        tracing::info!(
+            "DerpActor heap [{}]: total_free={} bytes, largest_internal_block={} bytes",
+            tag,
+            total_free,
+            largest_internal
+        );
+    }
+    #[cfg(not(target_os = "espidf"))]
+    tracing::info!("DerpActor heap [{}]: (host build; probe is device-only)", tag);
+}
 
 // ── DERP frame types (from Tailscale DERP spec) ───────────────────────────────
 
@@ -167,11 +188,14 @@ pub enum DerpError {
 
 pub struct DerpActor {
     our_key: NodePublicKey,
+    /// Node Curve25519 private key. Paired with `our_key` for the DERP
+    /// ServerKey/ClientInfo/ServerInfo NaCl `crypto_box` handshake.
+    node_priv: [u8; 32],
 }
 
 impl DerpActor {
-    pub fn new(our_key: NodePublicKey) -> Self {
-        Self { our_key }
+    pub fn new(our_key: NodePublicKey, node_priv: [u8; 32]) -> Self {
+        Self { our_key, node_priv }
     }
 
     pub async fn run(
@@ -193,43 +217,143 @@ impl DerpActor {
         }
     }
 
+    /// Real DERP connection over embedded-tls (feature `etls`).
+    ///
+    /// Dials plain TCP via tokio, wraps it in the embedded-io adapter, runs the
+    /// TLS 1.3 + DERP handshake ([`tls::DerpTls::connect`]), then services the
+    /// send/receive loop. The loop uses `tokio::select!` only to *decide* what
+    /// happened (a command arrived, or a frame was read); every `&mut tls`
+    /// action runs afterwards, outside the `select!`, so the two paths never
+    /// need `tls` simultaneously. The receive branch uses the resumable
+    /// [`tls::DerpTls::read_frame_buffered`], which survives being dropped when
+    /// the command branch wins — no partial-frame loss, no framing desync.
+    #[cfg(feature = "etls")]
     async fn run_connection(
         &self,
         host:             &str,
         port:             u16,
-        fingerprint:      Option<[u8; 32]>,
+        _fingerprint:     Option<[u8; 32]>,
         cmds:             &mut async_channel::Receiver<DerpCmd>,
         events:           &async_channel::Sender<DerpEvent>,
     ) -> Result<(), DerpError> {
-        // Platform TLS connection injected here.
-        // On host: tokio + rustls/native-tls
-        // On ESP32-C3: esp-idf-svc EspTls with fingerprint verification
-        //
-        // Stub — platform impl follows in platform/ modules.
-        //
-        // After TLS:
-        //   1. Write "DERP" magic
-        //   2. Exchange ServerKey / ClientInfo / ServerInfo frames
-        //   3. Enter send/receive select loop below
+        use embedded_io_adapters::tokio_1::FromTokio;
+        use tls::{DerpTls, RECORD_READ_BUF, RECORD_WRITE_BUF};
 
-        // ── Main loop: send + receive in the same task ──
-        // (MicroLink uses separate tasks for TX and RX, but Tokio's select!
-        // achieves the same non-blocking behaviour in one task with less
-        // memory — no extra stack for the TX task)
+        tracing::info!("DerpActor: dialing {}:{}", host, port);
+        let tcp = tokio::net::TcpStream::connect((host, port))
+            .await
+            .map_err(|_| DerpError::Io)?;
+        let socket = FromTokio::new(tcp);
+
+        // Probe BEFORE any TLS allocation so the delta captures the full DERP
+        // TLS session RAM: the two record buffers here plus embedded-tls's
+        // fixed session state and DerpTls's boxed frame buffer (Task 5).
+        heap_probe("before DerpTls::connect");
+
+        // TLS record buffers on the heap, not the small task stack.
+        let mut read_buf = Box::new([0u8; RECORD_READ_BUF]);
+        let mut write_buf = Box::new([0u8; RECORD_WRITE_BUF]);
+
+        let our_pub = *self.our_key.as_bytes();
+        let mut tls = DerpTls::connect(
+            socket,
+            &mut read_buf[..],
+            &mut write_buf[..],
+            host,
+            &our_pub,
+            &self.node_priv,
+            rand::rngs::OsRng,
+        )
+        .await?;
+        heap_probe("after DerpTls::connect");
+        tracing::info!("DerpActor: DERP handshake complete with {}", host);
+
+        let _ = events.send(DerpEvent::Connected).await;
+
+        // What the select! resolved to. Kept deliberately tls-free so no branch
+        // handler borrows `tls` while the other branch's future still holds it.
+        enum Decision {
+            Send(NodePublicKey, Box<heapless::Vec<u8, MAX_DERP_PAYLOAD>>),
+            Frame(u8, usize),
+            Stop,
+        }
+
         loop {
-            tokio::select! {
-                cmd = cmds.recv() => {
-                    match cmd {
-                        Ok(DerpCmd::SendPacket { dst_key, payload }) => {
-                            // self.send_packet(stream, &dst_key, &payload).await?;
-                        }
-                        Ok(DerpCmd::Disconnect) | Err(_) => return Ok(()),
-                        Ok(_) => {}
-                    }
+            let decision = tokio::select! {
+                biased;
+                cmd = cmds.recv() => match cmd {
+                    Ok(DerpCmd::SendPacket { dst_key, payload }) => Decision::Send(dst_key, payload),
+                    Ok(DerpCmd::Disconnect) | Ok(DerpCmd::Shutdown) | Err(_) => Decision::Stop,
+                    Ok(DerpCmd::Connect { .. }) => continue, // already connected
+                },
+                frame = tls.read_frame_buffered() => {
+                    let (ft, n) = frame?;
+                    Decision::Frame(ft, n)
                 }
-                // recv = self.recv_frame(stream) => {
-                //     self.handle_frame(recv?, events).await?;
-                // }
+            };
+
+            match decision {
+                Decision::Stop => return Ok(()),
+                Decision::Send(dst_key, payload) => {
+                    tls.send_packet(dst_key.as_bytes(), &payload).await?;
+                }
+                Decision::Frame(ft, n) => {
+                    if ft == DerpFrameType::RecvPacket as u8 {
+                        // RecvPacket body: src_pubkey(32) + WG/disco payload.
+                        if n >= 32 {
+                            let mut src = [0u8; 32];
+                            src.copy_from_slice(&tls.frame()[..32]);
+                            tracing::info!(
+                                "DerpActor: RecvPacket {} bytes from {:02x}{:02x}..",
+                                n - 32,
+                                src[0],
+                                src[1]
+                            );
+                            let mut payload: heapless::Vec<u8, MAX_DERP_PAYLOAD> =
+                                heapless::Vec::new();
+                            let _ = payload.extend_from_slice(&tls.frame()[32..n]);
+                            let _ = events
+                                .send(DerpEvent::PacketReceived {
+                                    src_key: NodePublicKey::from_bytes(src),
+                                    payload: Box::new(payload),
+                                })
+                                .await;
+                        }
+                    } else if ft == DerpFrameType::Ping as u8 {
+                        let body: heapless::Vec<u8, 8> = {
+                            let mut b = heapless::Vec::new();
+                            let take = core::cmp::min(n, 8);
+                            let _ = b.extend_from_slice(&tls.frame()[..take]);
+                            b
+                        };
+                        tls.pong(&body).await?;
+                        tracing::info!("DerpActor: server PING -> PONG");
+                        let _ = events.send(DerpEvent::PingReceived).await;
+                    } else {
+                        tracing::debug!("DerpActor: frame type 0x{:02x} ({} bytes) ignored", ft, n);
+                    }
+                    // KeepAlive / PeerPresent / PeerGone / Health etc. ignored.
+                }
+            }
+        }
+    }
+
+    /// Stub connection loop for builds without the `etls` feature (host tests,
+    /// stock firmware). Preserves the original behaviour: drains commands but
+    /// performs no I/O.
+    #[cfg(not(feature = "etls"))]
+    async fn run_connection(
+        &self,
+        _host:            &str,
+        _port:            u16,
+        _fingerprint:     Option<[u8; 32]>,
+        cmds:             &mut async_channel::Receiver<DerpCmd>,
+        _events:          &async_channel::Sender<DerpEvent>,
+    ) -> Result<(), DerpError> {
+        loop {
+            match cmds.recv().await {
+                Ok(DerpCmd::Disconnect) | Ok(DerpCmd::Shutdown) | Err(_) => return Ok(()),
+                Ok(_) => {}
             }
         }
     }

@@ -114,10 +114,11 @@ fn spawn_control(
 #[inline(never)]
 fn spawn_derp(
     our_key: NodePublicKey,
+    node_priv: [u8; 32],
     rx: async_channel::Receiver<DerpCmd>,
     tx: async_channel::Sender<DerpEvent>,
 ) -> BoxActorFut {
-    let actor = DerpActor::new(our_key);
+    let actor = DerpActor::new(our_key, node_priv);
     Box::pin(actor.run(rx, tx))
 }
 
@@ -200,6 +201,32 @@ async fn event_router_task(
                                 info!("Runtime::join()   peer {} derp_region={} online={} ip={}.{}.{}.{}",
                                     p.hostname.as_str(), p.derp_region, p.is_online,
                                     p.tailnet_ip.0[0], p.tailnet_ip.0[1], p.tailnet_ip.0[2], p.tailnet_ip.0[3]);
+                            }
+                            // Rung-4: bring up the DERP relay leg. Pick a target
+                            // peer (first online, else first) and connect to the
+                            // DERP region it is homed on, so the server can relay
+                            // our WireGuard/disco traffic to it. A repeat Connect
+                            // from a later map snapshot is ignored by the actor
+                            // once a connection is up.
+                            if let Some(target) =
+                                map.peers.iter().find(|p| p.is_online).or_else(|| map.peers.first())
+                            {
+                                let rid = target.derp_region;
+                                if let Some(region) =
+                                    map.derp_regions.iter().find(|r| r.region_id == rid)
+                                {
+                                    let port = if region.port != 0 { region.port } else { 443 };
+                                    info!("Runtime::join() - DERP connect -> region {} ({}) host={} port={} for peer {}",
+                                        region.region_id, region.region_code.as_str(),
+                                        region.host.as_str(), port, target.hostname.as_str());
+                                    let _ = derp_tx2.send(DerpCmd::Connect {
+                                        host: region.host.clone(),
+                                        port,
+                                        cert_fingerprint: None,
+                                    }).await;
+                                    #[cfg(target_os = "espidf")]
+                                    tokio_freertos_yield().await;
+                                }
                             }
                             let _ = wg_tx2.send(WgCmd::ApplyMap(map)).await;
                         }
@@ -465,7 +492,7 @@ impl Runtime {
         tracing::debug!("Runtime::join() - preparing actor tasks");
         let control_task = spawn_control(config.control, config.node_state, ctrl_rx, ctrl_ev_tx);
         log_heap("after ControlActor spawn");
-        let derp_task = spawn_derp(our_pub, derp_rx, derp_ev_tx);
+        let derp_task = spawn_derp(our_pub, wg_priv, derp_rx, derp_ev_tx);
         log_heap("after DerpActor spawn");
         let disco_task = spawn_disco(disco_key, disco_rx, disco_ev_tx);
         log_heap("after DiscoActor spawn");
@@ -523,7 +550,7 @@ impl Runtime {
         let control_actor = ControlActor::new(config.control, config.node_state);
         tokio::spawn(control_actor.run(ctrl_rx, ctrl_ev_tx));
 
-        let derp_actor = DerpActor::new(our_pub);
+        let derp_actor = DerpActor::new(our_pub, wg_priv);
         tokio::spawn(derp_actor.run(derp_rx, derp_ev_tx));
 
         let disco_actor = DiscoActor::new(disco_key);

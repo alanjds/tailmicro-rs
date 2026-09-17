@@ -10,7 +10,8 @@ edition.workspace = true
 etls = [
     "dep:embedded-tls", "dep:embedded-io-async", "dep:embedded-io-adapters",
     "dep:chacha20poly1305", "dep:crypto_box", "dep:sha2", "dep:digest",
-    "dep:typenum", "dep:rand_core",
+    "dep:typenum", "dep:rand_core", "dep:rand",
+    "tokio/net",
 ]
 
 [dependencies]
@@ -34,3 +35,13 @@ sha2                  = { version = "0.10", default-features = false, optional =
 digest                = { version = "0.10", default-features = false, features = ["core-api"], optional = true }
 typenum               = { version = "1", optional = true }
 rand_core             = { version = "0.6", optional = true }
+# OsRng (getrandom-backed; on ESP32-C3 getrandom is served by esp_fill_random,
+# the same source tm_wg already uses). Supplies the CryptoRng for embedded-tls
+# and the ClientInfo NaCl box nonce.
+rand                  = { workspace = true, features = ["getrandom"], optional = true }
+
+# Heap probes around DerpTls::connect (Task 5) are device-only. esp-idf-sys is
+# a shared sys crate (tm_runtime already depends on it); pulled only when
+# building for the espidf target, so host builds/tests are unaffected.
+[target.'cfg(target_os = "espidf")'.dependencies]
+esp-idf-sys = { workspace = true }

@@ -233,12 +233,16 @@ impl WgActor {
             region_id: 0,
             node_key: src_key,
         };
-        // Box the RecvOut (~12 KB of packet buffers) before it crosses the
-        // `drain_recv` await boundary: kept by value it was held twice (as the
-        // captured argument and a moved-out local) plus a multi-KB consuming
-        // iterator, ~33 KB on the stack. Boxed, only an 8-byte pointer lives
-        // in the future.
-        let out = Box::new(self.endpoint().recv_one(payload, from, Instant::now()));
+        // Allocate the RecvOut (~12 KB of inline packet buffers) on the heap
+        // FIRST, then fill it in place via `recv_one_into`. The earlier
+        // `Box::new(recv_one(...))` still built the 12 KB RecvOut on the stack
+        // (inside recv_one, then again as the Box::new argument) before moving
+        // it to the heap; stacked on the tokio/actor poll chain that overflowed
+        // the ESP32-C3 main task stack the first time DERP delivered a real
+        // inbound WG handshake response. Filling a pre-boxed RecvOut keeps those
+        // 12 KB off the stack entirely.
+        let mut out = Box::new(crate::endpoint::RecvOut::default());
+        self.endpoint().recv_one_into(payload, from, Instant::now(), &mut out);
         self.drain_recv(src_key, out, events).await;
     }
 

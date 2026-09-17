@@ -100,6 +100,20 @@ pub struct DerpTls<'a, S: AsyncRead + AsyncWrite> {
     tls: TlsConnection<'a, S, Chacha20Poly1305Sha256>,
     /// 32-byte DERP server public key from the ServerKey frame.
     pub server_key: [u8; 32],
+    // ── Resumable frame-read state ────────────────────────────────────────
+    // `read_frame_buffered` reads a DERP frame incrementally, keeping every
+    // byte of progress in these fields (never in the future's stack frame).
+    // Dropping the future — e.g. the losing branch of a `tokio::select!` that
+    // interleaves sends — therefore cannot desync framing: embedded-tls itself
+    // retains any partial *record* (`RecordReader::pending`), and these fields
+    // retain the partial *frame*. The next call resumes exactly where it left.
+    rd_hdr: [u8; 5],
+    rd_hdr_got: usize,
+    /// `usize::MAX` until the 5-byte header has been parsed.
+    rd_body_len: usize,
+    rd_body_got: usize,
+    /// Owned body buffer (boxed off the small async task stack).
+    frame_buf: Box<[u8; MAX_DERP_PAYLOAD]>,
 }
 
 impl<'a, S: AsyncRead + AsyncWrite> DerpTls<'a, S> {
@@ -177,7 +191,15 @@ impl<'a, S: AsyncRead + AsyncWrite> DerpTls<'a, S> {
         bx.decrypt(&Nonce::from(si_nonce), &buf[24..n])
             .map_err(|_| DerpError::HandshakeFailed)?;
 
-        Ok(DerpTls { tls, server_key })
+        Ok(DerpTls {
+            tls,
+            server_key,
+            rd_hdr: [0u8; 5],
+            rd_hdr_got: 0,
+            rd_body_len: usize::MAX,
+            rd_body_got: 0,
+            frame_buf: Box::new([0u8; MAX_DERP_PAYLOAD]),
+        })
     }
 
     /// Send a WireGuard packet to `dst_key` as a DERP SendPacket (0x04) frame.
@@ -196,6 +218,64 @@ impl<'a, S: AsyncRead + AsyncWrite> DerpTls<'a, S> {
     /// Answer a server PING (0x12) with a PONG (0x13) echoing its payload.
     pub async fn pong(&mut self, ping_body: &[u8]) -> Result<(), DerpError> {
         write_frame(&mut self.tls, DerpFrameType::Pong as u8, &[ping_body]).await
+    }
+
+    /// Cancellation-safe, resumable read of one DERP frame.
+    ///
+    /// Returns `(frame_type_byte, body_len)`; the body lives in [`Self::frame`]
+    /// (`&self.frame()[..body_len]`). Unlike [`Self::read_frame`], which reads
+    /// into a caller buffer and loses those bytes if its future is dropped
+    /// mid-frame, this method persists all progress in `self`, so it is safe to
+    /// use as one branch of a `tokio::select!` whose other branch may win and
+    /// drop this future. On the next call it resumes from the exact byte.
+    pub async fn read_frame_buffered(&mut self) -> Result<(u8, usize), DerpError> {
+        while self.rd_hdr_got < 5 {
+            let n = self
+                .tls
+                .read(&mut self.rd_hdr[self.rd_hdr_got..])
+                .await
+                .map_err(|_| DerpError::Io)?;
+            if n == 0 {
+                return Err(DerpError::Io);
+            }
+            self.rd_hdr_got += n;
+        }
+        if self.rd_body_len == usize::MAX {
+            let len = u32::from_be_bytes([
+                self.rd_hdr[1],
+                self.rd_hdr[2],
+                self.rd_hdr[3],
+                self.rd_hdr[4],
+            ]) as usize;
+            if len > self.frame_buf.len() {
+                return Err(DerpError::FrameTooLarge(len as u32));
+            }
+            self.rd_body_len = len;
+        }
+        while self.rd_body_got < self.rd_body_len {
+            let n = self
+                .tls
+                .read(&mut self.frame_buf[self.rd_body_got..self.rd_body_len])
+                .await
+                .map_err(|_| DerpError::Io)?;
+            if n == 0 {
+                return Err(DerpError::Io);
+            }
+            self.rd_body_got += n;
+        }
+        let ft = self.rd_hdr[0];
+        let n = self.rd_body_len;
+        // Reset for the next frame.
+        self.rd_hdr_got = 0;
+        self.rd_body_len = usize::MAX;
+        self.rd_body_got = 0;
+        Ok((ft, n))
+    }
+
+    /// The body buffer filled by the most recent [`Self::read_frame_buffered`].
+    /// Valid up to the `body_len` that call returned.
+    pub fn frame(&self) -> &[u8; MAX_DERP_PAYLOAD] {
+        &self.frame_buf
     }
 }
 

@@ -410,31 +410,45 @@ impl WgEndpoint {
     }
 
     /// Process one inbound packet arriving over `from`.
+    /// Process one inbound packet, returning a fresh [`RecvOut`] by value.
+    ///
+    /// Kept for tests and host callers. On-device callers should prefer
+    /// [`Self::recv_one_into`] with a heap-allocated `RecvOut`: `RecvOut` embeds
+    /// two `ArrayVec<Packet, OUT_CAP>` (~12 KB of inline, heapless buffers), so
+    /// returning it by value materialises ~12 KB on the caller's stack — which,
+    /// stacked on the tokio/actor poll chain, overflowed the ESP32-C3 main task
+    /// stack the first time DERP actually delivered an inbound WG packet.
     pub fn recv_one(&mut self, raw: &[u8], from: Endpoint, now: Instant) -> RecvOut {
         let mut out = RecvOut::default();
+        self.recv_one_into(raw, from, now, &mut out);
+        out
+    }
 
+    /// Process one inbound packet, writing results into a caller-provided
+    /// `out` (which should be freshly [`RecvOut::default`] and, on device,
+    /// heap-allocated so the ~12 KB never touches the stack).
+    pub fn recv_one_into(&mut self, raw: &[u8], from: Endpoint, now: Instant, out: &mut RecvOut) {
         // Disco-demux belt-and-suspenders: only WireGuard type bytes 1..=4
         // reach here. (Primary disco split happens at the runtime edge.)
         match raw.first() {
             Some(1..=4) => {}
             _ => {
                 tracing::trace!("non-wireguard packet dropped at wg parser");
-                return out;
+                return;
             }
         }
 
         let Ok(msg) = Message::try_from(raw) else {
             tracing::trace!("undecodable wireguard packet");
-            return out;
+            return;
         };
 
         match msg {
-            Message::HandshakeInitiation(_) => self.recv_init(raw, &from, now, &mut out),
-            Message::HandshakeResponse(_) => self.recv_response(raw, now, &mut out),
-            Message::CookieReply(_) => self.recv_cookie(raw, &mut out),
-            Message::TransportDataHeader(_) => self.recv_transport(raw, &from, now, &mut out),
+            Message::HandshakeInitiation(_) => self.recv_init(raw, &from, now, out),
+            Message::HandshakeResponse(_) => self.recv_response(raw, now, out),
+            Message::CookieReply(_) => self.recv_cookie(raw, out),
+            Message::TransportDataHeader(_) => self.recv_transport(raw, &from, now, out),
         }
-        out
     }
 
     fn recv_init(&mut self, raw: &[u8], from: &Endpoint, now: Instant, out: &mut RecvOut) {
