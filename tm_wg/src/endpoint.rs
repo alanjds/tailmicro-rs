@@ -338,6 +338,13 @@ impl WgEndpoint {
         }
     }
 
+    /// Number of live entries in the session-id map. Test-only: used to assert
+    /// that timed-out handshakes free their session id instead of leaking it.
+    #[cfg(test)]
+    pub(crate) fn session_count(&self) -> usize {
+        self.state.sessions.len()
+    }
+
     fn peer_index(&self, id: PeerId) -> Option<usize> {
         self.peers.iter().position(|p| p.id == id)
     }
@@ -623,16 +630,26 @@ impl WgEndpoint {
     ) -> ArrayVec<(PeerId, Packet), MAX_PEERS> {
         let mut out: ArrayVec<(PeerId, Packet), MAX_PEERS> = ArrayVec::new();
 
-        // Collect peers whose handshake timed out (need a retry).
-        let mut retry: ArrayVec<PeerId, MAX_PEERS> = ArrayVec::new();
+        // Collect peers whose handshake timed out (need a retry), capturing the
+        // stale handshake's session id BEFORE clearing it. The free itself must
+        // happen in the second loop (it borrows `self.state`, which we cannot
+        // touch while iterating `self.peers` mutably here). Reading the id AFTER
+        // clearing the handshake is the bug this ordering fixes: `session_id()`
+        // then returned `None`, so the stale id was never freed and the session
+        // map accumulated one dead entry per retry. A late DERP-relayed response
+        // answering that stale init still matched `peer_for_session`, routed to
+        // the peer, and was fed to `finish()` against the CURRENT (rotated)
+        // ephemeral -> wrong ee/se DH -> the live `aead::Error`.
+        let mut retry: ArrayVec<(PeerId, Option<SessionId>), MAX_PEERS> = ArrayVec::new();
         for peer in self.peers.iter_mut() {
             if let Some(t) = peer.handshake_timeout
                 && t <= now
             {
                 peer.handshake_timeout = None;
                 if peer.handshake.is_active() {
+                    let stale = peer.handshake.session_id();
                     peer.handshake = Handshake::None;
-                    let _ = retry.try_push(peer.id);
+                    let _ = retry.try_push((peer.id, stale));
                 }
             }
             if let Some(t) = peer.keepalive_at
@@ -647,10 +664,8 @@ impl WgEndpoint {
 
         // Free the retrying peers' stale handshake sessions, then re-initiate
         // with jitter applied to the next timeout.
-        for id in retry {
-            if let Some(idx) = self.peer_index(id)
-                && let Some(sid) = self.peers[idx].handshake.session_id()
-            {
+        for (id, stale) in retry {
+            if let Some(sid) = stale {
                 self.state.free_session(sid);
             }
             if let Some(pkt) = self.initiate(id, now, now_unix) {
@@ -772,6 +787,67 @@ mod tests {
             region_id: 1,
             node_key: a_kp.public.to_bytes(),
         }
+    }
+
+    #[test]
+    fn retry_frees_stale_session_and_ignores_late_response() {
+        // Reproduces the rung-5 blocker: a handshake retry (5 s timeout) must
+        // free the timed-out initiation's session id, and a DERP-relayed
+        // response that answers that now-stale initiation must be dropped
+        // cleanly -- never fed to `finish()` against the current, rotated
+        // ephemeral (which is what produced the live `aead::Error`). A response
+        // to the CURRENT initiation must still complete the handshake.
+        let a_kp = NodeKeyPair::new();
+        let b_kp = NodeKeyPair::new();
+        let psk = Psk::zero(); // Tailscale uses an all-zero PSK
+
+        let mut a = WgEndpoint::new(a_kp);
+        let mut b = WgEndpoint::new(b_kp);
+
+        let a_peer = a
+            .add_peer(PeerConfig { key: b_kp.public, psk }, a_derp(&b_kp))
+            .unwrap();
+        b.add_peer(PeerConfig { key: a_kp.public, psk }, b_derp(&a_kp))
+            .unwrap();
+
+        let t0 = Instant::now();
+
+        // First initiation (session S1, ephemeral E1). B builds a response that
+        // answers S1/E1, but we withhold it to simulate DERP relay latency.
+        let init1 = a.initiate(a_peer, t0, now_unix()).expect("init1");
+        assert_eq!(a.session_count(), 1);
+        let b_out1 = b.recv_one(init1.as_slice(), b_derp(&a_kp), t0);
+        let resp1 = b_out1.to_peer[0].clone(); // answers stale S1/E1 after retry
+
+        // The handshake times out; A retries with a fresh init (session S2,
+        // ephemeral E2). A later wall-clock second keeps init2's TAI64N strictly
+        // greater than init1's, so the responder does not treat it as a replay.
+        let t1 = t0 + HANDSHAKE_TIMEOUT + Duration::from_millis(1);
+        let retry = a.dispatch(t1, Some(1_700_000_130));
+        assert_eq!(retry.len(), 1, "A should retry the timed-out handshake");
+        let init2 = retry[0].1.clone();
+
+        // The core regression: the stale S1 must have been freed, so the map
+        // holds only the current S2 (before the fix it leaked, holding 2).
+        assert_eq!(
+            a.session_count(),
+            1,
+            "the timed-out handshake's session id must be freed on retry"
+        );
+
+        // The delayed resp1 answers the now-stale S1/E1: it must be dropped
+        // cleanly, not mis-finished against the current S2/E2 ephemeral.
+        let a_stale = a.recv_one(resp1.as_slice(), a_derp(&b_kp), t1);
+        assert!(!a_stale.handshook, "a stale response must not complete a handshake");
+
+        // The response to the CURRENT initiation completes the handshake.
+        let b_out2 = b.recv_one(init2.as_slice(), b_derp(&a_kp), t1);
+        let resp2 = b_out2.to_peer[0].clone();
+        let a_ok = a.recv_one(resp2.as_slice(), a_derp(&b_kp), t1);
+        assert!(
+            a_ok.handshook,
+            "the response to the current initiation must complete the handshake"
+        );
     }
 
     #[test]

@@ -454,6 +454,18 @@ impl Handshake {
             return None;
         };
 
+        // The response must answer THIS outstanding initiation: its
+        // `receiver_id` is the `sender_id` we chose for the init we are
+        // completing. Without this guard a late DERP-relayed response to an
+        // earlier (rotated-out) initiation would be run against the current
+        // ephemeral, whose `ee`/`se` DH inputs no longer match -- deriving a
+        // wrong key and failing the empty-payload AEAD tag (the live
+        // `aead::Error`). Reject the mismatch cleanly instead.
+        if packet.receiver_id != sent_handshake.id {
+            tracing::debug!("handshake response does not match the outstanding initiation");
+            return None;
+        }
+
         if !cookies.verify_macs(packet.as_bytes()) {
             return None;
         };
