@@ -1146,3 +1146,79 @@ Two fixes, in order of preference (heap-neutral first):
    (~14-16 KB) above the 12 KB the boxed `RecvOut` needs, so the two-sided
    squeeze (bigger stack vs. the heap the relay + boxed `RecvOut` need) stays
    satisfied. With both fixes the device runs the full window with **no fault**.
+
+## Rung 5 root cause: WG-finish `aead::Error` was an INDEX-MATCHING bug, not crypto
+
+The `handshake.finish` `aead::Error` (blocking rung 5) was root-caused
+Python-first and pinned to the initiator's response↔initiation matching, NOT to
+the Noise key schedule. Evidence, in order:
+
+### The crypto core is byte-correct (ruled out first)
+`tools/wg_validator/validate_offline.py` still passes 16/16 against the real
+Rust core (`cargo run -p tm_wg --example wg_emit_vectors`): initiation bytes,
+responder bytes, both transport keys, transport-data, cookie/mac2 domains all
+byte-for-byte vs. the independent from-spec oracle. The response MAC1 also
+verifies live on-device (`finish` reaches the `decrypt` step, past
+`cookies.verify_macs`), which proves the 92 response bytes arrive intact and are
+keyed with our correct static pubkey. So neither the schedule nor the wire
+framing (no DERP-header leak) is at fault.
+
+Gap this exposed: the offline oracle drives the responder path
+(`respond_vector`) for its keys and only exercises the initiator-consume schedule
+in *Python* (step 7). Rust's own `finish()` was covered only by the symmetric
+in-crate `test_handshake` (both sides the same code), so an operational fault in
+how `finish()` is *fed* was invisible to the oracle.
+
+### The bug: `dispatch` never freed a timed-out initiation's session id
+`WgEndpoint::dispatch` retries a handshake every `HANDSHAKE_TIMEOUT` (5 s), each
+retry with a fresh ephemeral and a new sender session id. The retry was meant to
+free the timed-out initiation's session id from the `sessions` map, but the two
+loops ran in the wrong order:
+
+```
+// first loop
+peer.handshake = Handshake::None;      // cleared the handshake ...
+// second loop
+... self.peers[idx].handshake.session_id()  // ... so this now returned None
+    -> free_session never called
+```
+
+So the stale session id was **never freed**; the map accumulated one dead entry
+per retry. A type-2 response names, in its `receiver_id`, exactly which
+outstanding initiation it answers. Because DERP relay + the peer's lazy-wireguard
+wake make responses lag the 5 s retry cadence, a response answering an *earlier*
+initiation still matched `peer_for_session(receiver_id)` (its id was leaked into
+the map), routed to the live peer, and was fed to `finish()` -- which ran it
+against the CURRENT (rotated) ephemeral. `finish()` never checked
+`receiver_id == sent_handshake.id`, so the `ee`/`se` Diffie-Hellman inputs no
+longer matched what the responder used: wrong derived key, failed empty-payload
+AEAD tag = the live `aead::Error`, consistently.
+
+`tools/wg_validator/validate_index_matching.py` reproduces this from spec,
+independently of Rust: a response for session S1 (ephemeral E1) verifies when
+finished against E1, and fails with `InvalidTag` when finished against a
+different initiation's ephemeral E2 -- the exact on-device symptom.
+
+### The fix (two parts, `tm_wg`)
+1. `endpoint.rs::dispatch` -- capture the timed-out handshake's `session_id()`
+   BEFORE clearing the handshake, and free it in the retry loop. The session map
+   no longer leaks a dead entry per retry, so a late response to a rotated-out
+   initiation is cleanly dropped as "unknown session" instead of being routed to
+   a live peer.
+2. `vendor/handshake.rs::finish` -- guard `packet.receiver_id ==
+   sent_handshake.id` before any crypto. Defense-in-depth: even a duplicate or
+   reordered response can no longer be run against the wrong ephemeral; a
+   mismatch is rejected cleanly instead of failing the AEAD tag.
+
+### New regression tests
+- `tm_wg` unit test `retry_frees_stale_session_and_ignores_late_response`:
+  drives two endpoints, forces a retry, and asserts (a) the session map does not
+  leak the stale id (`session_count()` stays 1; was 2 before the fix -- verified
+  RED), (b) a withheld response to the stale initiation does not complete a
+  handshake, and (c) the response to the current initiation still completes.
+- `tools/wg_validator/validate_index_matching.py`: the from-spec oracle above.
+
+With the guard, a response arriving within a DERP RTT of the current initiation
+(the common case once the peer's wireguard config is awake) matches and completes
+`finish()` -> `PeerHandshook`; lagging responses to rotated-out initiations are
+dropped instead of poisoning the schedule.
