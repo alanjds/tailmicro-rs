@@ -1263,3 +1263,52 @@ Rung 6 (inbound transport round-trip) was NOT reached in this window: no
 `WgEvent::InboundDecrypted` was observed. Landing rung 5 cleanly is the honest
 outcome here; rung 6 additionally needs the peer to send transport data toward
 us and `tm_netstack`'s lwIP inbound injection (still a stub) to deliver it.
+
+## Rung 6a: outbound transport elicitor implemented (live verification blocked on Wokwi quota)
+
+Rung 6 (inbound transport round-trip) splits into two coupled halves:
+- **6a** — drive an outbound transport payload so the peer replies, and observe
+  the reply arrive as `WgEvent::InboundDecrypted`. This is a tm_wg/tm_runtime
+  task: nothing in the firmware previously emitted transport data, so the peer
+  never had anything to answer.
+- **6b** — deliver the decrypted inbound IP packet into the on-device lwIP
+  stack so a local socket receives it (`tm_netstack` is still a stub). Larger
+  half; not started here.
+
+### What 6a adds
+- `WgEndpoint::send_data(dst_key, payload, now, out)` (`tm_wg/src/endpoint.rs`):
+  encrypts a plaintext IP packet under the peer's active send session into
+  `out.to_peer` (16-byte transport-data header prepended by `session::encrypt`),
+  or queues it if no session is active yet (flushed on activation). Same
+  heap-boxed `RecvOut` discipline as the rung-5 fixes — no by-value packet
+  buffers on the ESP32-C3 main-task stack.
+- `WgCmd::SendData { dst_key, payload }` + `WgActor::on_send_data`
+  (`tm_wg/src/lib.rs`): routes an app-data payload through `send_data` and drains
+  the ciphertext out as `WgEvent::OutboundPacket` for DERP relay.
+- `tm_runtime` (`event_router_task`): captures `our_ip` and each peer's
+  `tailnet_ip` from `MapUpdate`, and on `WgEvent::PeerHandshook` synthesizes an
+  ICMP echo request (`build_icmp_echo_request`, RFC 1071 checksums) from our
+  tailnet IP to the peer's and sends it via `WgCmd::SendData`. tailscaled's host
+  kernel answers pings to its own tailnet address with no listening app, so the
+  echo reply returns as an inbound transport packet -> `InboundDecrypted`.
+
+### Offline verification (green)
+- `tm_wg` unit test `send_data_encrypts_over_active_session_and_queues_without_one`:
+  A encrypts an app-data payload over its active session, B decrypts it back to
+  the *exact* plaintext; before a session exists the payload is queued and
+  nothing hits the wire; an unknown peer key is a no-op. 23/23 tm_wg tests pass.
+- `tools/wg_validator/validate_icmp_echo.py`: from-spec oracle; the synthesized
+  28-byte packet has valid IPv4 + ICMP checksums and scapy parses it as a
+  well-formed echo request (a real peer kernel will answer it).
+- Firmware builds clean twice for `riscv32imc-esp-espidf` (flash bin produced).
+
+### Live verification: BLOCKED (needs a human decision)
+The Wokwi run to capture on-device serial could not execute:
+```
+API Error: You have used up your Free plan monthly CI minute quota.
+```
+This is a hard monthly Wokwi CI-minute cap, not a transient rate limit. Landing
+6a *on-device* (the `WgEvent::InboundDecrypted N bytes from peer 0e63..` line)
+needs one of: a Wokwi plan/quota with CI minutes available, a different Wokwi
+token, waiting for the monthly reset, or a real ESP32-C3. The code + offline
+oracles are in place; only the live serial confirmation is outstanding.
