@@ -382,6 +382,23 @@ impl ControlActor {
         let mut prefix_have = 0usize;
         let mut cur_len: Option<usize> = None;
         let mut our_ip_sent = false;
+        // The streaming keepalive poll (MAP_STREAM_ID) is a live HTTP/2 stream
+        // the control server watches: per ts_control.py's start_keepalive_poll,
+        // the server only keeps OUR node marked online while we keep draining
+        // it. The non-streaming publish (MAP_PUBLISH_STREAM_ID) is a one-shot
+        // snapshot that must still parse and return at end_stream, so only the
+        // streaming caller gets drain-and-discard on a length desync below.
+        let streaming = expected_stream == MAP_STREAM_ID;
+        // v1 fix (card t_e34afeed): once the 4-byte-LE length prefix desyncs
+        // (root cause not yet fixed; seen live as ASCII "Host"), we can no
+        // longer trust ANY subsequent byte as prefix or body, so re-parsing
+        // is pointless. Instead of bailing (which orphans the stream and lets
+        // the control server see us stop reading -> mark us offline, so real
+        // peers stop answering our WG handshake), keep consuming and
+        // discarding every byte on this stream forever, so the server keeps
+        // seeing us as an active reader. v2 (parsing deltas) will fix the
+        // desync itself instead of just surviving it.
+        let mut discarding = false;
 
         loop {
             let mut hdr_bytes = [0u8; 9];
@@ -409,7 +426,7 @@ impl ControlActor {
                     // Feed the payload through the prefix -> body state machine.
                     // A single frame may finish one message and begin the next
                     // (streaming poll), so drive it with a cursor.
-                    let mut pos = 0usize;
+                    let mut pos = if discarding { payload.len() } else { 0usize };
                     while pos < payload.len() {
                         // Phase 1: collect the 4-byte LE length prefix.
                         if cur_len.is_none() {
@@ -424,6 +441,13 @@ impl ControlActor {
                             // that would OOM-abort with_capacity. Bail gracefully;
                             // the netmap already came from the publish response.
                             if mlen > MAX_MAP_MSG {
+                                if streaming {
+                                    info!("Tailscale stream_map_response: implausible message length {} on stream {}, draining+discarding (staying online)", mlen, expected_stream);
+                                    discarding = true;
+                                    prefix_have = 0;
+                                    cur_len = None;
+                                    break;
+                                }
                                 info!("Tailscale stream_map_response: implausible message length {} on stream {}, ending", mlen, expected_stream);
                                 return Ok(());
                             }

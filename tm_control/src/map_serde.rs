@@ -109,6 +109,18 @@ pub fn parse<const MAX_PEERS: usize, const MAX_REGIONS: usize>(
         if out.peers.is_full() {
             break;
         }
+        // Online-only netmap: an offline peer is unreachable (it won't answer
+        // a WG handshake), so it is dead weight in the fixed-size ArrayVec.
+        // Skipping it here means MAX_PEERS is a cap on ONLINE peers, which
+        // sidesteps the real-tailnet truncation that dropped the actually-
+        // reachable peers (lenovopill/bospill) behind stale offline entries
+        // that happened to appear earlier in the server's peer list. When a
+        // peer comes online later, the streaming poll re-delivers its full
+        // record (see docs/wg-dataplane-notes.md). An empty peer set when
+        // nobody is online is correct, not a bug.
+        if p.online != Some(true) {
+            continue;
+        }
         let (Some(key), Some(ip)) = (
             p.key.and_then(|k| hex_key(k)),
             p.addresses.iter().find_map(|a| parse_ipv4(a)),
@@ -248,5 +260,31 @@ mod tests {
         assert_eq!(m.derp_regions[0].region_id, 7);
         assert_eq!(m.derp_regions[0].region_code.as_str(), "lax");
         assert_eq!(m.derp_regions[0].host.as_str(), "derp7.tailscale.com");
+    }
+
+    // Mirrors the real-tailnet symptom: an offline peer listed ahead of an
+    // online one must not occupy an ArrayVec slot (design decision, card
+    // t_e34afeed comment 2026-09-17: "Netmap stores ONLY online peers").
+    const JSON_MIXED_ONLINE: &str = r#"{
+        "Node": {"Addresses": ["100.64.0.1/32"]},
+        "Peers": [
+            {"Key":"nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+             "Addresses":["100.64.0.9/32"],"DERP":"127.3.3.40:1","Online":false,
+             "Hostinfo":{"Hostname":"stale-offline"}},
+            {"Key":"nodekey:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+             "Addresses":["100.64.0.2/32"],"DERP":"127.3.3.40:7","Online":true,
+             "Hostinfo":{"Hostname":"live-online"}},
+            {"Key":"nodekey:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+             "Addresses":["100.64.0.3/32"],"DERP":"127.3.3.40:2",
+             "Hostinfo":{"Hostname":"missing-online-field"}}
+        ]
+    }"#;
+
+    #[test]
+    fn only_online_peers_are_kept() {
+        let m = parse::<8, 4>(JSON_MIXED_ONLINE.as_bytes()).unwrap();
+        assert_eq!(m.peers.len(), 1, "offline / missing-Online peers must be skipped");
+        assert_eq!(m.peers[0].hostname.as_str(), "live-online");
+        assert!(m.peers[0].is_online);
     }
 }
