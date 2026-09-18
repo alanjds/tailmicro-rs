@@ -1521,3 +1521,225 @@ killing the node — and instead pass `connect_timeout` into
 the long-running device future is never raced against a dropping timeout.
 See the implementation report on card t_0d32f11d for the concrete patch
 text (not applied here; out of this repo's scope per the card).
+
+## Readiness-decoupled connect handle (contract change, card t_0d32f11d, phase 2)
+
+### Why the bring-up timeout above was not enough
+
+The bring-up timeout (previous section) bounds only the control-plane
+connect phase; the streaming keepalive poll after it is deliberately
+unbounded, by design, to keep the node marked online for as long as the
+app runs. That is correct for the actor internals, but it means
+`Device::new(..)`'s returned future **never completes** in the success
+case — it only resolves on an internal error. The sibling app's existing
+wrapper (`tasmolike-rs/src/tailscale_rust.rs`, `TailscaleService::start()`)
+called `timeout(Duration::from_secs(60), Device::new(&config, ..))` and
+awaited that alone, sequentially, before the app's own
+`tokio::try_join!(echo_server(), stay_connected(..), run_server_tcp(..))`
+(`tasmolike-rs/src/main.rs:146` and `:167`). Simply deleting the 60s
+`timeout()` — the fix implied by the previous section in isolation — would
+have made `start()` hang forever on a successful connect, since
+`Device::new`'s future is the same one that never returns while the actors
+run. This was flagged in the phase-1 handback as a boot-hang risk and the
+owner approved a contract change instead of a wrapper-only fix.
+
+### New contract
+
+`Device::connect(&config, auth_key) -> Result<(Device, Driver), Error>`
+(`src/lib.rs`), where `Driver = Pin<Box<dyn Future<Output = ()>>>`
+(`tm_runtime/src/lib.rs`):
+
+- Returns as soon as the control plane assigns a tailnet IP
+  (`ControlEvent::OurIpAssigned`), bounded internally by the existing
+  `connect_timeout` from the section above — so it still cannot hang past
+  that deadline.
+- The returned `Device` already has `ipv4_addr()` (now sync, infallible)
+  and `is_connected()` available.
+- The returned `Driver` is the **same** unbounded data-plane future
+  (`tokio::join!` of the control/DERP/disco/WireGuard actors + event
+  router) that used to be hidden inside `Device::new`/`Runtime::join`. It
+  is still pending when `connect` returns. The caller MUST fold it into
+  its own `tokio::join!`/`tokio::try_join!` alongside whatever else it
+  needs to run concurrently — never `.await` it alone (by design it then
+  never returns) and never wrap it in an external `timeout`/`select!` (that
+  reproduces exactly the ephemeral-node-GC bug flagged in phase 1: dropping
+  the actors mid-flight deregisters the node from the tailnet).
+
+`Device::new` is kept as a `#[deprecated]` shim (source-compatible, calls
+the pre-existing `Runtime::spawn`/`Runtime::join` path unchanged) so any
+caller not yet migrated still builds; new code must use `Device::connect`.
+
+### `tm_runtime`: `Runtime::build` / `Runtime::join` / `Runtime::connect`
+
+The pre-existing `Runtime::join(config) -> Runtime` body (all channel/actor
+construction, `ControlCmd::Start`, the five `spawn_*` off-frame-boxing
+helpers, the final `tokio::join!`) is unchanged in substance but factored
+into a private `async fn build(config) -> (Runtime, Driver)`, where
+`Driver` is the boxed `tokio::join!(...)` future, not yet awaited. `join`
+becomes `let (rt, driver) = Self::build(config).await; driver.await; rt`
+(behavior-identical to before). `connect` is new:
+
+```rust
+pub async fn connect(mut config: RuntimeConfig) -> Result<(Self, Ipv4Addr, Driver), ConnectError> {
+    let (our_ip_tx, our_ip_rx) = async_channel::bounded::<Ipv4Addr>(1);
+    config.our_ip_tx = Some(our_ip_tx);
+    let (runtime, mut driver) = Self::build(config).await;
+    match race_driver_vs_ready(&mut driver, &our_ip_rx).await {
+        Ok(ip) => Ok((runtime, ip, driver)),
+        Err(()) => Err(ConnectError),
+    }
+}
+```
+
+`connect` owns and creates the `our_ip_tx`/`our_ip_rx` pair itself (the
+caller passes `our_ip_tx: None` in `RuntimeConfig`; `Device::connect`'s
+doc comment says so explicitly) — this keeps the readiness channel purely
+internal plumbing, not something callers need to wire up themselves.
+
+`race_driver_vs_ready` is a small standalone generic helper (not a method,
+so it is unit-testable without any `Runtime`/`RuntimeConfig` scaffolding):
+
+```rust
+pub async fn race_driver_vs_ready<T, D>(
+    driver: &mut D,
+    ready_rx: &async_channel::Receiver<T>,
+) -> Result<T, ()>
+where
+    D: core::future::Future<Output = ()> + Unpin,
+{
+    tokio::select! {
+        _ = driver => Err(()),
+        recv = ready_rx.recv() => recv.map_err(|_| ()),
+    }
+}
+```
+
+The critical correctness property, called out explicitly in the contract:
+`driver` is taken by `&mut`, not by value, so losing the `select!` race
+(readiness wins) does **not** drop or cancel the driver future — it is
+simply not polled on that particular `select!` pass, and is handed back to
+the caller by `connect` fully intact, still pending, ready to be polled
+again via the caller's own `tokio::join!`. This is what makes the "no
+dedicated thread" cooperative model work: there is exactly one long-lived
+task per actor, ever, and racing readiness against the driver never tears
+any of them down. If the driver resolves first (`_ = driver => Err(())`),
+that means the whole actor set exited — which after the fix below only
+happens on a real bring-up error or timeout — so `connect` reports
+`Err(ConnectError)`.
+
+### `ControlActor::run` fix required for the `Err` path to actually resolve
+
+`race_driver_vs_ready` can only see the driver "finish" if the actor
+`tokio::join!` set genuinely completes. Before this phase,
+`ControlActor::run` handled a `connect_and_poll` error by logging and
+`continue`-ing its `cmds.recv().await` loop — i.e. it never returned after
+a bring-up failure, it just sat parked waiting for another command that
+nothing sends. That would have made `race_driver_vs_ready` hang forever on
+any bring-up error instead of resolving to `Err`, defeating the entire
+point of the readiness race. Fixed in `tm_control/src/lib.rs`,
+`ControlActor::run`: after `events.send(ControlEvent::Error(e)).await`, the
+loop now `break`s, ending `run()` and dropping `events` — which cascades
+through the event router (and thus, transitively, through the `our_ip_tx`
+it holds) until `our_ip_rx.recv()` also returns `Err`, and the whole
+`tokio::join!` set in `Runtime::build`'s driver naturally completes.
+
+### `our_ip_tx` cfg-gate: removed, was a real bug
+
+`tm_runtime/src/lib.rs`'s event router previously gated the entire
+`our_ip_tx.send(..)` under `#[cfg(target_os = "espidf")]`:
+
+```rust
+#[cfg(target_os = "espidf")]
+if let Some(ref tx) = our_ip_tx {
+    tokio_freertos_yield().await;
+    let _ = tx.send(ip.to_ipv4()).await;
+}
+```
+
+`OurIpSender` is a plain `async_channel::Sender<Ipv4Addr>` with nothing
+espidf-specific about it; the only genuinely target-specific line inside
+was the `tokio_freertos_yield().await` call (a real espidf-only helper
+that cooperatively yields to FreeRTOS — it doesn't exist off-target). The
+outer gate was over-broad: on host builds it silently skipped sending
+readiness at all, meaning `Runtime::connect`'s readiness signal (and any
+host test of it) would never fire on host. Resolution: kept the inner
+`#[cfg(target_os = "espidf")]` on `tokio_freertos_yield().await` only, and
+un-gated the `tx.send(..)` call so it runs on every target:
+
+```rust
+if let Some(ref tx) = our_ip_tx {
+    #[cfg(target_os = "espidf")]
+    tokio_freertos_yield().await;
+    let _ = tx.send(ip.to_ipv4()).await;
+}
+```
+
+There was no real reason for the outer gate beyond having been written
+alongside the yield call and over-scoped; removing it is safe and was
+necessary for `race_driver_vs_ready`'s host tests (below) to mean
+anything, and for `Runtime::connect` to work correctly on host builds at
+all (e.g. under `cargo test` harnesses that exercise it indirectly, once
+`tm_runtime` itself is host-buildable — see limitation below).
+
+### Testing: what runs on host, and why `tm_runtime` itself does not
+
+`tm_runtime/Cargo.toml` declares `esp-idf-sys`/`esp-idf-svc` as plain
+(non-`cfg`-gated) dependencies, so the crate has never been host-buildable
+in this sandbox — `cargo check -p tm_runtime` fails before reaching any
+Rust source, at the `esp-idf-sys` build script (`Error: Unsupported target
+'x86_64-unknown-linux-gnu'`), confirmed both before and after this phase's
+changes (and in phase 1, via `git stash` bisection against the
+pre-phase-1 commit) — a pre-existing condition, not introduced by this
+work, and out of scope to fix here (re-plumbing that crate's Cargo target
+tables is an unplanned, higher-blast-radius build-system change; flagging
+it rather than guessing, per instruction).
+
+Given that, `race_driver_vs_ready` — the one new piece of genuinely
+target-independent logic this phase adds — is written as a standalone
+function precisely so its correctness does not depend on anything else in
+`tm_runtime` compiling for host; three `#[cfg(test)]` tests exercise it
+directly with `async_channel` fixtures and a `Box::pin`'d
+`std::future::pending()`/`async {}` in place of a real actor driver:
+
+- `readiness_wins_and_driver_survives` — sends on a channel, wins the
+  race, then re-races the **same** `&mut` driver a second time against a
+  fresh channel and wins again — proving the first race did not consume or
+  drop the driver.
+- `driver_ending_first_is_an_error` — an already-resolved driver against a
+  channel nothing ever sends on: resolves `Err(())`.
+- `dropped_sender_is_an_error` — the `Sender` half is dropped before the
+  race starts (modelling `ControlActor::run`'s break-and-drop path above):
+  `ready_rx.recv()` returns `Err`, so the race also resolves `Err(())`.
+
+These tests cannot currently be run via `cargo test -p tm_runtime` in this
+sandbox for the reason above (the crate-level build-script failure blocks
+compiling any of its `#[cfg(test)]` code too, regardless of that
+function's own lack of esp-idf dependencies) — this is **not faked**: the
+tests are real, target-independent unit tests of real shipped logic, ready
+to run wherever this crate's build-script precondition is satisfied (a
+real ESP-IDF toolchain, or a future fix that `cfg`-gates the esp-idf
+dependencies). Validation of the full `Runtime::connect`/`Device::connect`
+integration path (readiness win against real actors, not fixtures) is
+therefore deferred to device flash / Wokwi runs, consistent with how the
+rest of `tm_runtime`'s behavior in this repo has always been verified.
+
+`cargo test -p tm_control` and `cargo test -p tm_wg` (both host-buildable)
+are unaffected in shape by this phase's `tm_control` change beyond the
+`ControlActor::run` `break` fix, which is exercised indirectly by the
+existing `bring_up_timeout_emits_error_and_returns` test (it already
+asserts `run()` returns rather than hanging).
+
+### Wrapper-side shape required (sibling app, not in this repo)
+
+`tasmolike-rs::TailscaleService::start()` can no longer own a fully
+"connected and running" `Device` by itself, because `Device::connect`
+hands back a still-pending `Driver` that must be polled by `main`'s own
+`tokio::try_join!` (`main.rs:167`), not consumed and discarded inside
+`start()`. `start()` must instead call `Device::connect`, store the
+returned `Device` in the existing `Arc<Mutex<Option<Device>>>` immediately
+(so other code paths that read it, e.g. an HTTP status handler, see it as
+soon as it's ready), and return the `Driver` out to `main`, which folds it
+into the existing `try_join!` alongside `echo_server()`/
+`stay_connected(..)`/`run_server_tcp(..)`. See the concrete patch text (not
+applied to that repo) in the phase-2 implementation report on card
+t_0d32f11d.
