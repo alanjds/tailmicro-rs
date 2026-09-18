@@ -13,6 +13,7 @@
 //! reasonable.
 pub mod noise;
 pub mod map_serde;
+pub mod map_stream;
 pub mod pin;
 mod io;
 
@@ -494,7 +495,15 @@ impl ControlActor {
         // graceful bail instead of an OOM abort/reboot-loop. NB: this only
         // guards OUR allocation; the map still needs to fit the live heap budget
         // to be delivered (rung 3). See docs/wg-dataplane-notes.md.
-        let mut msg_body: Vec<u8> = Vec::new();
+        // Streaming (push) parse: the MapResponse body is fed to actson as the
+        // decrypted DATA frames arrive, so the ~34-48 KB netmap is never held in
+        // one contiguous allocation (which try_reserve_exact could not satisfy
+        // on the fragmented heap, forcing us to discard the whole netmap and
+        // lose the data plane). Only actson's ~1 KB feeder ring and the fixed
+        // MapState are ever resident. See map_stream. `fed` counts body bytes
+        // fed for the current message so we know when `mlen` is complete.
+        let mut parser: Option<map_stream::MapStreamParser<8, 4>> = None;
+        let mut fed = 0usize;
         let mut prefix = [0u8; 4];
         let mut prefix_have = 0usize;
         let mut cur_len: Option<usize> = None;
@@ -577,48 +586,35 @@ impl ControlActor {
                                 cur_len = None;
                                 break;
                             }
-                            // One exact, FALLIBLE allocation for the whole body;
-                            // the appends below never realloc, so peak transient
-                            // == mlen. try_reserve_exact turns an over-budget map
-                            // into a graceful bail instead of an OOM abort.
-                            msg_body = Vec::new();
-                            if msg_body.try_reserve_exact(mlen).is_err() {
-                                // Rolling-discard fallback. We cannot buffer this
-                                // body: no `mlen`-byte contiguous block on the
-                                // (small, fragmented) heap -- e.g. a ~47 KB netmap
-                                // on a ~57 KB heap, inflated further by ephemeral
-                                // ghost peers. Returning here would orphan the rest
-                                // of the message AND the rest of the stream, so the
-                                // unread frames get read by the NEXT request on this
-                                // connection as if they were its own -> H2
-                                // UnexpectedStream and a reconnect storm (observed
-                                // live). Instead keep consuming every remaining byte
-                                // on the stream (WINDOW_UPDATEs still sent above)
-                                // until end_stream, so the connection stays byte-
-                                // consistent. We lose THIS snapshot's parse but the
-                                // node stays online and a later, smaller netmap
-                                // parses. A streaming JSON parser that never needs
-                                // the whole body is the deferred v2 (card
-                                // t_e34afeed).
-                                info!("Tailscale stream_map_response: cannot allocate {} B for map body on stream {} (heap budget), discarding rest of stream", mlen, expected_stream);
-                                discarding = true;
-                                prefix_have = 0;
-                                cur_len = None;
-                                break;
-                            }
+                            // Start a fresh streaming parse for this message. No
+                            // `mlen`-byte allocation happens here or below: body
+                            // bytes are pushed into actson's bounded feeder as
+                            // they arrive, so a netmap too large to buffer (a
+                            // ~47 KB map on a fragmented ~57 KB heap, inflated by
+                            // ephemeral ghost peers) still parses instead of
+                            // forcing a discard that would drop the data plane.
+                            parser = Some(map_stream::MapStreamParser::new());
+                            fed = 0;
                             cur_len = Some(mlen);
                         }
 
-                        // Phase 2: append body bytes up to the known length.
+                        // Phase 2: feed body bytes up to the known length.
                         let want = cur_len.unwrap();
-                        let take = core::cmp::min(want - msg_body.len(), payload.len() - pos);
-                        msg_body.extend_from_slice(&payload[pos..pos + take]);
+                        let take = core::cmp::min(want - fed, payload.len() - pos);
+                        if let Some(p) = parser.as_mut() {
+                            // A feed error is recorded inside the parser and
+                            // surfaced by finish(); we keep consuming every body
+                            // byte regardless so the stream stays byte-consistent.
+                            let _ = p.push(&payload[pos..pos + take]);
+                        }
                         pos += take;
-                        if msg_body.len() < want { break; }
+                        fed += take;
+                        if fed < want { break; }
 
-                        // Complete message: parse + emit, then reset for the next.
-                        match map_serde::parse::<8, 4>(&msg_body) {
-                            Ok(map) => {
+                        // Complete message: finish the parse + emit, then reset.
+                        let parsed = parser.take().map(|p| p.finish());
+                        match parsed {
+                            Some(Ok(map)) => {
                                 if !our_ip_sent && map.our_ip.0 != [0u8; 4] {
                                     our_ip_sent = true;
                                     info!("Tailscale OurIpAssigned event sent: {}.{}.{}.{}", map.our_ip.0[0], map.our_ip.0[1], map.our_ip.0[2], map.our_ip.0[3]);
@@ -637,11 +633,13 @@ impl ControlActor {
                                     info!("Tailscale MapUpdate skipped (empty snapshot)");
                                 }
                             }
-                            Err(e) => { info!("Tailscale map_serde parse error: {:?}", e); }
+                            Some(Err(e)) => { info!("Tailscale map_stream parse error: {:?}", e); }
+                            None => {} // unreachable: parser is Some for a non-discarding message
                         }
-                        // Free the body before reading the next message so two
-                        // message buffers never coexist.
-                        msg_body = Vec::new();
+                        // Drop the parser before reading the next message so two
+                        // parse states never coexist.
+                        parser = None;
+                        fed = 0;
                         cur_len = None;
                         prefix_have = 0;
                     }

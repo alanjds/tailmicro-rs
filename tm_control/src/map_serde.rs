@@ -177,12 +177,12 @@ pub fn parse<const MAX_PEERS: usize, const MAX_REGIONS: usize>(
     Ok(out)
 }
 
-fn region_id_or(key: &str, from_body: Option<u16>) -> u16 {
+pub(crate) fn region_id_or(key: &str, from_body: Option<u16>) -> u16 {
     from_body.unwrap_or_else(|| key.parse::<u16>().unwrap_or(0))
 }
 
 /// Decode a `"nodekey:<64 hex>"` / `"discokey:<64 hex>"` / bare-hex string to 32 bytes.
-fn hex_key(s: &str) -> Option<[u8; 32]> {
+pub(crate) fn hex_key(s: &str) -> Option<[u8; 32]> {
     let hex = s.rsplit(':').next().unwrap_or(s);
     if hex.len() != 64 {
         return None;
@@ -205,7 +205,7 @@ fn hex_nib(c: u8) -> Option<u8> {
 }
 
 /// Parse the first IPv4 out of `"100.64.0.1/32"` (skips IPv6 like `"fd7a::/128"`).
-fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+pub(crate) fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     let host = s.split('/').next().unwrap_or(s);
     if host.contains(':') {
         return None;
@@ -222,7 +222,7 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
 }
 
 /// Parse the region id out of a peer's DERP home `"127.3.3.40:<region>"`.
-fn parse_derp_region(s: &str) -> Option<u16> {
+pub(crate) fn parse_derp_region(s: &str) -> Option<u16> {
     s.rsplit(':').next()?.parse::<u16>().ok()
 }
 

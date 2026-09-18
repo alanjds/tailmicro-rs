@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "actson"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78deb7b1fc041f9faa47b5f4c05a48362c5cbb18308bf7f9641e200f56a26a71"
+dependencies = [
+ "btoi",
+ "num-traits",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -202,6 +213,15 @@ checksum = "6bb31b46c14244e20ee9984b11bf5c992b91fb6939fea616e3512c8baecdbe5f"
 dependencies = [
  "memchr",
  "serde_core",
+]
+
+[[package]]
+name = "btoi"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b5ab9db53bcda568284df0fd39f6eac24ad6f7ba7ff1168b9e76eba6576b976"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
@@ -2201,6 +2221,7 @@ dependencies = [
 name = "tm_control"
 version = "0.1.0"
 dependencies = [
+ "actson",
  "arrayvec",
  "async-channel",
  "chacha20poly1305",

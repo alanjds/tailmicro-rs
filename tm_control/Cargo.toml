@@ -12,6 +12,12 @@ heapless  = { workspace = true }
 httparse  = { workspace = true }
 serde     = { workspace = true }
 serde_json = { workspace = true }
+# Push (event) JSON parser: fed decrypted netmap bytes as H2 DATA frames
+# arrive, so the ~34-48KB body is never held in one contiguous allocation
+# (which OOM-aborts on the fragmented ~57KB heap). Push model fits our
+# cooperative single-task async runtime; a pull/from_reader parser would
+# block the executor. See stream_map_response.
+actson = "2.1.0"
 snow      = { workspace = true, features = ["risky-raw-split"] }
 chacha20poly1305 = { workspace = true }
 tokio     = { workspace = true, features = ["sync", "io-util", "net", "time"] }
