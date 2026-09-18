@@ -209,7 +209,20 @@ struct MapRequest<'a> {
     disco_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hostinfo: Option<HostInfo<'a>>,
+    // Serialized as "OmitPeers". On the Stream=true keepalive we set this true:
+    // the control server then holds the long-poll open for online heartbeats
+    // but does NOT send the (~34 KB) peer netmap. Receiving that netmap on a
+    // held-open poll fragments the ~57 KB heap below DERP's ~6 KB TLS block and
+    // OOM-aborts (observed live). We already have the authoritative netmap from
+    // the non-streaming publish, so omitting it on the keepalive is free. Kept
+    // out of the serialized body when false (skip_serializing_if) so the
+    // publish request stays byte-identical.
+    #[serde(skip_serializing_if = "is_false")]
+    omit_peers: bool,
 }
+
+/// serde `skip_serializing_if` predicate for a plain bool field.
+fn is_false(b: &bool) -> bool { !*b }
 
 
 // ── ControlActor ─────────────────────────────────────────────────────────────
@@ -272,19 +285,65 @@ impl ControlActor {
             None => bring_up.await?,
         };
 
-        // Step 8 & 9: streaming MapRequest + streaming response
-        {
-            let map_body = serde_json::to_vec(&MapRequest {
-                version: CAPABILITY_VERSION, compress: "", keep_alive: true,
-                node_key: node_key_hex.as_str(), endpoints: &[], stream: true,
-                disco_key: None, hostinfo: None,
-            }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
+        // Step 8 & 9: streaming keepalive poll, kept alive across drops.
+        //
+        // OurIpAssigned has already fired (during bring-up), so from here this
+        // never returns on success: it holds the streaming poll and, whenever
+        // that poll ends, reconnects and reopens it. A returning poll is NOT a
+        // graceful stop -- `Ok(())` means the server closed the stream and
+        // `Err` means a poll/transport error -- and either way, if we simply
+        // returned, `run()` would park on `cmds.recv()` forever and the node
+        // would go stale (control plane "offline") within a minute. Reconnect
+        // with capped backoff instead. The FIRST bring-up above is deliberately
+        // outside this loop so its failure still propagates to Device::connect's
+        // readiness race; every reconnect below is post-readiness.
+        let mut backoff = core::time::Duration::from_secs(1);
+        loop {
+            // (Re)open the streaming keepalive request on the current
+            // connection. Hostinfo is required by the control server on EVERY
+            // MapRequest, streaming included: omitting it makes the server
+            // answer the poll with `400 "Hostinfo required in MapRequest"` and
+            // immediately close the stream, so the keepalive never holds and
+            // the node goes stale even though the data plane stays up. See the
+            // publish request above and Bug 3 in docs/wg-dataplane-notes.md.
+            // DiscoKey/Endpoints are read-only on a Stream=true request
+            // (cap >= 68) so they stay None; the authoritative values were
+            // already published non-streaming during bring-up.
+            let poll_res = async {
+                let map_body = serde_json::to_vec(&MapRequest {
+                    version: CAPABILITY_VERSION, compress: "", keep_alive: true,
+                    node_key: node_key_hex.as_str(), endpoints: &[], stream: true,
+                    disco_key: None,
+                    hostinfo: Some(HostInfo { os: "embedded", hostname: "esp32c3" }),
+                    omit_peers: true,
+                }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
+                let map_req = build_h2_post("/machine/map", self.config.control_host, MAP_STREAM_ID, &map_body);
+                noise.write_all(&mut main_conn, &map_req).await?;
+                self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_STREAM_ID).await
+            }.await;
 
-            let map_req = build_h2_post("/machine/map", self.config.control_host, MAP_STREAM_ID, &map_body);
-            noise.write_all(&mut main_conn, &map_req).await?;
+            match poll_res {
+                Ok(()) => tracing::warn!("Tailscale keepalive stream closed by server; reconnecting"),
+                Err(e) => tracing::warn!("Tailscale keepalive stream error: {:?}; reconnecting", e),
+            }
+
+            // A dead keepalive stream usually means a dead connection, so
+            // re-establish the whole thing (fresh TCP + Noise + register +
+            // publish) rather than just re-issuing the request. Backoff caps at
+            // 30s so a persistently failing control server is retried, not
+            // hammered. bring-up failures here do NOT propagate (readiness is
+            // already resolved); we just keep retrying.
+            tokio::time::sleep(backoff).await;
+            backoff = core::cmp::min(backoff.saturating_mul(2), core::time::Duration::from_secs(30));
+            match self.bring_up(auth_key, events).await {
+                Ok((c, n, h, _)) => {
+                    main_conn = c; noise = n; h2 = h;
+                    backoff = core::time::Duration::from_secs(1);
+                    info!("Tailscale keepalive reconnected (bring-up ok)");
+                }
+                Err(e) => tracing::warn!("Tailscale keepalive reconnect bring-up failed: {:?}; will retry", e),
+            }
         }
-
-        self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_STREAM_ID).await
     }
 
     /// Bring-up only: TCP + Noise + register + the non-streaming publish
@@ -384,6 +443,7 @@ impl ControlActor {
                 node_key: node_key_hex.as_str(), endpoints: &[], stream: false,
                 disco_key: Some(disco_key_hex.as_str()),
                 hostinfo: Some(HostInfo { os: "embedded", hostname: "esp32c3" }),
+                omit_peers: false,
             }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
 
             let publish_req = build_h2_post("/machine/map", host, MAP_PUBLISH_STREAM_ID, &publish_body);
@@ -446,16 +506,23 @@ impl ControlActor {
         // snapshot that must still parse and return at end_stream, so only the
         // streaming caller gets drain-and-discard on a length desync below.
         let streaming = expected_stream == MAP_STREAM_ID;
-        // v1 fix (card t_e34afeed): once the 4-byte-LE length prefix desyncs
-        // (root cause not yet fixed; seen live as ASCII "Host"), we can no
-        // longer trust ANY subsequent byte as prefix or body, so re-parsing
-        // is pointless. Instead of bailing (which orphans the stream and lets
-        // the control server see us stop reading -> mark us offline, so real
-        // peers stop answering our WG handshake), keep consuming and
-        // discarding every byte on this stream forever, so the server keeps
-        // seeing us as an active reader. v2 (parsing deltas) will fix the
-        // desync itself instead of just surviving it.
-        let mut discarding = false;
+        // Drain-and-discard the streaming keepalive body from the very first
+        // byte: we deliberately never allocate or parse it.
+        //
+        // Once Hostinfo is included (see connect_and_poll), the server answers
+        // the Stream=true poll with the FULL netmap first (~34 KB of JSON,
+        // length-prefixed) and then holds the stream open for keepalives.
+        // try_reserve_exact-ing that 34 KB on a device with ~65 KB free and a
+        // ~40 KB DERP TLS connection to stand up next exhausts the heap and
+        // aborts (observed live: "memory allocation of 6052 bytes failed" in
+        // DerpTls::connect right after this poll). We do not need the streaming
+        // netmap anyway: the authoritative snapshot (our IP, peers, DERPMap)
+        // already came from the non-streaming publish during bring-up. So we
+        // consume every byte, keep sending WINDOW_UPDATEs (flow control below),
+        // and stay in the read loop so the server keeps us marked online, but
+        // allocate nothing. Parsing streaming deltas (to pick up peers that
+        // come online after boot) is the deferred v2 of card t_e34afeed.
+        let mut discarding = streaming;
 
         loop {
             let mut hdr_bytes = [0u8; 9];
@@ -498,15 +565,17 @@ impl ControlActor {
                             // that would OOM-abort with_capacity. Bail gracefully;
                             // the netmap already came from the publish response.
                             if mlen > MAX_MAP_MSG {
-                                if streaming {
-                                    info!("Tailscale stream_map_response: implausible message length {} on stream {}, draining+discarding (staying online)", mlen, expected_stream);
-                                    discarding = true;
-                                    prefix_have = 0;
-                                    cur_len = None;
-                                    break;
-                                }
-                                info!("Tailscale stream_map_response: implausible message length {} on stream {}, ending", mlen, expected_stream);
-                                return Ok(());
+                                // Desynced/garbage length prefix. Discard the rest
+                                // of the stream to end_stream (rather than return
+                                // and orphan unread frames) so the connection stays
+                                // byte-consistent for the next request. Applies to
+                                // both the streaming keepalive (stay online) and the
+                                // non-streaming publish.
+                                info!("Tailscale stream_map_response: implausible message length {} on stream {}, discarding rest of stream", mlen, expected_stream);
+                                discarding = true;
+                                prefix_have = 0;
+                                cur_len = None;
+                                break;
                             }
                             // One exact, FALLIBLE allocation for the whole body;
                             // the appends below never realloc, so peak transient
@@ -514,8 +583,28 @@ impl ControlActor {
                             // into a graceful bail instead of an OOM abort.
                             msg_body = Vec::new();
                             if msg_body.try_reserve_exact(mlen).is_err() {
-                                info!("Tailscale stream_map_response: cannot allocate {} B for map body on stream {} (heap budget), ending", mlen, expected_stream);
-                                return Ok(());
+                                // Rolling-discard fallback. We cannot buffer this
+                                // body: no `mlen`-byte contiguous block on the
+                                // (small, fragmented) heap -- e.g. a ~47 KB netmap
+                                // on a ~57 KB heap, inflated further by ephemeral
+                                // ghost peers. Returning here would orphan the rest
+                                // of the message AND the rest of the stream, so the
+                                // unread frames get read by the NEXT request on this
+                                // connection as if they were its own -> H2
+                                // UnexpectedStream and a reconnect storm (observed
+                                // live). Instead keep consuming every remaining byte
+                                // on the stream (WINDOW_UPDATEs still sent above)
+                                // until end_stream, so the connection stays byte-
+                                // consistent. We lose THIS snapshot's parse but the
+                                // node stays online and a later, smaller netmap
+                                // parses. A streaming JSON parser that never needs
+                                // the whole body is the deferred v2 (card
+                                // t_e34afeed).
+                                info!("Tailscale stream_map_response: cannot allocate {} B for map body on stream {} (heap budget), discarding rest of stream", mlen, expected_stream);
+                                discarding = true;
+                                prefix_have = 0;
+                                cur_len = None;
+                                break;
                             }
                             cur_len = Some(mlen);
                         }
