@@ -296,13 +296,28 @@ async fn event_router_task(
                                     p.tailnet_ip.0[0], p.tailnet_ip.0[1], p.tailnet_ip.0[2], p.tailnet_ip.0[3]);
                             }
                             // Rung-4: bring up the DERP relay leg. Pick a target
-                            // peer (first online, else first) and connect to the
-                            // DERP region it is homed on, so the server can relay
-                            // our WireGuard/disco traffic to it. A repeat Connect
-                            // from a later map snapshot is ignored by the actor
-                            // once a connection is up.
-                            if let Some(target) =
-                                map.peers.iter().find(|p| p.is_online).or_else(|| map.peers.first())
+                            // peer and connect to the DERP region it is homed on,
+                            // so the server can relay our WireGuard/disco traffic
+                            // to it. A repeat Connect from a later map snapshot is
+                            // ignored by the actor once a connection is up.
+                            //
+                            // The target MUST be a peer whose home region is
+                            // actually present in the DERPMap. A peer homed on
+                            // region 0 (no DERP home -- e.g. a stale ghost of our
+                            // own node, which sorts first in the peer list) has no
+                            // resolvable region, and picking it made the connect
+                            // silently no-op so DERP never came up. Prefer an
+                            // online peer with a resolvable region, then fall back
+                            // to any peer with one.
+                            let region_present =
+                                |rid: u16| map.derp_regions.iter().any(|r| r.region_id == rid);
+                            if let Some(target) = map
+                                .peers
+                                .iter()
+                                .find(|p| p.is_online && region_present(p.derp_region))
+                                .or_else(|| {
+                                    map.peers.iter().find(|p| region_present(p.derp_region))
+                                })
                             {
                                 let rid = target.derp_region;
                                 if let Some(region) =
