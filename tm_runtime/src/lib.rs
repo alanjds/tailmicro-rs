@@ -492,6 +492,13 @@ pub struct RuntimeConfig {
     pub node_state:    NodeState,
     pub priority_peer: Option<[u8; 32]>,
     pub our_ip_tx:     Option<OurIpSender>,
+    /// Deadline for the control plane's bring-up phase only (see
+    /// `tm_control::Config::connect_timeout`). `None` disables it. Plumbed
+    /// into `ControlActor`'s `Config` at actor-construction time in
+    /// `Runtime::join` below; NEVER applied to the streaming poll that
+    /// follows bring-up, which always runs unbounded so the node stays
+    /// online. See docs/wg-dataplane-notes.md "Bring-up timeout".
+    pub connect_timeout: Option<core::time::Duration>,
 }
 
 pub struct Runtime {
@@ -575,6 +582,7 @@ impl Runtime {
         // this frame -- this is what keeps `join` under the 32 KB main-task
         // stack.
         tracing::debug!("Runtime::join() - preparing actor tasks");
+        config.control.connect_timeout = config.connect_timeout;
         let control_task = spawn_control(config.control, config.node_state, ctrl_rx, ctrl_ev_tx);
         log_heap("after ControlActor spawn");
         let derp_task = spawn_derp(our_pub, wg_priv, derp_rx, derp_ev_tx);
@@ -611,7 +619,7 @@ impl Runtime {
     /// Use tokio::spawn to run actors in separate tasks.
     /// This is the recommended method for ESP32-C3 when Runtime::join causes memory issues.
     #[cfg(not(target_os = "espidf"))]
-    pub async fn spawn(config: RuntimeConfig) -> Self {
+    pub async fn spawn(mut config: RuntimeConfig) -> Self {
         let (ctrl_tx,  ctrl_rx)  = async_channel::bounded::<ControlCmd>(CHAN_CAP);
         let (ctrl_ev_tx, mut ctrl_ev_rx) = async_channel::bounded::<ControlEvent>(CHAN_CAP);
 
@@ -632,6 +640,7 @@ impl Runtime {
         // moved into ControlActor below).
         let wg_priv = *config.node_state.node_key.as_bytes();
 
+        config.control.connect_timeout = config.connect_timeout;
         let control_actor = ControlActor::new(config.control, config.node_state);
         tokio::spawn(control_actor.run(ctrl_rx, ctrl_ev_tx));
 

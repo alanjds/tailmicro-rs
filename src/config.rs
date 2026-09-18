@@ -15,6 +15,12 @@ pub struct Config {
     /// is no path that produces a working `Config` without going through
     /// `with_control_pin_hex`.
     pub(crate) control_pin: [u8; 32],
+    /// Deadline for control-plane bring-up only (TCP + Noise + register +
+    /// publish, up to and including the tailnet IP being assigned). `None`
+    /// (the default) disables it. Once bring-up succeeds, the streaming
+    /// keepalive poll that follows runs unbounded regardless of this value
+    /// — see `tm_control::Config::connect_timeout`.
+    pub(crate) connect_timeout: Option<std::time::Duration>,
 }
 
 impl Config {
@@ -46,6 +52,19 @@ impl Config {
         Ok(self)
     }
 
+    /// Set the bring-up-only connect deadline (see `connect_timeout` field
+    /// doc). The caller (e.g. the app's outer wrapper) is expected to use
+    /// this INSTEAD OF an external `select!`/`timeout(..)` wrapped around
+    /// `Device::new(..)` — wrapping the whole `Device::new` future in a
+    /// dropping timeout races the streaming poll and, if it ever fires
+    /// after bring-up, drops every actor and gets the ephemeral node
+    /// garbage-collected off the tailnet. This deadline only ever bounds
+    /// bring-up; the streaming poll after it is always unbounded.
+    pub fn with_connect_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
     pub(crate) async fn load_or_generate_keys(&self) -> Result<NodeState, Error> {
         // On ESP32-C3: read from NVS; generate + persist on first boot.
         // On host: read from key_file JSON; generate + write on first run.
@@ -58,6 +77,7 @@ impl Config {
             control_host: self.control_host,
             control_port: self.control_port,
             control_pin:  self.control_pin,
+            connect_timeout: self.connect_timeout,
         }
     }
 }
@@ -69,6 +89,7 @@ impl Default for Config {
             control_port: 80,
             key_file:     None,
             control_pin:  [0u8; 32],
+            connect_timeout: None,
         }
     }
 }

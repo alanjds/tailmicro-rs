@@ -122,6 +122,7 @@ impl Device {
             priority_peer: None,
             #[cfg(target_os = "espidf")]
             our_ip_tx: Some(our_ip_tx),
+            connect_timeout: config.connect_timeout,
         };
 
         #[cfg(target_os = "espidf")]

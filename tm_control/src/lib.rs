@@ -106,13 +106,26 @@ pub struct Config {
     /// handshake, so it is mandatory (no `Default` impl for `Config`: an
     /// all-zero sentinel here can't verify anything downstream).
     pub control_pin: [u8; 32],
+    /// Deadline for the bring-up phase only (TCP + Noise + register + the
+    /// non-streaming publish MapRequest, i.e. everything up to and including
+    /// `OurIpAssigned`). `None` disables the deadline. The streaming poll
+    /// that follows bring-up NEVER gets a deadline — it must run unbounded
+    /// (drain-and-discard, see `stream_map_response`) so the ephemeral node
+    /// stays online. See docs/wg-dataplane-notes.md "Bring-up timeout".
+    pub connect_timeout: Option<core::time::Duration>,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub enum ControlError { Tls, Noise(NoiseError), Http, H2(H2Error), Json(JsonError),
-                        PeerTableFull, RegistrationFailed, Io, Pin(pin::PinError) }
+                        PeerTableFull, RegistrationFailed, Io, Pin(pin::PinError),
+                        /// The bring-up phase (TCP + Noise + register + publish, up
+                        /// to `OurIpAssigned`) did not complete within
+                        /// `Config::connect_timeout`. Never returned once bring-up
+                        /// has succeeded — the streaming poll after it has no
+                        /// deadline. See `ControlActor::connect_and_poll`.
+                        Timeout }
 #[derive(Debug)]
 pub enum NoiseError { Handshake, Decrypt, Encrypt }
 #[derive(Debug)]
@@ -231,6 +244,48 @@ impl ControlActor {
                                events: &async_channel::Sender<ControlEvent>)
         -> Result<(), ControlError>
     {
+        // Bring-up (TCP + Noise + register + non-streaming publish, up to
+        // and including OurIpAssigned) is the ONLY phase bounded by
+        // `connect_timeout`. It is wrapped in `tokio::time::timeout` below
+        // when a deadline is configured. The streaming poll that follows
+        // (Step 8 & 9, further down this function) gets NO deadline: it
+        // must run unbounded (drain-and-discard, already implemented in
+        // `stream_map_response`) so the ephemeral node stays online. See
+        // docs/wg-dataplane-notes.md "Bring-up timeout".
+        let connect_timeout = self.config.connect_timeout;
+        let bring_up = self.bring_up(auth_key, events);
+        let (mut main_conn, mut noise, mut h2, node_key_hex) = match connect_timeout {
+            Some(dur) => tokio::time::timeout(dur, bring_up).await.map_err(|_| {
+                tracing::error!("Control bring-up exceeded connect_timeout ({:?})", dur);
+                ControlError::Timeout
+            })??,
+            None => bring_up.await?,
+        };
+
+        // Step 8 & 9: streaming MapRequest + streaming response
+        {
+            let map_body = serde_json::to_vec(&MapRequest {
+                version: CAPABILITY_VERSION, compress: "", keep_alive: true,
+                node_key: node_key_hex.as_str(), endpoints: &[], stream: true,
+                disco_key: None, hostinfo: None,
+            }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
+
+            let map_req = build_h2_post("/machine/map", self.config.control_host, MAP_STREAM_ID, &map_body);
+            noise.write_all(&mut main_conn, &map_req).await?;
+        }
+
+        self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_STREAM_ID).await
+    }
+
+    /// Bring-up only: TCP + Noise + register + the non-streaming publish
+    /// MapRequest and its parse (which emits `MapUpdate` + `OurIpAssigned`
+    /// via `stream_map_response`). No deadline is applied inside this
+    /// function itself — the caller (`connect_and_poll`) wraps the call in
+    /// `tokio::time::timeout` when `connect_timeout` is set.
+    async fn bring_up(&mut self, auth_key: &str,
+                       events: &async_channel::Sender<ControlEvent>)
+        -> Result<(tokio::net::TcpStream, NoiseChannel, H2State, heapless::String<80>), ControlError>
+    {
         info!("Tailscale connect_and_poll starting");
         let host = self.config.control_host;
         let port = self.config.control_port;
@@ -335,19 +390,11 @@ impl ControlActor {
         info!("Tailscale Step 7.5: reading + parsing publish MapResponse");
         self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_PUBLISH_STREAM_ID).await?;
 
-        // Step 8 & 9: streaming MapRequest + streaming response
-        {
-            let map_body = serde_json::to_vec(&MapRequest {
-                version: CAPABILITY_VERSION, compress: "", keep_alive: true,
-                node_key: node_key_hex.as_str(), endpoints: &[], stream: true,
-                disco_key: None, hostinfo: None,
-            }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
-
-            let map_req = build_h2_post("/machine/map", host, MAP_STREAM_ID, &map_body);
-            noise.write_all(&mut main_conn, &map_req).await?;
-        }
-
-        self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_STREAM_ID).await
+        // Bring-up complete: OurIpAssigned has been emitted. Hand the live
+        // connection state back to `connect_and_poll`, which continues with
+        // the UNBOUNDED streaming poll (Step 8 & 9) — no timeout applies
+        // past this point.
+        Ok((main_conn, noise, h2, node_key_hex))
     }
 
     async fn stream_map_response<S: IoStream>(
@@ -615,6 +662,105 @@ async fn read_one_h2_body<S: IoStream>(
             FrameAction::SendPingAck(p) => { debug!("read_one_h2_body[{}]: PING -> ack", expected_stream); let mut a=[0u8;17]; write_ping_ack(&mut a,&p); noise.write_all(stream,&a).await?; }
             FrameAction::GoAway => { info!("read_one_h2_body[{}]: GOAWAY", expected_stream); return Err(ControlError::H2(H2Error::GoAway{last_stream:0,error_code:0})); }
             FrameAction::Ignore => { debug!("read_one_h2_body[{}]: Ignore (type={})", expected_stream, hdr.frame_type); }
+        }
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+//
+// Host-only: exercises `ControlActor::run` against a local `TcpListener`
+// stand-in for the control server, so no real Noise/H2 handshake needs to
+// complete. These only need bring-up (the Noise handshake read, which the
+// stand-in server never answers) to hang long enough for `connect_timeout`
+// to matter.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+
+    fn leak_host(addr: std::net::SocketAddr) -> &'static str {
+        Box::leak(addr.ip().to_string().into_boxed_str())
+    }
+
+    async fn run_once(config: Config) -> ControlEvent {
+        let node_state = NodeState::generate();
+        let actor = ControlActor::new(config, node_state);
+
+        let (cmd_tx, cmd_rx) = async_channel::bounded::<ControlCmd>(2);
+        let (ev_tx, ev_rx) = async_channel::bounded::<ControlEvent>(4);
+
+        cmd_tx.send(ControlCmd::Start {
+            auth_key: heapless::String::try_from("tskey-test").unwrap(),
+        }).await.unwrap();
+        cmd_tx.send(ControlCmd::Shutdown).await.unwrap();
+        drop(cmd_tx);
+
+        // `run()` itself must never hang past a reasonable outer bound: if
+        // `connect_timeout` isn't actually enforced, this outer timeout is
+        // what fails the test (rather than the test hanging forever).
+        tokio::time::timeout(Duration::from_secs(5), actor.run(cmd_rx, ev_tx))
+            .await
+            .expect("ControlActor::run must return promptly, not hang");
+
+        ev_rx.recv().await.expect("expected a ControlEvent")
+    }
+
+    /// Bring-up (the Noise handshake read) exceeding a tiny `connect_timeout`
+    /// must yield `ControlEvent::Error(ControlError::Timeout)` and `run()`
+    /// must return cleanly (no streamer exists yet, so nothing to tear down).
+    #[tokio::test]
+    async fn bring_up_timeout_emits_error_and_returns() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept the connection but never write a response: the Noise
+        // handshake's read half hangs forever, so only `connect_timeout`
+        // can end `bring_up`.
+        tokio::spawn(async move {
+            let (_sock, _peer) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await
+        });
+
+        let config = Config {
+            control_host: leak_host(addr),
+            control_port: addr.port(),
+            control_pin: [0u8; 32],
+            connect_timeout: Some(Duration::from_millis(50)),
+        };
+
+        match run_once(config).await {
+            ControlEvent::Error(ControlError::Timeout) => {}
+            ControlEvent::Error(_) => panic!("expected ControlError::Timeout, got a different ControlError"),
+            _ => panic!("expected ControlEvent::Error, got a different ControlEvent"),
+        }
+    }
+
+    /// `connect_timeout: None` must disable the deadline entirely: a
+    /// bring-up failure in this mode must never surface as
+    /// `ControlError::Timeout` (there is no deadline to exceed).
+    #[tokio::test]
+    async fn none_connect_timeout_disables_deadline() {
+        // Bind then immediately drop, so nothing listens on this port and
+        // the TCP connect fails fast (connection refused) rather than
+        // hanging — proving absence of `ControlError::Timeout` isn't just
+        // because the (nonexistent) deadline hasn't fired yet.
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let config = Config {
+            control_host: leak_host(addr),
+            control_port: addr.port(),
+            control_pin: [0u8; 32],
+            connect_timeout: None,
+        };
+
+        match run_once(config).await {
+            ControlEvent::Error(ControlError::Timeout) => {
+                panic!("connect_timeout: None must never produce ControlError::Timeout");
+            }
+            ControlEvent::Error(_) => {} // any other connect error is expected
+            _ => panic!("expected ControlEvent::Error"),
         }
     }
 }
