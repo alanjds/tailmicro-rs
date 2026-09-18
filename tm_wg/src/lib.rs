@@ -118,11 +118,12 @@ impl WgActor {
     }
 
     /// Get the endpoint, allocating (and boxing) it on first use. `new_boxed`
-    /// builds+boxes in its own `#[inline(never)]` frame to keep the ~28 KB off
-    /// this caller's stack.
+    /// builds+boxes in its own `#[inline(never)]` frame to keep it off this
+    /// caller's stack. Size is ~6 KB since QUEUE_DEPTH = 0 dropped the inline
+    /// per-peer packet queues (was ~28 KB, which OOM-aborted here on device).
     fn endpoint(&mut self) -> &mut WgEndpoint {
         if self.endpoint.is_none() {
-            tracing::info!("WgActor: allocating WgEndpoint (~28 KB) on first use");
+            tracing::info!("WgActor: allocating WgEndpoint (~6 KB) on first use");
             self.endpoint = Some(WgEndpoint::new_boxed(self.kp));
         }
         self.endpoint.as_mut().unwrap()

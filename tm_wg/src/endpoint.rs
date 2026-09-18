@@ -34,9 +34,17 @@ use crate::vendor::{
 };
 
 pub const MAX_PEERS: usize = 8;
-/// Per-peer packet queue depth. Kept small (plan correction #5: queues are the
-/// dominant RAM term, not the replay window).
-const QUEUE_DEPTH: usize = 2;
+/// Per-peer packet queue depth. Zero: the queue holds outbound *app-data*
+/// packets while a session is still handshaking, but that path is not wired to
+/// a `WgCmd` variant yet (see `queue_push` / `SessionState::needs_rotation`,
+/// both dead code). At `QUEUE_DEPTH = 2` this queue was 3048 of each Peer's
+/// 3488 bytes -- ~24 KB of the ~28 KB `WgEndpoint` -- reserved inline for all
+/// MAX_PEERS slots up front, and allocating that on the ESP32-C3's fragmented
+/// ~57 KB heap (once the DERP TLS session is up) OOM-aborted the data-plane
+/// bring-up (`memory allocation of 27968 bytes failed`). With no inline queue
+/// the endpoint drops to ~6 KB (5968 bytes) and fits. When the outbound app-data path is
+/// wired up, give it a heap-on-demand queue rather than a per-slot inline one.
+const QUEUE_DEPTH: usize = 0;
 /// Session-id map capacity: 3 keypairs/peer (current/previous/next).
 const SESSION_MAP_CAP: usize = 3 * MAX_PEERS;
 /// Max packets a single `recv_one` call emits (in `RecvOut::to_peer` /
@@ -87,8 +95,16 @@ type Queue = ArrayVec<Packet, QUEUE_DEPTH>;
 /// Part of the outbound app-data path (queue packets while a session is being
 /// established). That path is not yet wired to a `WgCmd` variant, so this and
 /// `SessionState::needs_rotation` are currently unused.
+///
+/// With `QUEUE_DEPTH == 0` the queue has no capacity: `is_full()` is always
+/// true and both `remove(0)` (empty vec) and `push` would panic, so the packet
+/// is simply dropped. Pre-session app-data is best-effort until the outbound
+/// path is wired up, so dropping it is the correct no-op here.
 #[allow(dead_code)]
 fn queue_push(q: &mut Queue, pkt: Packet) {
+    if QUEUE_DEPTH == 0 {
+        return;
+    }
     if q.is_full() {
         q.remove(0);
     }
@@ -795,6 +811,22 @@ mod tests {
 
     fn now_unix() -> Option<u64> {
         Some(1_700_000_123)
+    }
+
+    #[test]
+    fn wgendpoint_fits_fragmented_heap() {
+        // Regression guard for the QUEUE_DEPTH = 0 fix: at QUEUE_DEPTH = 2 the
+        // endpoint was 28240 bytes and its first-use allocation OOM-aborted on
+        // the ESP32-C3's fragmented ~57 KB heap. With the inline per-peer queue
+        // removed it is ~6 KB. Keep it well under 8 KB so nobody silently
+        // re-inflates the per-peer footprint. Prints the live size on failure.
+        let sz = core::mem::size_of::<WgEndpoint>();
+        assert!(
+            sz <= 8 * 1024,
+            "WgEndpoint grew to {sz} bytes (Peer = {} bytes, QUEUE_DEPTH = {QUEUE_DEPTH}); \
+             it must stay small enough to allocate on the device's fragmented heap",
+            core::mem::size_of::<Peer>(),
+        );
     }
 
     #[test]
