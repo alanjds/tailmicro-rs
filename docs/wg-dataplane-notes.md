@@ -1440,3 +1440,84 @@ keepalive poll. On the length-prefix desync (`mlen > MAX_MAP_MSG`):
 `cargo test -p tm_wg` (23, unchanged) both green; no regression to the
 publish-response path or heap budget (online-only filtering can only shrink
 peer storage, never grow it).
+
+## Bring-up timeout (Shape A — cooperative, no dedicated thread)
+
+Card t_0d32f11d ("Board never stays online on tailnet") root-caused the
+board never appearing on the dashboard: the app-side outer wrapper
+(`tasmolike-rs::tailscale_rust`) wrapped its ENTIRE `Device::new(..)` call in
+`tokio::time::timeout(60s, ..)`. On ESP32-C3, `Device::new` (via
+`Runtime::join`) never returns while the actors run — `Runtime::join`'s
+`tokio::join!` only resolves once every actor task ends, and the streaming
+MapResponse poll (this doc's "Fix 2" above) is deliberately unbounded so the
+control server keeps the ephemeral node marked online. So the wrapper's
+timeout *always* eventually fires, even on a fully successful connection,
+dropping the whole `Runtime::join` future — every actor with it — which
+closes the control connection and gets the ephemeral node garbage-collected
+off the tailnet. That is why rung-6a (handshake + round-trip) succeeded in
+testing yet the board never showed up: the timeout fired sometime after
+success, not before it.
+
+The owner's chosen fix (Shape A, rejecting a dedicated ~32 KB
+`std::thread::spawn` "Shape B") is that **the connect deadline moves inside
+`tm_control`, and only bounds bring-up** — never the streaming poll:
+
+- `tm_control::Config` gains `connect_timeout: Option<Duration>`.
+  `tm_runtime::RuntimeConfig` gains the same field and copies it into
+  `config.control.connect_timeout` right before actor construction in both
+  `Runtime::join` and `Runtime::spawn`. `tailmicro::Config` gains a
+  `.with_connect_timeout(Duration)` builder mirroring
+  `.with_control_pin_hex(..)`, plumbed through `Device::new`.
+- `ControlActor::connect_and_poll` is split into `bring_up` (TCP + Noise +
+  register + the non-streaming publish MapRequest + its parse — i.e.
+  everything through `OurIpAssigned`) and the streaming poll that follows.
+  `connect_and_poll` wraps ONLY the `bring_up` call in
+  `tokio::time::timeout(dur, ..)` when `connect_timeout` is `Some`; with
+  `None` it calls `bring_up` directly, no deadline. The streaming
+  `stream_map_response(.., MAP_STREAM_ID)` call after it is never wrapped in
+  anything.
+- On a bring-up timeout, `connect_and_poll` returns
+  `Err(ControlError::Timeout)` (new variant), which `ControlActor::run`'s
+  existing error path turns into `events.send(ControlEvent::Error(..))` and
+  a clean return from `run` — no streamer was ever constructed at that
+  point, so there is nothing to tear down beyond dropping the half-open
+  connection.
+- `tm_control`'s main `tokio` dependency gained the `"time"` feature (it was
+  previously `sync`/`io-util`/`net` only — `time` was dev-deps-only, used by
+  host examples, not by the shipped crate). `tokio::time::timeout` needs the
+  runtime's time driver; `Builder::enable_all()` (already the documented
+  guidance in `src/lib.rs`'s module doc and `examples/udp_echo/main.rs`) or
+  an explicit `.enable_time()` covers this. **The actual esp-idf
+  `tokio::runtime::Builder` is constructed in the sibling app
+  (`tasmolike-rs`), not in this repo** — that app's real `main`/`app_main`
+  runtime construction must confirm `.enable_time()` (or `.enable_all()`) is
+  set, or `tokio::time::timeout` will panic ("there is no timer running")
+  instead of firing.
+- The readiness signal the wrapper should await instead of an external
+  timeout already existed and is unchanged: `RuntimeConfig.our_ip_tx`, fired
+  by the event router on `ControlEvent::OurIpAssigned` (emitted from the
+  non-streaming publish parse, before the streaming poll starts). Verified
+  intact end-to-end for this change.
+- No retry logic on bring-up timeout — that's an explicitly deferred v2
+  follow-up (card t_0d32f11d comment "CHOSEN DESIGN").
+
+### New tests (`tm_control/src/lib.rs`, `mod tests`)
+Both host-only, against a local `TcpListener` stand-in for the control
+server (no real Noise/H2 handshake needs to complete — bring-up just needs
+to hang long enough for the deadline to matter):
+- `bring_up_timeout_emits_error_and_returns`: a listener that accepts but
+  never answers, `connect_timeout: Some(50ms)` — asserts
+  `ControlEvent::Error(ControlError::Timeout)` and that `run()` returns
+  within an outer 5s bound (i.e. it doesn't hang past the deadline).
+- `none_connect_timeout_disables_deadline`: `connect_timeout: None` against
+  a closed port (fails fast, connection refused) — asserts the resulting
+  `ControlEvent::Error` is never `ControlError::Timeout`.
+
+### Wrapper-side change needed (sibling app, not in this repo)
+`tasmolike-rs::tailscale_rust` must delete its external
+`tokio::time::timeout(60s, Device::new(..))` wrapper — it is what was
+killing the node — and instead pass `connect_timeout` into
+`tailmicro::Config` and await the `our_ip` readiness signal out-of-band, so
+the long-running device future is never raced against a dropping timeout.
+See the implementation report on card t_0d32f11d for the concrete patch
+text (not applied here; out of this repo's scope per the card).
