@@ -232,6 +232,16 @@ impl ControlActor {
                     if let Err(e) = self.connect_and_poll(auth_key.as_str(), &events).await {
                         tracing::error!("Control error: {:?}", e);
                         let _ = events.send(ControlEvent::Error(e)).await;
+                        // No retry (v2 follow-up, see docs/wg-dataplane-notes.md
+                        // "Bring-up timeout"): end run() so `events` is
+                        // dropped and the closed channel cascades through
+                        // the event router to `Runtime::connect`'s readiness
+                        // race (our_ip_tx's sender lives inside the event
+                        // router and is dropped once it sees this channel
+                        // close), rather than leaving this task parked on
+                        // `cmds.recv()` forever with no one left to send it
+                        // another command.
+                        break;
                     }
                 }
                 Ok(ControlCmd::Shutdown) | Err(_) => break,

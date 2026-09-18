@@ -22,15 +22,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // ── Identical to tailscale-rs example ────────────────────────────────────
     let config = tailmicro::Config::default_with_key_file("tailmicro_keys.json")
         .await?
-        .with_control_pin_hex(&control_pin_hex)?;
-    let dev = tailmicro::Device::new(&config, Some(auth_key)).await?;
+        .with_control_pin_hex(&control_pin_hex)?
+        .with_connect_timeout(Duration::from_secs(60));
+    // `driver` must be folded into this fn's own tokio::join! below -- never
+    // awaited alone, never raced under an external timeout/select! (see
+    // docs/wg-dataplane-notes.md "Readiness-decoupled connect handle").
+    let (dev, driver) = tailmicro::Device::connect(&config, Some(auth_key)).await?;
 
-    let sock = dev.udp_bind((dev.ipv4_addr().await?, 1234).into()).await?;
+    let sock = dev.udp_bind((dev.ipv4_addr(), 1234).into()).await?;
 
     tracing::info!("Connected. Sending to {}:5678 every second.", peer_ip);
 
-    loop {
-        sock.send_to((peer_ip, 5678u16).into(), b"hello").await?;
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    let ping_loop = async {
+        loop {
+            sock.send_to((peer_ip, 5678u16).into(), b"hello").await?;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), Box<dyn Error>>(())
+    };
+
+    let (ping_result, ()) = tokio::join!(ping_loop, driver);
+    ping_result
 }

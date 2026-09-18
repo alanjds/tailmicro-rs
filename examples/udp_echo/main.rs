@@ -34,19 +34,36 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .expect("set TAILMICRO_CONTROL_PIN env var (hex pin blob from tools/gen_fingerprint.py)");
 
     let config = tailmicro::Config::new(&auth_key)
-        .with_control_pin_hex(&control_pin_hex)?;
-    let dev = tailmicro::Device::new(&config, Some(auth_key)).await?;
+        .with_control_pin_hex(&control_pin_hex)?
+        .with_connect_timeout(std::time::Duration::from_secs(60));
+    // `Device::connect` returns as soon as bring-up completes (bounded by
+    // the connect_timeout above); `driver` is the still-pending data-plane
+    // future -- it must be folded into this fn's own tokio::join! below,
+    // NOT awaited alone and NOT raced under an external timeout/select!
+    // (see docs/wg-dataplane-notes.md "Readiness-decoupled connect handle").
+    let (dev, driver) = tailmicro::Device::connect(&config, Some(auth_key)).await?;
 
-    let our_ip = dev.ipv4_addr().await?;
+    let our_ip = dev.ipv4_addr();
     tracing::info!("Tailnet IP: {}", our_ip);
 
     let sock = dev.udp_bind((our_ip, 9000u16).into()).await?;
     tracing::info!("UDP echo listening on {}:9000", our_ip);
 
-    let mut buf = [0u8; 1500];
-    loop {
-        let (n, from) = sock.recv_from(&mut buf).await?;
-        tracing::debug!("Echo {} bytes to {}", n, from);
-        sock.send_to(from, &buf[..n]).await?;
-    }
+    let echo_loop = async {
+        let mut buf = [0u8; 1500];
+        loop {
+            let (n, from) = sock.recv_from(&mut buf).await?;
+            tracing::debug!("Echo {} bytes to {}", n, from);
+            sock.send_to(from, &buf[..n]).await?;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), Box<dyn Error>>(())
+    };
+
+    // Neither future normally returns: the data plane's streaming keepalive
+    // poll is deliberately unbounded (keeps the node marked online) and the
+    // echo loop runs forever. tokio::join! (not select!) so a slow/blocked
+    // echo loop can never drop `driver` out from under the connection.
+    let (echo_result, ()) = tokio::join!(echo_loop, driver);
+    echo_result
 }

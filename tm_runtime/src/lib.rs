@@ -292,7 +292,14 @@ async fn event_router_task(
                         }
                         ControlEvent::OurIpAssigned(ip) => {
                             info!("Runtime::join() - received ControlEvent::OurIpAssigned: {}.{}.{}.{}", ip.0[0], ip.0[1], ip.0[2], ip.0[3]);
-                            #[cfg(target_os = "espidf")]
+                            // Not espidf-specific: `OurIpSender` is a plain
+                            // `async_channel::Sender<Ipv4Addr>`, so this must
+                            // fire on every target. It used to be gated to
+                            // espidf only, which meant `Runtime::connect`'s
+                            // readiness signal (and any host test of it)
+                            // never fired on host — see
+                            // docs/wg-dataplane-notes.md "Readiness-decoupled
+                            // connect handle".
                             if let Some(ref tx) = our_ip_tx {
                                 #[cfg(target_os = "espidf")]
                                 tokio_freertos_yield().await;
@@ -509,15 +516,71 @@ pub struct Runtime {
     pub wg_tx:      async_channel::Sender<WgCmd>,
 }
 
+/// The still-pending data-plane future handed back by `Runtime::connect`.
+///
+/// Polling it is what keeps every actor (control, DERP, disco, WireGuard,
+/// event router — including the deliberately unbounded streaming MapResponse
+/// poll) alive; it resolves only once every actor's task ends, which during
+/// normal operation is never. The caller MUST fold this into its own
+/// `tokio::join!`/`tokio::try_join!` alongside its other work — NOT
+/// `.await` it alone (that reproduces `Runtime::join`'s "never returns"
+/// behavior) and NOT race it under an external `timeout`/`select!` that
+/// would drop it (that reproduces the ephemeral-node-GC bug from card
+/// t_0d32f11d: dropping this future drops every actor, closing the control
+/// connection). See docs/wg-dataplane-notes.md "Readiness-decoupled connect
+/// handle".
+pub type Driver = core::pin::Pin<Box<dyn core::future::Future<Output = ()>>>;
+
+/// `Runtime::connect` failed to reach readiness (`OurIpAssigned`) before the
+/// data-plane future itself ended. In practice this means bring-up failed
+/// or exceeded `RuntimeConfig::connect_timeout` — `ControlActor` emits
+/// `ControlEvent::Error` and ends its task in that case, which (via the
+/// event router closing in turn) drops the readiness sender and unblocks
+/// this race with an `Err` rather than hanging forever. No retry here —
+/// v2 follow-up, see docs/wg-dataplane-notes.md.
+#[derive(Debug)]
+pub struct ConnectError;
+
+/// Race an arbitrary long-running "driver" future against a readiness
+/// channel, WITHOUT ever dropping the driver.
+///
+/// This is the pure-async pattern `Runtime::connect` is built on: `driver`
+/// is `&mut`-borrowed (never consumed), so if `ready_rx` fires first,
+/// `driver` is left exactly where it was -- still pending, still fully
+/// alive, no actor torn down -- for the caller to keep polling afterward.
+/// If `driver` resolves first, or `ready_rx`'s sender is dropped before
+/// sending, this returns `Err(())`.
+///
+/// Deliberately generic over `D`/`T` and free of any `tm_runtime` actor
+/// type: this is the one piece of `connect`'s logic that has no
+/// `esp-idf-sys`/`esp-idf-svc` dependency and so is host-unit-testable even
+/// though the rest of this crate (and the `tailmicro` root crate that wraps
+/// it) is not — see `tm_runtime`'s host-build note in
+/// docs/wg-dataplane-notes.md "Readiness-decoupled connect handle".
+pub async fn race_driver_vs_ready<T, D>(
+    driver: &mut D,
+    ready_rx: &async_channel::Receiver<T>,
+) -> Result<T, ()>
+where
+    D: core::future::Future<Output = ()> + Unpin,
+{
+    tokio::select! {
+        _ = driver => Err(()),
+        recv = ready_rx.recv() => recv.map_err(|_| ()),
+    }
+}
+
 impl Runtime {
-    /// Run all actors within a single task using `tokio::join!`.
+    /// Shared actor/channel construction for both `join` and `connect`.
     ///
-    /// This avoids per-task heap allocations that `tokio::spawn` incurs.
-    /// All actors run cooperatively on the same stack.
-    ///
-    /// This is the recommended method for ESP32-C3.
-    pub async fn join(mut config: RuntimeConfig) -> Self {
-        tracing::debug!("Runtime::join() - starting actor runtime");
+    /// Builds every actor and the event router exactly as before, sends the
+    /// initial `ControlCmd::Start`, and returns the still-idle `Runtime`
+    /// handle (its command senders are usable immediately — they don't
+    /// depend on any actor having made progress) together with the combined
+    /// `Driver` future, NOT yet polled to completion.
+    #[inline(never)]
+    async fn build(mut config: RuntimeConfig) -> (Self, Driver) {
+        tracing::debug!("Runtime::build() - starting actor runtime");
 
         // ── Channel allocation ──────────────────────────────────────────────
         // Heap probes routed through `log_heap` (see its doc comment): kept
@@ -596,24 +659,78 @@ impl Runtime {
             ctrl_tx3, derp_tx2, wg_tx2, disco_tx2, our_ip_tx,
         );
 
-        log_heap("before tokio::join! (all actors constructed)");
+        log_heap("before Driver construction (all actors constructed)");
 
-        tracing::debug!("Runtime::join() - sending ControlCmd::Start");
+        tracing::debug!("Runtime::build() - sending ControlCmd::Start");
         let _ = ctrl_tx4.send(ControlCmd::Start { auth_key: config.auth_key.clone() }).await;
 
-        tracing::debug!("Runtime::join() - joining actor tasks with tokio::join!");
+        tracing::debug!("Runtime::build() - combining actor tasks into a single Driver future");
         // Run all actors together. The event_router loop runs indefinitely until a channel error occurs.
         // The other tasks (control_task, derp_task, disco_task, wg_task) will complete when their channels close.
-        tokio::join!(
-            control_task,
-            derp_task,
-            disco_task,
-            wg_task,
-            event_router,
-        );
+        // Boxed (not returned as an opaque `impl Future`) so `Driver` is a
+        // concrete, nameable type callers can hold across an `.await` point
+        // (in `connect`'s readiness race) without it becoming part of any
+        // caller's own generator state -- same off-frame-boxing discipline
+        // as every `spawn_*` helper above.
+        let driver: Driver = Box::pin(async move {
+            tokio::join!(
+                control_task,
+                derp_task,
+                disco_task,
+                wg_task,
+                event_router,
+            );
+            tracing::debug!("Runtime - all actor tasks completed");
+        });
 
-        tracing::debug!("Runtime::join() - all tasks completed");
-        Runtime { control_tx: ctrl_tx, derp_tx, disco_tx, wg_tx }
+        (Runtime { control_tx: ctrl_tx, derp_tx, disco_tx, wg_tx }, driver)
+    }
+
+    /// Run all actors within a single task using `tokio::join!`.
+    ///
+    /// This avoids per-task heap allocations that `tokio::spawn` incurs.
+    /// All actors run cooperatively on the same stack.
+    ///
+    /// Never returns while the connection is up (the streaming MapResponse
+    /// poll is deliberately unbounded so the node stays marked online) --
+    /// prefer `Runtime::connect` for any caller that needs to do other work
+    /// (e.g. run an HTTP server) concurrently with the data plane, since
+    /// that other work can't proceed until this returns. See
+    /// docs/wg-dataplane-notes.md "Readiness-decoupled connect handle".
+    pub async fn join(config: RuntimeConfig) -> Self {
+        let (runtime, driver) = Self::build(config).await;
+        driver.await;
+        runtime
+    }
+
+    /// Connect and return as soon as the tailnet IP is assigned
+    /// (`ControlEvent::OurIpAssigned`), handing back the still-pending data
+    /// plane `Driver` future for the caller to fold into its own
+    /// `tokio::join!`/`tokio::try_join!`.
+    ///
+    /// Bring-up (TCP + Noise + register + publish, up to `OurIpAssigned`) is
+    /// bounded by `RuntimeConfig::connect_timeout` inside `ControlActor`
+    /// itself -- `connect` adds no timeout of its own. On a bring-up
+    /// failure or timeout, `ControlActor::run` emits `ControlEvent::Error`
+    /// and ends its task; that closes the control event channel, which ends
+    /// the event router in turn, which drops the readiness sender created
+    /// below -- so the race below resolves to `Err(ConnectError)` rather
+    /// than hanging.
+    ///
+    /// Whichever caller-supplied `config.our_ip_tx` may have been set is
+    /// overwritten here: `connect` owns the readiness channel it races
+    /// against the driver, so it must be the one to construct and hold the
+    /// sending half.
+    pub async fn connect(mut config: RuntimeConfig) -> Result<(Self, Ipv4Addr, Driver), ConnectError> {
+        let (our_ip_tx, our_ip_rx) = async_channel::bounded::<Ipv4Addr>(1);
+        config.our_ip_tx = Some(our_ip_tx);
+
+        let (runtime, mut driver) = Self::build(config).await;
+
+        match race_driver_vs_ready(&mut driver, &our_ip_rx).await {
+            Ok(ip) => Ok((runtime, ip, driver)),
+            Err(()) => Err(ConnectError),
+        }
     }
 
     /// Use tokio::spawn to run actors in separate tasks.
@@ -743,5 +860,79 @@ impl Runtime {
         let _ = ctrl_tx4.send(ControlCmd::Start { auth_key: config.auth_key.clone() }).await;
 
         Runtime { control_tx: ctrl_tx, derp_tx, disco_tx, wg_tx }
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+//
+// NOTE: this crate cannot currently be `cargo test`-ed on host in this
+// environment -- `tm_runtime`'s `[dependencies]` pull in `esp-idf-sys`/
+// `esp-idf-svc` unconditionally (not `cfg`-gated to `target_os = "espidf"`),
+// and `esp-idf-sys`'s build script refuses any non-espidf target outright
+// ("Unsupported target 'x86_64-unknown-linux-gnu'"). Confirmed pre-existing
+// (present before this change too, via `git stash` + rebuild on the prior
+// commit) and NOT something this change introduces or fixes -- see
+// docs/wg-dataplane-notes.md "Readiness-decoupled connect handle" for the
+// note to the owner. These tests exercise the real `race_driver_vs_ready`
+// used by `Runtime::connect` (not a re-implementation) and will run
+// wherever this crate's build script preconditions are satisfied (a real
+// ESP-IDF toolchain, or a future fix that `cfg`-gates the esp-idf deps).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    fn pending_forever() -> Pin<Box<dyn Future<Output = ()>>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn already_done() -> Pin<Box<dyn Future<Output = ()>>> {
+        Box::pin(async {})
+    }
+
+    /// Readiness firing while the driver is still pending must win the
+    /// race, and must NOT consume/drop the driver (it must still be usable
+    /// -- here, still pending -- afterward).
+    #[tokio::test]
+    async fn readiness_wins_and_driver_survives() {
+        let mut driver = pending_forever();
+        let (tx1, rx1) = async_channel::bounded::<u32>(1);
+        tx1.send(42).await.unwrap();
+        assert_eq!(race_driver_vs_ready(&mut driver, &rx1).await, Ok(42));
+
+        // `driver` must still be alive and pending -- proved by racing it a
+        // second time: it only compiles/runs at all if the first call left
+        // `driver` intact (never consumed it), and this second race must
+        // resolve via the NEW channel (not via `driver` suddenly
+        // completing), since `pending_forever()` never does.
+        let (tx2, rx2) = async_channel::bounded::<u32>(1);
+        tx2.send(7).await.unwrap();
+        assert_eq!(race_driver_vs_ready(&mut driver, &rx2).await, Ok(7));
+    }
+
+    /// If the driver ends before readiness ever fires, that's a bring-up
+    /// failure: the race must resolve to `Err`, not hang.
+    #[tokio::test]
+    async fn driver_ending_first_is_an_error() {
+        let mut driver = already_done();
+        let (_tx, rx) = async_channel::bounded::<u32>(1); // never sent to
+
+        let result = race_driver_vs_ready(&mut driver, &rx).await;
+        assert_eq!(result, Err(()));
+    }
+
+    /// The readiness sender being dropped (e.g. because whatever owned it
+    /// -- the event router in `Runtime::connect`'s real usage -- ended
+    /// after a bring-up error) must also resolve to `Err`, not hang, even
+    /// if the driver itself is still (separately) pending.
+    #[tokio::test]
+    async fn dropped_sender_is_an_error() {
+        let mut driver = pending_forever();
+        let (tx, rx) = async_channel::bounded::<u32>(1);
+        drop(tx);
+
+        let result = race_driver_vs_ready(&mut driver, &rx).await;
+        assert_eq!(result, Err(()));
     }
 }

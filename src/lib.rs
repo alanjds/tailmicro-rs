@@ -86,31 +86,58 @@ fn spawn_runtime_join(
     Box::pin(tm_runtime::Runtime::join(rt_config))
 }
 
+/// Same off-frame-boxing rationale as `spawn_runtime_join` above, for
+/// `Runtime::connect`'s (larger still — it awaits the same actor/channel
+/// construction as `join` internally) state machine.
+#[cfg(target_os = "espidf")]
+#[inline(never)]
+fn spawn_runtime_connect(
+    rt_config: tm_runtime::RuntimeConfig,
+) -> core::pin::Pin<Box<dyn core::future::Future<
+        Output = Result<(tm_runtime::Runtime, Ipv4Addr, tm_runtime::Driver), tm_runtime::ConnectError>,
+    >>>
+{
+    Box::pin(tm_runtime::Runtime::connect(rt_config))
+}
+
 /// Mirrors `tailscale::Device` exactly.
 pub struct Device {
     runtime: tm_runtime::Runtime,
-    our_ip_rx: Option<tm_runtime::OurIpReceiver>,
+    our_ip: Ipv4Addr,
 }
 
 impl Device {
-    /// Create a device and connect to the tailnet.
+    /// Connect to the tailnet, returning as soon as the control plane
+    /// assigns a tailnet IP (`ControlEvent::OurIpAssigned`) — bring-up is
+    /// bounded internally by `Config::connect_timeout` (see
+    /// `Config::with_connect_timeout`), so this never hangs past that
+    /// deadline. `device.ipv4_addr()`/`is_connected()` work immediately on
+    /// the returned `Device`.
     ///
-    /// Spawns the control, DERP, DISCO, and WireGuard actors as Tokio tasks.
+    /// Hands back a `Driver` future alongside `Device`: the data plane
+    /// (control, DERP, disco, WireGuard actors, including the deliberately
+    /// unbounded streaming keepalive poll that keeps the node marked
+    /// online) is NOT running unless `Driver` keeps being polled. The
+    /// caller MUST fold it into its own `tokio::join!`/`tokio::try_join!`
+    /// alongside whatever else it needs to run concurrently (e.g. an HTTP
+    /// server) — never `.await` it alone (it then never returns, by
+    /// design) and never wrap it in an external `timeout`/`select!` that
+    /// could drop it (that reproduces the ephemeral-node-GC bug fixed by
+    /// this contract change — see docs/wg-dataplane-notes.md
+    /// "Readiness-decoupled connect handle").
     ///
-    /// On ESP32-C3, call this inside a `current_thread` Tokio runtime.
-    /// 
     /// # Arguments
     /// * `config` - Tailscale configuration (must carry a verified control
     ///   pin — see `Config::with_control_pin_hex`)
     /// * `auth_key` - Auth key for Tailscale control plane
-    pub async fn new(config: &Config, auth_key: Option<String>) -> Result<Self, Error> {
-        tracing::debug!("Device::new() - starting device initialization");
+    pub async fn connect(
+        config: &Config,
+        auth_key: Option<String>,
+    ) -> Result<(Self, tm_runtime::Driver), Error> {
+        tracing::debug!("Device::connect() - starting device initialization");
 
         let node_state = config.load_or_generate_keys().await?;
-        tracing::debug!("Device::new() - keys loaded, node_state generated");
-
-        // Create channel for receiving the IP address
-        let (our_ip_tx, our_ip_rx) = async_channel::bounded::<Ipv4Addr>(1);
+        tracing::debug!("Device::connect() - keys loaded, node_state generated");
 
         let rt_config = tm_runtime::RuntimeConfig {
             control:       config.control_config(),
@@ -120,8 +147,47 @@ impl Device {
                 .unwrap_or_default(),
             node_state,
             priority_peer: None,
-            #[cfg(target_os = "espidf")]
-            our_ip_tx: Some(our_ip_tx),
+            // `Runtime::connect` owns and overwrites the readiness channel
+            // itself (it races `Driver` against it internally) — nothing
+            // to set here.
+            our_ip_tx: None,
+            connect_timeout: config.connect_timeout,
+        };
+
+        #[cfg(target_os = "espidf")]
+        let result = spawn_runtime_connect(rt_config).await;
+
+        #[cfg(not(target_os = "espidf"))]
+        let result = tm_runtime::Runtime::connect(rt_config).await;
+
+        let (runtime, our_ip, driver) = result.map_err(|_| Error::NotConnected)?;
+        Ok((Self { runtime, our_ip }, driver))
+    }
+
+    /// Deprecated: on ESP32-C3 this blocks forever once connected (the
+    /// streaming keepalive poll it awaits internally is deliberately
+    /// unbounded, so the node stays marked online) — this is exactly the
+    /// "wrapper races a droppable future against the data plane" failure
+    /// mode fixed by `Device::connect` (card t_0d32f11d). Kept only so
+    /// existing callers keep building; new code should call
+    /// `Device::connect` and fold the returned `Driver` into its own
+    /// `tokio::join!`.
+    #[deprecated(note = "use Device::connect, which returns promptly and hands back a Driver future to fold into your own tokio::join!")]
+    pub async fn new(config: &Config, auth_key: Option<String>) -> Result<Self, Error> {
+        tracing::debug!("Device::new() - starting device initialization");
+
+        let node_state = config.load_or_generate_keys().await?;
+        tracing::debug!("Device::new() - keys loaded, node_state generated");
+
+        let rt_config = tm_runtime::RuntimeConfig {
+            control:       config.control_config(),
+            auth_key:      auth_key
+                .as_deref()
+                .and_then(|s| heapless::String::try_from(s).ok())
+                .unwrap_or_default(),
+            node_state,
+            priority_peer: None,
+            our_ip_tx: None,
             connect_timeout: config.connect_timeout,
         };
 
@@ -131,21 +197,29 @@ impl Device {
         #[cfg(not(target_os = "espidf"))]
         let runtime = tm_runtime::Runtime::spawn(rt_config).await;
 
-        Ok(Self { runtime, our_ip_rx: Some(our_ip_rx) })
+        // The legacy contract never had a working way to learn our_ip
+        // without racing the (now nonexistent, on this path) readiness
+        // channel against a completed `Runtime` — `ipv4_addr()` below just
+        // reports `NotConnected` unconditionally on this deprecated path.
+        Ok(Self { runtime, our_ip: Ipv4Addr::UNSPECIFIED })
     }
 
     /// Get this device's IPv4 tailnet address.
     ///
-    /// Waits until the control plane assigns one (up to ~30 s on first boot).
-    pub async fn ipv4_addr(&self) -> Result<Ipv4Addr, Error> {
-        // Wait for the IP to be assigned by the control plane
-        // Timeout after 30 seconds to avoid hanging forever
-        let our_ip_rx = self.our_ip_rx.as_ref().ok_or(Error::NotConnected)?;
-        match tokio::time::timeout(std::time::Duration::from_secs(30), our_ip_rx.recv()).await {
-            Ok(Ok(ip)) => Ok(ip),
-            Ok(Err(_)) => Err(Error::NotConnected), // Channel closed
-            Err(_) => Err(Error::NotConnected), // Timeout
-        }
+    /// Available immediately: `Device` (from `Device::connect`) only ever
+    /// exists once the control plane has assigned one.
+    pub fn ipv4_addr(&self) -> Ipv4Addr {
+        self.our_ip
+    }
+
+    /// Whether this device is connected to the tailnet.
+    ///
+    /// Always `true` for a `Device` obtained from `Device::connect` — its
+    /// existence already implies `OurIpAssigned` fired. Whether the data
+    /// plane is still actually running depends on whether the caller is
+    /// still polling the paired `Driver` future.
+    pub fn is_connected(&self) -> bool {
+        self.our_ip != Ipv4Addr::UNSPECIFIED
     }
 
     /// Bind a UDP socket to `addr` on the tailnet.
