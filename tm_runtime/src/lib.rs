@@ -205,6 +205,46 @@ fn build_icmp_echo_request(src: [u8; 4], dst: [u8; 4], ident: u16, seq: u16) -> 
     pkt
 }
 
+/// If `req` is an IPv4 ICMP echo request addressed to `our_ip`, build the
+/// matching echo reply: source/destination swapped, ICMP type 8 -> 0, both
+/// checksums recomputed, and ident/seq/data preserved. Returns `None` for
+/// anything that is not such a request. This is a minimal on-path responder so
+/// an external `ping` to our tailnet address is answered; tm_netstack still has
+/// no on-device lwIP injection path (it is a stub), so ICMP echo is handled
+/// here rather than in a real IP stack.
+fn build_icmp_echo_reply(req: &[u8], our_ip: [u8; 4]) -> Option<heapless::Vec<u8, 1500>> {
+    if req.len() < 20 || req[0] >> 4 != 4 { return None; } // IPv4 only
+    let ihl = (req[0] & 0x0f) as usize * 4;                // IPv4 header length
+    if ihl < 20 || req.len() < ihl + 8 { return None; }
+    if req[9] != 1 { return None; }                        // protocol: ICMP
+    if req[16..20] != our_ip { return None; }              // addressed to us
+    if req[ihl] != 8 { return None; }                      // ICMP type: echo request
+
+    // Copy the whole packet, then mutate in place; length/ident/seq/data all
+    // carry over unchanged from the request, as ping expects.
+    let mut reply: heapless::Vec<u8, 1500> = heapless::Vec::new();
+    reply.extend_from_slice(req).ok()?;
+
+    // Swap source and destination IPv4 addresses.
+    let mut src = [0u8; 4]; src.copy_from_slice(&reply[12..16]);
+    let mut dst = [0u8; 4]; dst.copy_from_slice(&reply[16..20]);
+    reply[12..16].copy_from_slice(&dst);
+    reply[16..20].copy_from_slice(&src);
+    // Recompute the IPv4 header checksum over the (variable-length) header.
+    reply[10] = 0; reply[11] = 0;
+    let ip_csum = inet_checksum(&reply[..ihl]);
+    reply[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+    // Echo request (8) -> echo reply (0); recompute the ICMP checksum over the
+    // whole ICMP message (header + any ping payload).
+    reply[ihl] = 0;
+    reply[ihl + 2] = 0; reply[ihl + 3] = 0;
+    let icmp_csum = inet_checksum(&reply[ihl..]);
+    reply[ihl + 2..ihl + 4].copy_from_slice(&icmp_csum.to_be_bytes());
+
+    Some(reply)
+}
+
 /// The event-router loop, extracted to a top-level `async fn`.
 ///
 /// This used to be an `async move { .. }` block declared as a local inside
@@ -400,6 +440,22 @@ async fn event_router_task(
                         // surface it here; this is the seam where a
                         // transport round-trip becomes observable.
                         info!("Runtime::join() - WgEvent::InboundDecrypted {} bytes from peer {:02x}{:02x}..", payload.len(), src_key[0], src_key[1]);
+                        // Answer external pings to our tailnet address: if this
+                        // decrypted packet is an ICMP echo request to our_ip,
+                        // reflect an echo reply back through tm_wg so `ping` to
+                        // the node succeeds. Non-echo traffic still has no
+                        // netstack to land in and is only logged above.
+                        if our_ip != [0; 4] {
+                            if let Some(reply) = build_icmp_echo_reply(payload.as_slice(), our_ip) {
+                                info!("Runtime::join() - ICMP echo reply -> peer {:02x}{:02x}.. ({} bytes)", src_key[0], src_key[1], reply.len());
+                                let _ = wg_tx2.send(WgCmd::SendData {
+                                    dst_key: src_key,
+                                    payload: Box::new(reply),
+                                }).await;
+                                #[cfg(target_os = "espidf")]
+                                tokio_freertos_yield().await;
+                            }
+                        }
                     }
                     Ok(WgEvent::PeerHandshook(key)) => {
                         info!("Runtime::join() - WgEvent::PeerHandshook with peer {:02x}{:02x}..", key[0], key[1]);
