@@ -66,10 +66,26 @@ impl Config {
     }
 
     pub(crate) async fn load_or_generate_keys(&self) -> Result<NodeState, Error> {
-        // On ESP32-C3: read from NVS; generate + persist on first boot.
-        // On host: read from key_file JSON; generate + write on first run.
-        // Both paths are platform-specific — stubbed here.
-        Ok(NodeState::generate())
+        // K2 (docs/stable-node-identity-plan.md): derive the node identity
+        // deterministically from the chip's eFuse MAC via HKDF-SHA256, so
+        // the SAME physical device always registers with the SAME identity
+        // -- even across NVS erase and reflash, with nothing to persist.
+        //
+        // Root cause this replaces: this used to be `NodeState::generate()`,
+        // called unconditionally on every `Device::connect()`. That's the
+        // actual reason the node key churned every boot: the app layer
+        // (tasmolike-rs's `TailscaleService::load_or_generate_keys`, which
+        // reads/writes NVS) loaded or generated a key and logged "Loaded
+        // existing Tailscale node keys" -- but never passed that key here.
+        // `Device::connect` doesn't take a `NodeState` argument at all, so
+        // the app's NVS round-trip was live but entirely disconnected from
+        // what actually got registered with the control plane.
+        let node_state = NodeState::derive_from_chip();
+        tracing::info!(
+            "Derived stable per-chip node identity, registering public key {}",
+            node_state.node_key.public().to_hex()
+        );
+        Ok(node_state)
     }
 
     pub(crate) fn control_config(&self) -> tm_control::Config {

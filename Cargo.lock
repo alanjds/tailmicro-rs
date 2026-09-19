@@ -2284,10 +2284,13 @@ name = "tm_keys"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "esp-idf-sys",
  "heapless 0.8.0",
+ "hkdf",
  "rand",
  "rand_core",
  "serde",
+ "sha2",
  "x25519-dalek",
 ]
 
