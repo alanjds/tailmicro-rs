@@ -30,6 +30,7 @@ use tm_derp::{DerpActor, DerpCmd, DerpEvent, MAX_DERP_PAYLOAD};
 use tm_disco::{DiscoActor, DiscoCmd, DiscoEvent};
 use tm_wg::{WgActor, WgCmd, WgEvent};
 use tm_keys::{NodeState, NodePublicKey};
+use tm_netstack::tailnet;
 use log::{info, debug, warn, error};
 use async_channel;
 
@@ -158,6 +159,69 @@ fn log_derp_error(e: &tm_derp::DerpError) {
     error!("Runtime::join() - received DerpEvent::Error: {:?}", e);
 }
 
+/// Bring up (first call) or re-address (subsequent calls with a changed IP)
+/// the tailnet lwIP netif -- plan (a), docs/tailnet-http-lwip-netif-plan.md
+/// item 4. Called from both `ControlEvent::MapUpdate` and
+/// `ControlEvent::OurIpAssigned`, since either can be the first place a
+/// given IP is observed depending on `ControlActor`'s event ordering; `*last`
+/// makes repeat calls with the same IP (which MapUpdate's periodic streaming
+/// poll will produce constantly) a no-op instead of retrying every time.
+///
+/// `netif_out_tx` is consumed by `tailnet::bring_up` on the first successful
+/// (or attempted) call; `None` afterward routes through `set_address`
+/// instead, which never needs the sender (device.rs keeps it in a
+/// process-wide `OnceLock` set once at bring-up).
+///
+/// `#[inline(never)]`: matches every other helper in this file -- keeps this
+/// branch's temporaries (and the `tailnet` crate's own call frame) off
+/// `event_router_task`'s single `tokio::select!` poll frame.
+#[inline(never)]
+fn apply_tailnet_address(
+    ip: [u8; 4],
+    last: &mut Option<[u8; 4]>,
+    netif_out_tx: &mut Option<tailnet::OutboundSender>,
+) {
+    if ip == [0; 4] {
+        return; // not yet assigned
+    }
+    if *last == Some(ip) {
+        return; // already applied (or already attempted) this exact address
+    }
+    let result = match netif_out_tx.take() {
+        Some(tx) => tailnet::bring_up(ip, tx),
+        None => tailnet::set_address(ip),
+    };
+    *last = Some(ip);
+    match result {
+        Ok(()) => {
+            info!("Runtime::join() - tailnet netif address set to {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+        }
+        Err(tailnet::TailnetError::NotSupported) => {
+            // Expected on host builds (no on-device lwIP to attach to); not
+            // an error worth alarming about.
+            debug!("Runtime::join() - tailnet netif not supported on this target");
+        }
+        Err(e) => {
+            warn!("Runtime::join() - tailnet netif bring-up/set_address failed for {}.{}.{}.{}: {:?}", ip[0], ip[1], ip[2], ip[3], e);
+        }
+    }
+}
+
+/// Log an outbound netif packet whose destination IP matched no known peer
+/// (i.e. `event_router_task`'s `ip_to_key` table, built from the last
+/// `MapUpdate`, has no entry for it). `#[inline(never)]` for the same reason
+/// as `log_control_error`; `last` collapses repeats to one log line per
+/// distinct unresolved destination instead of one per dropped packet, per
+/// the plan's item 3 ("log once, not once per packet, for storm-safety").
+#[inline(never)]
+fn log_unknown_netif_dest(dst_ip: [u8; 4], last: &mut Option<[u8; 4]>) {
+    if *last == Some(dst_ip) {
+        return;
+    }
+    *last = Some(dst_ip);
+    warn!("Runtime::join() - tailnet netif output: no peer known for destination {}.{}.{}.{}, dropping", dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
+}
+
 /// Internet checksum (RFC 1071): ones-complement sum of 16-bit words.
 fn inet_checksum(bytes: &[u8]) -> u16 {
     let mut sum: u32 = 0;
@@ -208,10 +272,17 @@ fn build_icmp_echo_request(src: [u8; 4], dst: [u8; 4], ident: u16, seq: u16) -> 
 /// If `req` is an IPv4 ICMP echo request addressed to `our_ip`, build the
 /// matching echo reply: source/destination swapped, ICMP type 8 -> 0, both
 /// checksums recomputed, and ident/seq/data preserved. Returns `None` for
-/// anything that is not such a request. This is a minimal on-path responder so
-/// an external `ping` to our tailnet address is answered; tm_netstack still has
-/// no on-device lwIP injection path (it is a stub), so ICMP echo is handled
-/// here rather than in a real IP stack.
+/// anything that is not such a request.
+///
+/// No longer called from `event_router_task`: now that `tm_netstack::tailnet`
+/// gives the device a real lwIP netif (plan (a),
+/// docs/tailnet-http-lwip-netif-plan.md), decrypted inbound packets are
+/// handed to `tailnet::inject_inbound` instead, and lwIP's own ICMP handling
+/// answers pings the same way it answers everything else on that netif. Kept
+/// (dead-code-allowed) as the rung-6a elicitor's reply-side counterpart and
+/// for anyone bisecting the pre-netif behavior; see the plan's "retiring the
+/// hand-rolled ICMP responder" item.
+#[allow(dead_code)]
 fn build_icmp_echo_reply(req: &[u8], our_ip: [u8; 4]) -> Option<heapless::Vec<u8, 1500>> {
     if req.len() < 20 || req[0] >> 4 != 4 { return None; } // IPv4 only
     let ihl = (req[0] & 0x0f) as usize * 4;                // IPv4 header length
@@ -262,11 +333,13 @@ async fn event_router_task(
     mut derp_ev_rx: async_channel::Receiver<DerpEvent>,
     mut disco_ev_rx: async_channel::Receiver<DiscoEvent>,
     mut wg_ev_rx: async_channel::Receiver<WgEvent>,
+    mut netif_out_rx: tailnet::OutboundReceiver,
     ctrl_tx3: async_channel::Sender<ControlCmd>,
     derp_tx2: async_channel::Sender<DerpCmd>,
     wg_tx2: async_channel::Sender<WgCmd>,
     disco_tx2: async_channel::Sender<DiscoCmd>,
     our_ip_tx: Option<OurIpSender>,
+    mut netif_out_tx: Option<tailnet::OutboundSender>,
 ) {
     info!("Runtime::join() - event_router task started");
     // Rung-6a addressing state: our tailnet IPv4 and each peer's tailnet IPv4
@@ -275,6 +348,16 @@ async fn event_router_task(
     // replies and an inbound transport packet becomes observable.
     let mut our_ip: [u8; 4] = [0; 4];
     let mut peer_ips: heapless::Vec<([u8; 32], [u8; 4]), 8> = heapless::Vec::new();
+    // Reverse lookup for the tailnet netif's outbound path (plan (a) item
+    // 3): destination tailnet IPv4 -> peer node key, so a packet lwIP wants
+    // to send out the "wg0"-style netif can be routed to the right
+    // WireGuard peer. Rebuilt from the same `MapUpdate` as `peer_ips`.
+    let mut ip_to_key: heapless::Vec<([u8; 4], [u8; 32]), 8> = heapless::Vec::new();
+    // Last tailnet IPv4 address applied (or attempted) on the on-device
+    // netif, and the last outbound destination IP logged as unresolved --
+    // see `apply_tailnet_address`/`log_unknown_netif_dest`.
+    let mut netif_applied_ip: Option<[u8; 4]> = None;
+    let mut last_unknown_dst: Option<[u8; 4]> = None;
     loop {
         #[cfg(target_os = "espidf")]
         tokio_freertos_yield().await;
@@ -336,13 +419,17 @@ async fn event_router_task(
                                     tokio_freertos_yield().await;
                                 }
                             }
-                            // Capture addressing for rung-6a BEFORE the map is
+                            // Capture addressing for rung-6a and the tailnet
+                            // netif's outbound routing BEFORE the map is
                             // moved into ApplyMap.
                             our_ip = map.our_ip.0;
                             peer_ips.clear();
+                            ip_to_key.clear();
                             for p in map.peers.iter() {
                                 let _ = peer_ips.push((p.node_key, p.tailnet_ip.0));
+                                let _ = ip_to_key.push((p.tailnet_ip.0, p.node_key));
                             }
+                            apply_tailnet_address(our_ip, &mut netif_applied_ip, &mut netif_out_tx);
                             let _ = wg_tx2.send(WgCmd::ApplyMap(map)).await;
                         }
                         ControlEvent::OurIpAssigned(ip) => {
@@ -355,6 +442,7 @@ async fn event_router_task(
                             // never fired on host — see
                             // docs/wg-dataplane-notes.md "Readiness-decoupled
                             // connect handle".
+                            apply_tailnet_address(ip.0, &mut netif_applied_ip, &mut netif_out_tx);
                             if let Some(ref tx) = our_ip_tx {
                                 #[cfg(target_os = "espidf")]
                                 tokio_freertos_yield().await;
@@ -449,26 +537,21 @@ async fn event_router_task(
                         tokio_freertos_yield().await;
                     }
                     Ok(WgEvent::InboundDecrypted { src_key, payload }) => {
-                        // Decrypted inbound app data destined for the
-                        // local netstack. tm_netstack has no on-device
-                        // lwIP injection path yet (it is a stub), so we
-                        // surface it here; this is the seam where a
-                        // transport round-trip becomes observable.
+                        // Decrypted inbound app data destined for the local
+                        // netstack. Handed to the on-device lwIP tailnet
+                        // netif (plan (a), docs/tailnet-http-lwip-netif-plan.md
+                        // item 5) via `tcpip_input()`, which is safe to call
+                        // from this (non-tcpip) task -- see
+                        // tm_netstack::tailnet's module doc comment.
                         info!("Runtime::join() - WgEvent::InboundDecrypted {} bytes from peer {:02x}{:02x}..", payload.len(), src_key[0], src_key[1]);
-                        // Answer external pings to our tailnet address: if this
-                        // decrypted packet is an ICMP echo request to our_ip,
-                        // reflect an echo reply back through tm_wg so `ping` to
-                        // the node succeeds. Non-echo traffic still has no
-                        // netstack to land in and is only logged above.
-                        if our_ip != [0; 4] {
-                            if let Some(reply) = build_icmp_echo_reply(payload.as_slice(), our_ip) {
-                                info!("Runtime::join() - ICMP echo reply -> peer {:02x}{:02x}.. ({} bytes)", src_key[0], src_key[1], reply.len());
-                                let _ = wg_tx2.send(WgCmd::SendData {
-                                    dst_key: src_key,
-                                    payload: Box::new(reply),
-                                }).await;
-                                #[cfg(target_os = "espidf")]
-                                tokio_freertos_yield().await;
+                        match tailnet::inject_inbound(payload.as_slice()) {
+                            Ok(()) => {}
+                            Err(tailnet::TailnetError::NotSupported) => {
+                                // Expected on host builds; nothing to inject into.
+                                debug!("Runtime::join() - tailnet netif not supported on this target; dropping inbound packet");
+                            }
+                            Err(e) => {
+                                warn!("Runtime::join() - tailnet inject_inbound failed: {:?}", e);
                             }
                         }
                     }
@@ -525,6 +608,31 @@ async fn event_router_task(
                     }
                 }
             }
+            // ── Tailnet netif outbound packets (plan (a) item 3) ───────
+            // lwIP's netif `output` callback (tm_netstack::tailnet::device)
+            // handed this packet to us because it wants to send it out the
+            // tailnet interface. Route it to the WireGuard peer that owns
+            // its destination IP, if we know one.
+            pkt = netif_out_rx.recv() => {
+                match pkt {
+                    Ok(tailnet::OutboundPacket { dst_ip, data }) => {
+                        if let Some((_, dst_key)) = ip_to_key.iter().find(|(ip, _)| *ip == dst_ip) {
+                            let _ = wg_tx2.send(WgCmd::SendData {
+                                dst_key: *dst_key,
+                                payload: data,
+                            }).await;
+                            #[cfg(target_os = "espidf")]
+                            tokio_freertos_yield().await;
+                        } else {
+                            log_unknown_netif_dest(dst_ip, &mut last_unknown_dst);
+                        }
+                    }
+                    Err(_) => {
+                        info!("Runtime::join() - tailnet netif outbound channel closed, breaking");
+                        break;
+                    }
+                }
+            }
         }
     }
     info!("Runtime::join() - event_router task exiting");
@@ -539,15 +647,17 @@ fn spawn_event_router(
     derp_ev_rx: async_channel::Receiver<DerpEvent>,
     disco_ev_rx: async_channel::Receiver<DiscoEvent>,
     wg_ev_rx: async_channel::Receiver<WgEvent>,
+    netif_out_rx: tailnet::OutboundReceiver,
     ctrl_tx3: async_channel::Sender<ControlCmd>,
     derp_tx2: async_channel::Sender<DerpCmd>,
     wg_tx2: async_channel::Sender<WgCmd>,
     disco_tx2: async_channel::Sender<DiscoCmd>,
     our_ip_tx: Option<OurIpSender>,
+    netif_out_tx: Option<tailnet::OutboundSender>,
 ) -> BoxActorFut {
     Box::pin(event_router_task(
-        ctrl_ev_rx, derp_ev_rx, disco_ev_rx, wg_ev_rx,
-        ctrl_tx3, derp_tx2, wg_tx2, disco_tx2, our_ip_tx,
+        ctrl_ev_rx, derp_ev_rx, disco_ev_rx, wg_ev_rx, netif_out_rx,
+        ctrl_tx3, derp_tx2, wg_tx2, disco_tx2, our_ip_tx, netif_out_tx,
     ))
 }
 
@@ -692,6 +802,15 @@ impl Runtime {
         tokio_freertos_yield().await;
         log_heap("after WgEvent channel");
 
+        // Tailnet netif outbound-packet channel (plan (a) item 3): packets
+        // lwIP's netif `output` callback wants sent out the tailnet
+        // interface, drained by `event_router_task` and routed to a
+        // WireGuard peer. Same capacity/backpressure philosophy as every
+        // other inter-actor channel here.
+        let (netif_out_tx, netif_out_rx) = async_channel::bounded::<tailnet::OutboundPacket>(CHAN_CAP);
+        tokio_freertos_yield().await;
+        log_heap("after tailnet netif outbound channel");
+
         // ── Key extraction ───────────────────────────────────────────────────
         let our_pub = config.node_state.node_key.public();
         let disco_key = config.node_state.disco_key.clone();
@@ -726,8 +845,8 @@ impl Runtime {
         let wg_task = spawn_wg(wg_priv, priority_peer, wg_rx, wg_ev_tx);
         log_heap("after WgActor spawn");
         let event_router = spawn_event_router(
-            ctrl_ev_rx, derp_ev_rx, disco_ev_rx, wg_ev_rx,
-            ctrl_tx3, derp_tx2, wg_tx2, disco_tx2, our_ip_tx,
+            ctrl_ev_rx, derp_ev_rx, disco_ev_rx, wg_ev_rx, netif_out_rx,
+            ctrl_tx3, derp_tx2, wg_tx2, disco_tx2, our_ip_tx, Some(netif_out_tx),
         );
 
         log_heap("before Driver construction (all actors constructed)");
