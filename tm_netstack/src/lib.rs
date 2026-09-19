@@ -14,6 +14,12 @@
 
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
+/// The tailnet point-to-point lwIP netif (plan (a) --
+/// `docs/tailnet-http-lwip-netif-plan.md`): gives the on-device lwIP stack a
+/// netif for the node's tailnet IP so the existing `0.0.0.0:80` HTTP server
+/// becomes reachable there with no application change.
+pub mod tailnet;
+
 // ── Error ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]

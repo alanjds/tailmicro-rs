@@ -3,5 +3,21 @@ name = "tm_netstack"
 version.workspace = true
 edition.workspace = true
 
+# Extra lwIP bindgen coverage (tcpip_input/tcpip_callback) needed by the
+# on-device tailnet netif (src/tailnet/device.rs). Read by esp-idf-sys's
+# build script directly off this crate's manifest, because tm_netstack is a
+# *direct* dependency of the root firmware crate (tasmolike-rs) -- see the
+# doc comment on include/lwip_tcpip_extra.h and
+# docs/tailnet-http-lwip-netif-plan.md. Harmless / unused on host builds.
+[package.metadata.esp-idf-sys]
+[[package.metadata.esp-idf-sys.extra_components]]
+bindings_header = "include/lwip_tcpip_extra.h"
+
 [dependencies]
 tokio = { workspace = true, features = ["net", "io-util"] }
+heapless = { workspace = true }
+async-channel = { workspace = true }
+log = { workspace = true }
+
+[target.'cfg(target_os = "espidf")'.dependencies]
+esp-idf-sys = { workspace = true }
