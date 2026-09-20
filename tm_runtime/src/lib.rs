@@ -392,24 +392,25 @@ async fn event_router_task(
                             // silently no-op so DERP never came up. Prefer an
                             // online peer with a resolvable region, then fall back
                             // to any peer with one.
-                            let region_present =
-                                |rid: u16| map.derp_regions.iter().any(|r| r.region_id == rid);
-                            if let Some(target) = map
-                                .peers
-                                .iter()
-                                .find(|p| p.is_online && region_present(p.derp_region))
-                                .or_else(|| {
-                                    map.peers.iter().find(|p| region_present(p.derp_region))
-                                })
-                            {
-                                let rid = target.derp_region;
+                            // Connect our DERP session to the SAME home region
+                            // tm_control advertises as our PreferredDERP. Both
+                            // sides call tm_control::select_home_region on this
+                            // same netmap snapshot, so advertised == actual with
+                            // no coordination and no hardcoded region. This is
+                            // what makes us reachable after a reboot on a stable
+                            // tailnet IP: without a stable advertised home, peers
+                            // only reach us via disco caches that go stale and
+                            // inbound dies. DERP servers mesh across regions, so
+                            // a single home session still reaches peers homed
+                            // elsewhere.
+                            if let Some(rid) = tm_control::select_home_region(map.as_ref()) {
                                 if let Some(region) =
                                     map.derp_regions.iter().find(|r| r.region_id == rid)
                                 {
                                     let port = if region.port != 0 { region.port } else { 443 };
-                                    info!("Runtime::join() - DERP connect -> region {} ({}) host={} port={} for peer {}",
+                                    info!("Runtime::join() - DERP connect -> home region {} ({}) host={} port={}",
                                         region.region_id, region.region_code.as_str(),
-                                        region.host.as_str(), port, target.hostname.as_str());
+                                        region.host.as_str(), port);
                                     let _ = derp_tx2.send(DerpCmd::Connect {
                                         host: region.host.clone(),
                                         port,

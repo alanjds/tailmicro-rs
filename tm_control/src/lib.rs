@@ -88,7 +88,13 @@ pub const CAPABILITY_VERSION: u16 = 72;
 /// write-map, then the streaming poll).
 const REGISTER_STREAM_ID: u32 = 1;
 const MAP_PUBLISH_STREAM_ID: u32 = 3;
-const MAP_STREAM_ID: u32 = 5;
+/// Second non-streaming publish ("write") MapRequest: re-published with our
+/// PreferredDERP + DERP-home endpoint once the first publish's response has
+/// revealed the DERPMap and `select_home_region` has chosen our home region.
+/// Standard Tailscale cold-boot pattern (write empty -> learn DERPMap ->
+/// write again with endpoints). Its own odd, incrementing HTTP/2 stream id.
+const MAP_REPUBLISH_STREAM_ID: u32 = 5;
+const MAP_STREAM_ID: u32 = 7;
 /// Upper bound on a single length-prefixed MapResponse message. The real
 /// non-streaming netmap for this device is tens of KB; a value larger than
 /// this means the stream is desynced (seen live: a ~1.95 GB garbage prefix on
@@ -169,6 +175,71 @@ struct RegisterRequest<'a> {
 }
 #[derive(Serialize)]
 struct RegisterAuth<'a> { #[serde(rename="AuthKey")] auth_key: &'a str }
+/// Choose the DERP region this node uses as its home: the region it connects
+/// its DERP session to AND advertises to peers as its `PreferredDERP`. Peers
+/// relay inbound WireGuard/disco traffic to us via this region, so the value
+/// the runtime connects to (see tm_runtime's DERP connect) MUST match the one
+/// published here. Both sides call this same function on the same `MapState`
+/// snapshot, so they agree with no coordination and nothing is hardcoded.
+///
+/// Selection, from the live netmap only (no static region number):
+///   1. Among regions we actually have a DERP hostname for (present in the
+///      DERPMap), prefer the one the most ONLINE peers are homed on, so relayed
+///      traffic stays regional. Tie-break by lowest measured latency, then
+///      lowest region id.
+///   2. If no online peer is homed on a region we can reach, fall back to the
+///      reachable region with the lowest measured latency, then lowest id.
+/// Returns `None` only when the DERPMap carries no regions at all.
+///
+/// `latency_ms` is client-measured and may be 0/unset today (no netcheck yet),
+/// in which case the tie-breaks collapse to lowest region id -- still fully
+/// data-driven. A future netcheck pass populates latency and this starts
+/// picking the nearest region automatically, with no change here.
+pub fn select_home_region<const P: usize, const R: usize>(
+    map: &MapState<P, R>,
+) -> Option<u16> {
+    let reachable = |rid: u16| map.derp_regions.iter().any(|r| r.region_id == rid);
+    let latency_of = |rid: u16| {
+        map.derp_regions
+            .iter()
+            .find(|r| r.region_id == rid)
+            .map(|r| r.latency_ms)
+            .unwrap_or(u16::MAX)
+    };
+    // Rank a reachable region by (online-peer count desc, latency asc, id asc).
+    let score = |rid: u16| {
+        let peers = map
+            .peers
+            .iter()
+            .filter(|p| p.is_online && p.derp_region == rid)
+            .count();
+        // Sort key: more peers first (negate via Reverse), then lower latency,
+        // then lower id. Returned so the max-by picks the best.
+        (peers, core::cmp::Reverse(latency_of(rid)), core::cmp::Reverse(rid))
+    };
+    map.derp_regions
+        .iter()
+        .map(|r| r.region_id)
+        .filter(|rid| reachable(*rid))
+        .max_by_key(|rid| score(*rid))
+}
+
+/// Tailscale encodes "reach me via DERP region N" as the pseudo-endpoint
+/// `127.3.3.40:N` (derpMagicIP). Published in MapRequest.Endpoints alongside
+/// Hostinfo.NetInfo.PreferredDERP -- both together, matching the confirmed
+/// recipe in tools/wg_validator/validate_live_tailnet.py.
+pub const DERP_MAGIC_IP: &str = "127.3.3.40";
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct NetInfo {
+    // tailcfg.NetInfo.PreferredDERP is "PreferredDERP" (DERP all-caps); the
+    // PascalCase rule would otherwise emit "PreferredDerp", so rename it
+    // explicitly -- same reason as `os` -> "OS" below.
+    #[serde(rename = "PreferredDERP")]
+    preferred_derp: u16,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct HostInfo<'a> {
@@ -181,6 +252,12 @@ struct HostInfo<'a> {
     #[serde(rename = "OS")]
     os: &'a str,
     hostname: &'a str,
+    // Carries PreferredDERP (our home region) on the non-streaming publish
+    // MapRequest; None on the register and streaming requests, where it is
+    // either irrelevant or read-only. skip_serializing_if keeps those bodies
+    // byte-identical to before this change.
+    #[serde(rename = "NetInfo", skip_serializing_if = "Option::is_none")]
+    net_info: Option<NetInfo>,
 }
 
 #[derive(Deserialize)]
@@ -315,16 +392,16 @@ impl ControlActor {
                     version: CAPABILITY_VERSION, compress: "", keep_alive: true,
                     node_key: node_key_hex.as_str(), endpoints: &[], stream: true,
                     disco_key: None,
-                    hostinfo: Some(HostInfo { os: "embedded", hostname: "esp32c3" }),
+                    hostinfo: Some(HostInfo { os: "embedded", hostname: "esp32c3", net_info: None }),
                     omit_peers: true,
                 }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
                 let map_req = build_h2_post("/machine/map", self.config.control_host, MAP_STREAM_ID, &map_body);
                 noise.write_all(&mut main_conn, &map_req).await?;
-                self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_STREAM_ID).await
+                self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_STREAM_ID, true).await
             }.await;
 
             match poll_res {
-                Ok(()) => tracing::warn!("Tailscale keepalive stream closed by server; reconnecting"),
+                Ok(_) => tracing::warn!("Tailscale keepalive stream closed by server; reconnecting"),
                 Err(e) => tracing::warn!("Tailscale keepalive stream error: {:?}; reconnecting", e),
             }
 
@@ -398,7 +475,7 @@ impl ControlActor {
                 version: CAPABILITY_VERSION, node_key: node_key_hex.as_str(),
                 old_node_key: None,
                 auth: RegisterAuth { auth_key },
-                hostinfo: HostInfo { os: "embedded", hostname: "esp32c3" },
+                hostinfo: HostInfo { os: "embedded", hostname: "esp32c3", net_info: None },
             }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
 
             info!("Tailscale Step 4: registering node");
@@ -439,11 +516,17 @@ impl ControlActor {
         info!("Tailscale Step 7.5: publishing Hostinfo/DiscoKey/Endpoints (non-streaming MapRequest)");
         {
             let disco_key_hex = self.node_state.disco_key.public().to_hex();
+            // Publish #1 (the "probe"): publish Hostinfo + DiscoKey with NO
+            // endpoints/home yet. We cannot know our DERP home until the
+            // response reveals the DERPMap, so this write's only job here is to
+            // register the disco key and fetch the netmap. select_home_region
+            // then runs on the parsed response and publish #2 (below) advertises
+            // the chosen home. This is the standard Tailscale cold-boot order.
             let publish_body = serde_json::to_vec(&MapRequest {
                 version: CAPABILITY_VERSION, compress: "", keep_alive: false,
                 node_key: node_key_hex.as_str(), endpoints: &[], stream: false,
                 disco_key: Some(disco_key_hex.as_str()),
-                hostinfo: Some(HostInfo { os: "embedded", hostname: "esp32c3" }),
+                hostinfo: Some(HostInfo { os: "embedded", hostname: "esp32c3", net_info: None }),
                 omit_peers: false,
             }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
 
@@ -459,7 +542,42 @@ impl ControlActor {
         // a raw JSON body with an END_STREAM, so stream_map_response parses it
         // and returns at end_stream, emitting MapUpdate + OurIpAssigned.
         info!("Tailscale Step 7.5: reading + parsing publish MapResponse");
-        self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_PUBLISH_STREAM_ID).await?;
+        let home_region = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_PUBLISH_STREAM_ID, true).await?;
+
+        // Step 7.6 (new): re-publish with our DERP home so peers get a stable
+        // relay path to us. Encoded two ways, together, per the confirmed
+        // recipe in tools/wg_validator/validate_live_tailnet.py:
+        //   - Endpoints = ["127.3.3.40:<region>"] (the derpMagicIP home hint)
+        //   - Hostinfo.NetInfo.PreferredDERP = <region>
+        // <region> comes from select_home_region on publish #1's netmap; the
+        // runtime picks the same region from the same MapUpdate and connects
+        // its DERP session there, so advertised == actual. Without this,
+        // peers have no durable path to us and inbound dies once their disco
+        // caches go stale (e.g. after we reboot on a now-stable tailnet IP).
+        if let Some(region) = home_region {
+            let disco_key_hex = self.node_state.disco_key.public().to_hex();
+            let home_endpoint = format!("{}:{}", DERP_MAGIC_IP, region);
+            let endpoints = [home_endpoint.as_str()];
+            info!("Tailscale Step 7.6: re-publishing with PreferredDERP={} endpoint={}", region, home_endpoint);
+            let republish_body = serde_json::to_vec(&MapRequest {
+                version: CAPABILITY_VERSION, compress: "", keep_alive: false,
+                node_key: node_key_hex.as_str(), endpoints: &endpoints, stream: false,
+                disco_key: Some(disco_key_hex.as_str()),
+                hostinfo: Some(HostInfo {
+                    os: "embedded", hostname: "esp32c3",
+                    net_info: Some(NetInfo { preferred_derp: region }),
+                }),
+                omit_peers: false,
+            }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
+            let republish_req = build_h2_post("/machine/map", host, MAP_REPUBLISH_STREAM_ID, &republish_body);
+            noise.write_all(&mut main_conn, &republish_req).await?;
+            // Drain + parse the response (re-emits the authoritative netmap,
+            // which is idempotent for the runtime: same IP -> netif no-op,
+            // repeat DERP Connect ignored). Its own return value is unused.
+            let _ = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_REPUBLISH_STREAM_ID, false).await?;
+        } else {
+            tracing::warn!("Tailscale Step 7.6: no reachable DERP region in netmap; skipping home advertisement (inbound may be unreliable)");
+        }
 
         // Bring-up complete: OurIpAssigned has been emitted. Hand the live
         // connection state back to `connect_and_poll`, which continues with
@@ -468,12 +586,19 @@ impl ControlActor {
         Ok((main_conn, noise, h2, node_key_hex))
     }
 
+    /// Returns the DERP home region selected from the parsed netmap (via
+    /// `select_home_region`), if this response carried a non-empty map. The
+    /// caller re-publishes with this as its `PreferredDERP`; the runtime picks
+    /// the same region from the same `MapUpdate`. `None` for empty responses
+    /// (e.g. the keepalive poll), whose return value the caller ignores.
     async fn stream_map_response<S: IoStream>(
         &self, stream: &mut S, noise: &mut NoiseChannel,
         h2: &mut H2State, events: &async_channel::Sender<ControlEvent>,
-        expected_stream: u32,
-    ) -> Result<(), ControlError> {
-        info!("Tailscale stream_map_response starting on stream {}", expected_stream);
+        expected_stream: u32, emit_events: bool,
+    ) -> Result<Option<u16>, ControlError> {
+        info!("Tailscale stream_map_response starting on stream {} (emit_events={})", expected_stream, emit_events);
+        // Home region selected from the parsed netmap; returned to the caller.
+        let mut home_region: Option<u16> = None;
         // Heap (Vec) not stack: this whole call chain is awaited inline with no
         // spawn/Box::pin boundary, so a stack-inline buffer folds into the
         // caller's combined async state machine and overflows the 16 KB main
@@ -615,7 +740,7 @@ impl ControlActor {
                         let parsed = parser.take().map(|p| p.finish());
                         match parsed {
                             Some(Ok(map)) => {
-                                if !our_ip_sent && map.our_ip.0 != [0u8; 4] {
+                                if emit_events && !our_ip_sent && map.our_ip.0 != [0u8; 4] {
                                     our_ip_sent = true;
                                     info!("Tailscale OurIpAssigned event sent: {}.{}.{}.{}", map.our_ip.0[0], map.our_ip.0[1], map.our_ip.0[2], map.our_ip.0[3]);
                                     let _ = events.send(ControlEvent::OurIpAssigned(map.our_ip.clone())).await;
@@ -627,8 +752,23 @@ impl ControlActor {
                                     || map.our_ip.0 != [0u8; 4]
                                     || !map.derp_regions.is_empty();
                                 if non_empty {
-                                    info!("Tailscale MapUpdate event sent ({} peers, {} DERP regions)", map.peers.len(), map.derp_regions.len());
-                                    let _ = events.send(ControlEvent::MapUpdate(Box::new(map))).await;
+                                    // Select our DERP home from the same snapshot
+                                    // the runtime will get, so both agree (see
+                                    // select_home_region). Computed before `map`
+                                    // is moved into the event.
+                                    if let Some(hr) = select_home_region(&map) {
+                                        home_region = Some(hr);
+                                    }
+                                    if emit_events {
+                                        info!("Tailscale MapUpdate event sent ({} peers, {} DERP regions, home_derp={:?})", map.peers.len(), map.derp_regions.len(), home_region);
+                                        let _ = events.send(ControlEvent::MapUpdate(Box::new(map))).await;
+                                    } else {
+                                        // Publish #2 drain: parsed only to complete
+                                        // the stream; the runtime already has this
+                                        // netmap from publish #1, so re-emitting
+                                        // would double OurIpAssigned/MapUpdate.
+                                        info!("Tailscale MapResponse parsed, not re-emitted ({} peers, {} DERP regions, home_derp={:?})", map.peers.len(), map.derp_regions.len(), home_region);
+                                    }
                                 } else {
                                     info!("Tailscale MapUpdate skipped (empty snapshot)");
                                 }
@@ -644,7 +784,7 @@ impl ControlActor {
                         prefix_have = 0;
                     }
 
-                    if end_stream { info!("Tailscale stream ended"); return Ok(()); }
+                    if end_stream { info!("Tailscale stream ended"); return Ok(home_region); }
                 }
                 FrameAction::SendSettingsAck => {
                     let mut a=[0u8;9]; write_settings_ack(&mut a); noise.write_all(stream,&a).await?;
@@ -778,6 +918,70 @@ mod tests {
 
     fn leak_host(addr: std::net::SocketAddr) -> &'static str {
         Box::leak(addr.ip().to_string().into_boxed_str())
+    }
+
+    fn region(id: u16, latency_ms: u16) -> DerpRegion {
+        DerpRegion {
+            region_id: id,
+            region_code: heapless::String::new(),
+            host: heapless::String::new(),
+            port: 443,
+            latency_ms,
+        }
+    }
+
+    fn peer(derp_region: u16, is_online: bool) -> PeerInfo {
+        PeerInfo {
+            node_key: [0u8; 32],
+            disco_key: [0u8; 32],
+            tailnet_ip: TailnetIp([0u8; 4]),
+            prefix_len: 32,
+            hostname: heapless::String::new(),
+            derp_region,
+            is_online,
+        }
+    }
+
+    fn map_of(regions: &[DerpRegion], peers: &[PeerInfo]) -> MapState {
+        let mut m = MapState { our_ip: TailnetIp([100, 64, 0, 1]), peers: ArrayVec::new(), derp_regions: ArrayVec::new() };
+        for r in regions { m.derp_regions.push(r.clone()); }
+        for p in peers { m.peers.push(p.clone()); }
+        m
+    }
+
+    #[test]
+    fn home_region_prefers_where_most_online_peers_live() {
+        // Regions 1, 5, 9 all reachable. Online peers cluster on 5.
+        let m = map_of(
+            &[region(1, 0), region(5, 0), region(9, 0)],
+            &[peer(5, true), peer(5, true), peer(9, true), peer(1, false)],
+        );
+        assert_eq!(select_home_region(&m), Some(5));
+    }
+
+    #[test]
+    fn home_region_ignores_regions_we_cannot_reach() {
+        // Most online peers are homed on region 12, but we have no DERP host
+        // for it (not in the DERPMap), so it must not be chosen.
+        let m = map_of(
+            &[region(1, 30), region(2, 10)],
+            &[peer(12, true), peer(12, true), peer(2, true)],
+        );
+        assert_eq!(select_home_region(&m), Some(2));
+    }
+
+    #[test]
+    fn home_region_falls_back_to_lowest_latency_then_id_without_online_peers() {
+        // No online peer homed on a reachable region -> lowest latency wins,
+        // ties break to lowest id.
+        let m = map_of(&[region(3, 50), region(7, 20), region(4, 20)], &[]);
+        assert_eq!(select_home_region(&m), Some(4));
+    }
+
+    #[test]
+    fn home_region_none_when_no_regions() {
+        let m = map_of(&[], &[peer(5, true)]);
+        assert_eq!(select_home_region(&m), None);
     }
 
     async fn run_once(config: Config) -> ControlEvent {
