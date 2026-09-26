@@ -11,7 +11,13 @@ arrayvec  = { workspace = true }
 heapless  = { workspace = true }
 httparse  = { workspace = true }
 serde     = { workspace = true }
-serde_json = { workspace = true }
+# "std" (on top of the workspace default alloc-only) is needed for
+# `serde_json::to_writer`, which `to_json_buf` uses to serialize request
+# bodies straight into a fixed-capacity heapless buffer instead of a
+# heap-growing Vec<u8>. Cargo feature unification means this applies
+# workspace-wide once built together; it costs flash (comfortably available:
+# ~72% used per the last build), not the RAM this change is meant to save.
+serde_json = { workspace = true, features = ["std"] }
 # Push (event) JSON parser: fed decrypted netmap bytes as H2 DATA frames
 # arrive, so the ~34-48KB body is never held in one contiguous allocation
 # (which OOM-aborts on the fragmented ~57KB heap). Push model fits our

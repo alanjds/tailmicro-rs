@@ -32,6 +32,40 @@ pub use io::IoStream;
 // Max request size: body + headers (headers ~256 bytes)
 const MAX_REQUEST_SIZE: usize = 4096 + 256;
 
+/// Cap for the small, fixed-shape JSON request bodies this crate sends
+/// (`RegisterRequest`, `MapRequest`): a handful of short string fields, well
+/// under 1KB in practice. See [`to_json_buf`].
+const REQUEST_BODY_CAP: usize = 768;
+
+/// Serialize `value` into a fixed-capacity buffer instead of `serde_json::
+/// to_vec`'s heap-growing `Vec<u8>`.
+///
+/// Each of this crate's request bodies (register / publish / republish /
+/// keepalive-poll) is a small, fixed-shape struct of short string fields, so
+/// a bounded buffer is a correctness-safe fit, not just an optimization: the
+/// call sites are individually rare (once at registration, once or twice at
+/// bring-up, once per stream reconnect), but each `Vec<u8>` grow-then-drop is
+/// still a variable-sized heap allocation competing with the data plane's
+/// fixed-size blocks for the same contiguous space (see ALLOCATIONS.md).
+/// `write_all` on a `heapless::Vec` returns `Err` once the buffer is full
+/// rather than growing, so an unexpectedly large body fails fast here
+/// instead of silently reallocating.
+fn to_json_buf<T: Serialize>(value: &T) -> Result<heapless::Vec<u8, REQUEST_BODY_CAP>, JsonError> {
+    struct Buf(heapless::Vec<u8, REQUEST_BODY_CAP>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .extend_from_slice(data)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "json request body overflow"))?;
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut buf = Buf(heapless::Vec::new());
+    serde_json::to_writer(&mut buf, value).map_err(|_| JsonError::ParseError)?;
+    Ok(buf.0)
+}
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -388,13 +422,13 @@ impl ControlActor {
             // (cap >= 68) so they stay None; the authoritative values were
             // already published non-streaming during bring-up.
             let poll_res = async {
-                let map_body = serde_json::to_vec(&MapRequest {
+                let map_body = to_json_buf(&MapRequest {
                     version: CAPABILITY_VERSION, compress: "", keep_alive: true,
                     node_key: node_key_hex.as_str(), endpoints: &[], stream: true,
                     disco_key: None,
                     hostinfo: Some(HostInfo { os: "embedded", hostname: "esp32c3", net_info: None }),
                     omit_peers: true,
-                }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
+                }).map_err(ControlError::Json)?;
                 let map_req = build_h2_post("/machine/map", self.config.control_host, MAP_STREAM_ID, &map_body);
                 noise.write_all(&mut main_conn, &map_req).await?;
                 self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_STREAM_ID, true).await
@@ -471,12 +505,12 @@ impl ControlActor {
         let mut h2 = H2State::new();
 
         {
-            let reg_body = serde_json::to_vec(&RegisterRequest {
+            let reg_body = to_json_buf(&RegisterRequest {
                 version: CAPABILITY_VERSION, node_key: node_key_hex.as_str(),
                 old_node_key: None,
                 auth: RegisterAuth { auth_key },
                 hostinfo: HostInfo { os: "embedded", hostname: "esp32c3", net_info: None },
-            }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
+            }).map_err(ControlError::Json)?;
 
             info!("Tailscale Step 4: registering node");
             tracing::debug!("register request body: {}", core::str::from_utf8(&reg_body).unwrap_or("<invalid utf8>"));
@@ -522,13 +556,13 @@ impl ControlActor {
             // register the disco key and fetch the netmap. select_home_region
             // then runs on the parsed response and publish #2 (below) advertises
             // the chosen home. This is the standard Tailscale cold-boot order.
-            let publish_body = serde_json::to_vec(&MapRequest {
+            let publish_body = to_json_buf(&MapRequest {
                 version: CAPABILITY_VERSION, compress: "", keep_alive: false,
                 node_key: node_key_hex.as_str(), endpoints: &[], stream: false,
                 disco_key: Some(disco_key_hex.as_str()),
                 hostinfo: Some(HostInfo { os: "embedded", hostname: "esp32c3", net_info: None }),
                 omit_peers: false,
-            }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
+            }).map_err(ControlError::Json)?;
 
             let publish_req = build_h2_post("/machine/map", host, MAP_PUBLISH_STREAM_ID, &publish_body);
             noise.write_all(&mut main_conn, &publish_req).await?;
@@ -559,7 +593,7 @@ impl ControlActor {
             let home_endpoint = format!("{}:{}", DERP_MAGIC_IP, region);
             let endpoints = [home_endpoint.as_str()];
             info!("Tailscale Step 7.6: re-publishing with PreferredDERP={} endpoint={}", region, home_endpoint);
-            let republish_body = serde_json::to_vec(&MapRequest {
+            let republish_body = to_json_buf(&MapRequest {
                 version: CAPABILITY_VERSION, compress: "", keep_alive: false,
                 node_key: node_key_hex.as_str(), endpoints: &endpoints, stream: false,
                 disco_key: Some(disco_key_hex.as_str()),
@@ -568,7 +602,7 @@ impl ControlActor {
                     net_info: Some(NetInfo { preferred_derp: region }),
                 }),
                 omit_peers: false,
-            }).map_err(|_| ControlError::Json(JsonError::ParseError))?;
+            }).map_err(ControlError::Json)?;
             let republish_req = build_h2_post("/machine/map", host, MAP_REPUBLISH_STREAM_ID, &republish_body);
             noise.write_all(&mut main_conn, &republish_req).await?;
             // Drain + parse the response (re-emits the authoritative netmap,
