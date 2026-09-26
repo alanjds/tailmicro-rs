@@ -599,11 +599,18 @@ impl ControlActor {
         info!("Tailscale stream_map_response starting on stream {} (emit_events={})", expected_stream, emit_events);
         // Home region selected from the parsed netmap; returned to the caller.
         let mut home_region: Option<u16> = None;
-        // Heap (Vec) not stack: this whole call chain is awaited inline with no
-        // spawn/Box::pin boundary, so a stack-inline buffer folds into the
-        // caller's combined async state machine and overflows the 16 KB main
-        // task stack (confirmed via a live Guru Meditation stack fault).
-        let mut frame_buf: Vec<u8> = Vec::new();
+        // Fixed-capacity scratch buffer (heapless, no heap allocation).
+        //
+        // Replaces the previous `Vec<u8>` that grew via `resize(blen, 0)` and
+        // never shrank: once a frame length crossed 4096 the Vec doubled to
+        // 8192 and OOM-aborted on the fragmented ESP32-C3 heap
+        // ("memory allocation of 8192 bytes failed"). `INITIAL_WINDOW`
+        // (see tm_h2) is 4096, so the control server is flow-control-limited
+        // to <= 4096-byte DATA frames; a 4096 cap matches the real wire
+        // contract and can never request more than 4096 contiguous bytes.
+        // `read_exact` below overwrites the whole range, so we never zero-fill.
+        const FRAME_BUF_CAP: usize = 4096;
+        let mut frame_buf: heapless::Vec<u8, FRAME_BUF_CAP> = heapless::Vec::new();
         // Both the non-streaming publish and the streaming poll frame each
         // MapResponse as a 4-byte-LE length prefix + JSON (per
         // tools/wg_validator/ts_control.py's read_full_body/read_stream_message
@@ -667,7 +674,15 @@ impl ControlActor {
                 return Err(ControlError::H2(H2Error::FrameTooLarge(hdr.length)));
             }
             let blen = hdr.length as usize;
-            frame_buf.resize(blen, 0);
+            if blen > FRAME_BUF_CAP {
+                // Never allocate beyond the fixed cap; the server is
+                // INITIAL_WINDOW-limited to <= 4096-byte DATA frames. Bail
+                // gracefully (same as the MAX_FRAME_SIZE guard above) rather
+                // than OOMing on a doubling allocation.
+                return Err(ControlError::H2(H2Error::FrameTooLarge(hdr.length)));
+            }
+            // blen <= FRAME_BUF_CAP guaranteed above, so this never fails.
+            let _ = frame_buf.resize(blen, 0);
             noise.read_exact(stream, &mut frame_buf[..blen]).await?;
             debug!("Tailscale frame received: length={}, type={}", hdr.length, hdr.frame_type);
 
@@ -857,10 +872,18 @@ async fn read_one_h2_body<S: IoStream>(
     // smaller (~8KB) stack overflow remained here and in build_h2_post's
     // by-value ArrayVec return, both fixed the same way.
     let mut body: Box<ArrayVec<u8, 4096>> = Box::new(ArrayVec::new());
-    // Vec, not heapless::Vec: same reasoning as stream_map_response's
-    // frame_buf (see comment there) — this local is live across every await
-    // in the loop below, nested inline in the same unboxed call chain.
-    let mut fb: Vec<u8> = Vec::new();
+    // Fixed-capacity scratch frame buffer (heapless, no heap allocation).
+    //
+    // Replaces the previous `Vec<u8>` that grew via `resize(blen, 0)` and
+    // never shrank: once a frame length crossed 4096 the Vec doubled to 8192
+    // and OOM-aborted on the fragmented ESP32-C3 heap
+    // ("memory allocation of 8192 bytes failed"). `INITIAL_WINDOW`
+    // (tm_h2) is 4096, so the server is flow-control-limited to <= 4096-byte
+    // DATA frames; a 4096 cap matches the real wire contract and can never
+    // request more than 4096 contiguous bytes. `read_exact` overwrites the
+    // whole range, so we never zero-fill.
+    const FB_CAP: usize = 4096;
+    let mut fb: heapless::Vec<u8, FB_CAP> = heapless::Vec::new();
     loop {
         let mut hb = [0u8; 9];
         debug!("read_one_h2_body[{}]: awaiting frame header (body so far {} B)", expected_stream, body.len());
@@ -869,7 +892,15 @@ async fn read_one_h2_body<S: IoStream>(
         debug!("read_one_h2_body[{}]: frame type={} flags={} stream={} len={}", expected_stream, hdr.frame_type, hdr.flags, hdr.stream_id, hdr.length);
         if hdr.length > MAX_FRAME_SIZE { return Err(ControlError::H2(H2Error::FrameTooLarge(hdr.length))); }
         let blen = hdr.length as usize;
-        fb.resize(blen, 0);
+        if blen > FB_CAP {
+            // Never allocate beyond the fixed cap; the server is
+            // INITIAL_WINDOW-limited to <= 4096-byte DATA frames. Bail
+            // gracefully (same as the MAX_FRAME_SIZE guard above) rather
+            // than OOMing on a doubling allocation.
+            return Err(ControlError::H2(H2Error::FrameTooLarge(hdr.length)));
+        }
+        // blen <= FB_CAP guaranteed above, so this never fails.
+        let _ = fb.resize(blen, 0);
         noise.read_exact(stream, &mut fb[..blen]).await?;
         match tm_h2::parse_frame(&hdr, &fb[..blen], expected_stream, h2)? {
             FrameAction::Data { payload, end_stream } => {

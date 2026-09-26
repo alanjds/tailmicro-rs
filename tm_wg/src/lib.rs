@@ -20,7 +20,7 @@ pub mod vendor;
 use tm_control::{MapState, PeerInfo};
 
 pub use endpoint::{Endpoint, MAX_PEERS, WgEndpoint};
-use endpoint::RecvOut;
+use endpoint::{DispatchOut, RecvOut};
 use vendor::config::{PeerConfig, PeerId, Psk};
 use vendor::keys::{NodeKeyPair, NodePrivateKey, NodePublicKey};
 use vendor::packet::Packet;
@@ -97,6 +97,20 @@ pub struct WgActor {
     // has parsed the netmap and freed its buffer — keeps that ~28 KB free
     // exactly when the map read needs it. See docs/wg-dataplane-notes.md.
     endpoint: Option<Box<WgEndpoint>>,
+    /// Reusable scratch buffer for `RecvOut` (~6 KB), allocated once on first
+    /// use and refilled in place thereafter instead of `Box::new`'d fresh on
+    /// every inbound packet / send / tick. That per-call churn was the exact
+    /// ~6 KB block behind the `memory allocation of 6052 bytes failed` heap
+    /// fragmentation aborts observed after a couple of HTTP requests interleaved
+    /// with data-plane traffic. See ALLOCATIONS.md.
+    recv_scratch: Option<Box<RecvOut>>,
+    /// Reusable scratch buffer for `dispatch()`'s output (~6 KB), allocated
+    /// once on first use and overwritten in place thereafter instead of
+    /// `Box::new`'d fresh every ~400ms tick. Same fragmentation shape as
+    /// `recv_scratch`, but on a periodic timer rather than per-packet, so it
+    /// fires independently of (and can coincide with) any HTTP/data-plane
+    /// traffic. See ALLOCATIONS.md.
+    dispatch_scratch: Option<Box<DispatchOut>>,
     /// Node keypair, retained so the endpoint can be built lazily on first use.
     kp: NodeKeyPair,
     /// Never-evicted peer (MicroLink: priority_peer). Retained for API
@@ -112,6 +126,8 @@ impl WgActor {
         let kp = NodeKeyPair::from_private(NodePrivateKey(node_priv));
         Self {
             endpoint: None,
+            recv_scratch: None,
+            dispatch_scratch: None,
             kp,
             priority_peer,
         }
@@ -127,6 +143,40 @@ impl WgActor {
             self.endpoint = Some(WgEndpoint::new_boxed(self.kp));
         }
         self.endpoint.as_mut().unwrap()
+    }
+
+    /// Take the persistent `RecvOut` scratch buffer, allocating it once on
+    /// first use. Pair with [`Self::return_scratch`] once done so the buffer
+    /// is reused (not dropped and re-allocated) on the next call.
+    fn take_scratch(&mut self) -> Box<RecvOut> {
+        self.recv_scratch.take().unwrap_or_else(|| {
+            tracing::info!("WgActor: allocating RecvOut scratch (~6 KB) on first use");
+            Box::new(RecvOut::default())
+        })
+    }
+
+    /// Clear and return the scratch buffer taken via [`Self::take_scratch`].
+    fn return_scratch(&mut self, mut out: Box<RecvOut>) {
+        out.reset();
+        self.recv_scratch = Some(out);
+    }
+
+    /// Take the persistent `dispatch()` output scratch buffer, allocating it
+    /// once on first use. Pair with [`Self::return_dispatch_scratch`] once
+    /// done so the buffer is reused (not dropped and re-allocated) on the
+    /// next tick.
+    fn take_dispatch_scratch(&mut self) -> Box<DispatchOut> {
+        self.dispatch_scratch.take().unwrap_or_else(|| {
+            tracing::info!("WgActor: allocating dispatch scratch (~6 KB) on first use");
+            Box::new(DispatchOut::new())
+        })
+    }
+
+    /// Clear and return the scratch buffer taken via
+    /// [`Self::take_dispatch_scratch`].
+    fn return_dispatch_scratch(&mut self, mut out: Box<DispatchOut>) {
+        out.clear();
+        self.dispatch_scratch = Some(out);
     }
 
     pub async fn run(
@@ -247,17 +297,16 @@ impl WgActor {
             region_id: 0,
             node_key: src_key,
         };
-        // Allocate the RecvOut (~12 KB of inline packet buffers) on the heap
-        // FIRST, then fill it in place via `recv_one_into`. The earlier
-        // `Box::new(recv_one(...))` still built the 12 KB RecvOut on the stack
-        // (inside recv_one, then again as the Box::new argument) before moving
-        // it to the heap; stacked on the tokio/actor poll chain that overflowed
-        // the ESP32-C3 main task stack the first time DERP delivered a real
-        // inbound WG handshake response. Filling a pre-boxed RecvOut keeps those
-        // 12 KB off the stack entirely.
-        let mut out = Box::new(crate::endpoint::RecvOut::default());
+        // Reuse the persistent RecvOut scratch buffer (~6 KB of inline packet
+        // buffers) instead of `Box::new`-ing a fresh one per packet: that
+        // per-call alloc/free churn on the hottest data-plane path was
+        // fragmenting the heap (see `recv_scratch` doc comment and
+        // ALLOCATIONS.md). Filling a heap-resident RecvOut still keeps those
+        // 6 KB off the stack, same as before.
+        let mut out = self.take_scratch();
         self.endpoint().recv_one_into(payload, from, Instant::now(), &mut out);
-        self.drain_recv(src_key, out, events).await;
+        self.drain_recv(src_key, &out, events).await;
+        self.return_scratch(out);
     }
 
     async fn on_send_data(
@@ -271,16 +320,18 @@ impl WgActor {
         if self.endpoint.is_none() {
             return;
         }
-        // Same stack discipline as on_inbound: fill a pre-boxed RecvOut so its
-        // ~12 KB of inline packet buffers never lands on the main-task stack.
-        let mut out = Box::new(crate::endpoint::RecvOut::default());
+        // Same reuse discipline as on_inbound: the persistent scratch buffer
+        // keeps its ~6 KB of inline packet buffers off the stack without
+        // re-allocating on every send.
+        let mut out = self.take_scratch();
         let sent = self
             .endpoint()
             .send_data(&dst_key, payload, Instant::now(), &mut out);
         if !sent {
             tracing::debug!("send_data queued (no active session yet) or dropped");
         }
-        self.drain_recv(dst_key, out, events).await;
+        self.drain_recv(dst_key, &out, events).await;
+        self.return_scratch(out);
     }
 
     async fn on_tick(&mut self, events: &async_channel::Sender<WgEvent>) {
@@ -292,16 +343,20 @@ impl WgActor {
         }
         let now = Instant::now();
         // next_event is advisory; we always tick, and only act on due timers.
-        // Box the dispatch output (ArrayVec of (PeerId, Packet), ~12 KB) so it
-        // does not live as an owning iterator on the stack across the
-        // emit_to_peer awaits; iterate by reference and clone each packet.
-        let outbound = Box::new(self.endpoint().dispatch(now, now_unix()));
+        // Reuse the persistent dispatch scratch buffer instead of `Box::new`-ing
+        // a fresh one every tick (see `dispatch_scratch` doc comment): keeps the
+        // ~6 KB block off the stack (writing into the boxed slot in place) and,
+        // once allocated, off the heap-churn path entirely. Iterate by
+        // reference and clone each packet, same as before.
+        let mut outbound = self.take_dispatch_scratch();
+        *outbound = self.endpoint().dispatch(now, now_unix());
         for (id, pkt) in outbound.iter() {
             self.emit_to_peer(*id, pkt.clone(), events).await;
         }
+        self.return_dispatch_scratch(outbound);
     }
 
-    async fn drain_recv(&self, src_key: [u8; 32], out: Box<RecvOut>, events: &async_channel::Sender<WgEvent>) {
+    async fn drain_recv(&self, src_key: [u8; 32], out: &RecvOut, events: &async_channel::Sender<WgEvent>) {
         let dst_key = out
             .peer
             .and_then(|id| self.endpoint.as_deref().and_then(|ep| ep.peer_key(id)))

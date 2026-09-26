@@ -545,6 +545,12 @@ async fn event_router_task(
                         // from this (non-tcpip) task -- see
                         // tm_netstack::tailnet's module doc comment.
                         info!("Runtime::join() - WgEvent::InboundDecrypted {} bytes from peer {:02x}{:02x}..", payload.len(), src_key[0], src_key[1]);
+                        unsafe {
+                            debug!("Runtime::join() - heap after inbound-decrypted (before inject_inbound): total_free={} largest_internal={} largest_default={}",
+                                esp_idf_sys::esp_get_free_heap_size(),
+                                esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL),
+                                esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT));
+                        }
                         match tailnet::inject_inbound(payload.as_slice()) {
                             Ok(()) => {}
                             Err(tailnet::TailnetError::NotSupported) => {

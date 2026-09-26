@@ -68,6 +68,11 @@ const OUT_CAP: usize = 2;
 /// due when the buffer fills are serviced on the next tick.
 const DISPATCH_CAP: usize = 4;
 
+/// The type [`WgEndpoint::dispatch`] returns, named so callers (e.g.
+/// `WgActor::on_tick`) can hold a persistent, reusable scratch buffer of this
+/// exact type instead of `Box::new`-ing a fresh one every tick.
+pub type DispatchOut = ArrayVec<(PeerId, Packet), DISPATCH_CAP>;
+
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Handshake-retry jitter upper bound (prevents synchronized fleet storms).
@@ -278,6 +283,20 @@ pub struct RecvOut {
     pub handshook: bool,
     /// The peer this packet belonged to, if identified.
     pub peer: Option<PeerId>,
+}
+
+impl RecvOut {
+    /// Clear all fields in place so a caller-owned `RecvOut` can be reused
+    /// across calls instead of being freed and re-`Box::new`'d (which was
+    /// measured to fragment the ESP32-C3 heap under sustained traffic: this
+    /// struct is exactly the ~6 KB block that recurs in `memory allocation
+    /// of 6052 bytes failed` aborts). See ALLOCATIONS.md.
+    pub fn reset(&mut self) {
+        self.to_peer.clear();
+        self.decrypted.clear();
+        self.handshook = false;
+        self.peer = None;
+    }
 }
 
 struct EndpointState {
@@ -527,8 +546,9 @@ impl WgEndpoint {
     }
 
     /// Process one inbound packet, writing results into a caller-provided
-    /// `out` (which should be freshly [`RecvOut::default`] and, on device,
-    /// heap-allocated so the ~12 KB never touches the stack).
+    /// `out`, which must be empty (freshly [`RecvOut::default`] or reset via
+    /// [`RecvOut::reset`]) and, on device, heap-allocated so the buffer never
+    /// touches the stack.
     pub fn recv_one_into(&mut self, raw: &[u8], from: Endpoint, now: Instant, out: &mut RecvOut) {
         // Disco-demux belt-and-suspenders: only WireGuard type bytes 1..=4
         // reach here. (Primary disco split happens at the runtime edge.)
