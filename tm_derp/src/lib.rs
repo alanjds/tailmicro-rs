@@ -24,7 +24,7 @@ use async_channel;
 /// the serial log. Device-only (esp-idf-sys); a no-op elsewhere.
 #[cfg(feature = "etls")]
 #[inline(never)]
-fn heap_probe(tag: &str) {
+pub(crate) fn heap_probe(tag: &str) {
     #[cfg(target_os = "espidf")]
     unsafe {
         let total_free = esp_idf_sys::esp_get_free_heap_size();

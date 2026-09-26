@@ -71,7 +71,7 @@ use rand_core::RngCore;
 use sha2::Sha256;
 use typenum::{Sum, U10, U12, U32};
 
-use crate::{DerpError, DerpFrameType, DERP_MAGIC, MAX_DERP_PAYLOAD};
+use crate::{heap_probe, DerpError, DerpFrameType, DERP_MAGIC, MAX_DERP_PAYLOAD};
 
 /// Smallest-RAM record buffers (see the module RAM note).
 pub const RECORD_READ_BUF: usize = 5 * 1024;
@@ -132,6 +132,13 @@ impl<'a, S: AsyncRead + AsyncWrite> DerpTls<'a, S> {
         our_priv: &[u8; 32],
         mut rng: R,
     ) -> Result<DerpTls<'a, S>, DerpError> {
+        // TEMPORARY instrumentation (not for commit as-is): bracket every step
+        // of the TLS 1.3 + DERP handshake with a heap probe to isolate where
+        // the ~30KB largest-contiguous-block collapse (59392 -> 19456,
+        // observed straddling the whole of `connect`) actually happens, since
+        // RECORD_READ_BUF+RECORD_WRITE_BUF+frame_buf only account for ~8.7KB
+        // of it. See tailmicro-rs ALLOCATIONS.md follow-up investigation.
+        heap_probe("connect: before TlsConnection::new");
         let mut tls = TlsConnection::new(socket, read_buf, write_buf);
         let config = TlsConfig::new()
             .with_server_name(host)
@@ -139,9 +146,11 @@ impl<'a, S: AsyncRead + AsyncWrite> DerpTls<'a, S> {
             .with_max_fragment_length(MaxFragmentLength::Bits11);
         // UnsecureProvider = NoVerify + NoSign: certificate verification off.
         let provider = UnsecureProvider::new::<Chacha20Poly1305Sha256>(&mut rng);
+        heap_probe("connect: before tls.open (TLS handshake)");
         tls.open(TlsContext::new(&config, provider))
             .await
             .map_err(|_| DerpError::Tls)?;
+        heap_probe("connect: after tls.open (TLS handshake complete)");
 
         // GET /derp HTTP/1.1 Upgrade (assembled without format! to avoid an fmt
         // chain on device).
@@ -154,6 +163,7 @@ impl<'a, S: AsyncRead + AsyncWrite> DerpTls<'a, S> {
         write_all(&mut tls, req.as_bytes()).await?;
         tls.flush().await.map_err(|_| DerpError::Io)?;
         read_http_upgrade(&mut tls).await?;
+        heap_probe("connect: after HTTP Upgrade");
 
         let mut buf: [u8; MAX_DERP_PAYLOAD] = [0u8; MAX_DERP_PAYLOAD];
 
@@ -164,6 +174,7 @@ impl<'a, S: AsyncRead + AsyncWrite> DerpTls<'a, S> {
         }
         let mut server_key = [0u8; 32];
         server_key.copy_from_slice(&buf[8..40]);
+        heap_probe("connect: after ServerKey frame");
 
         // ClientInfo (0x02): node_pub(32) + nonce(24) + sealed JSON.
         let bx = SalsaBox::new(&BoxPublic::from(server_key), &BoxSecret::from(*our_priv));
@@ -180,6 +191,7 @@ impl<'a, S: AsyncRead + AsyncWrite> DerpTls<'a, S> {
             &[our_pub, &nonce_bytes, &ct],
         )
         .await?;
+        heap_probe("connect: after ClientInfo frame sent");
 
         // ServerInfo (0x03): nonce(24) + sealed JSON : decrypt to confirm box.
         let (ft, n) = read_frame(&mut tls, &mut buf).await?;
@@ -190,6 +202,7 @@ impl<'a, S: AsyncRead + AsyncWrite> DerpTls<'a, S> {
         si_nonce.copy_from_slice(&buf[..24]);
         bx.decrypt(&Nonce::from(si_nonce), &buf[24..n])
             .map_err(|_| DerpError::HandshakeFailed)?;
+        heap_probe("connect: after ServerInfo decrypt (handshake done)");
 
         Ok(DerpTls {
             tls,
