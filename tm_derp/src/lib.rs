@@ -41,6 +41,38 @@ pub(crate) fn heap_probe(tag: &str) {
     tracing::info!("DerpActor heap [{}]: (host build; probe is device-only)", tag);
 }
 
+/// TEMPORARY instrumentation (2026-09-26 heap-collapse investigation, see
+/// tailmicro-rs ALLOCATIONS.md "Fix plan: DERP TLS handshake heap collapse",
+/// step 2): finer-grained probe than [`heap_probe`], using
+/// `heap_caps_get_info` instead of just `heap_caps_get_largest_free_block`,
+/// to tell apart "many small blocks churned" (consistent with lwIP TCP-RX
+/// pbuf fragmentation, the lead hypothesis) from "one big thing allocated"
+/// (something TLS-internal). Bracketing `tls.open()` with this and comparing
+/// `free_blocks`/`total_blocks` before vs. after is the confirmation step the
+/// fix plan calls for before touching any lwIP sdkconfig. Not meant to ship;
+/// strip once the question is settled.
+#[cfg(feature = "etls")]
+#[inline(never)]
+pub(crate) fn heap_probe_blocks(tag: &str) {
+    #[cfg(target_os = "espidf")]
+    unsafe {
+        let mut info: esp_idf_sys::multi_heap_info_t = core::mem::zeroed();
+        esp_idf_sys::heap_caps_get_info(&mut info, esp_idf_sys::MALLOC_CAP_INTERNAL);
+        tracing::info!(
+            "DerpActor heap-blocks [{}]: total_free={} largest_free={} \
+             free_blocks={} allocated_blocks={} total_blocks={}",
+            tag,
+            info.total_free_bytes,
+            info.largest_free_block,
+            info.free_blocks,
+            info.allocated_blocks,
+            info.total_blocks,
+        );
+    }
+    #[cfg(not(target_os = "espidf"))]
+    tracing::info!("DerpActor heap-blocks [{}]: (host build; probe is device-only)", tag);
+}
+
 // ── DERP frame types (from Tailscale DERP spec) ───────────────────────────────
 
 /// The 8-byte ServerKey-frame magic: the literal `DERP🔑`. Cross-checked

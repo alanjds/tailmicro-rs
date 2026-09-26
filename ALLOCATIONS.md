@@ -424,6 +424,81 @@ hardware — it's the cheapest thing that discriminates between "lwIP RX
 churn" and "something inside the crypto/TLS state machine," and the
 answer determines whether option (a) is even worth prototyping.
 
+### Step 2 result (2026-09-26): confirmed — many blocks, not one
+
+Added `heap_probe_blocks()` (`tm_derp/src/lib.rs`, using
+`heap_caps_get_info`/`multi_heap_info_t` instead of just
+`heap_caps_get_largest_free_block`) bracketing `tls.open()` in
+`tm_derp/src/tls.rs`, alongside the existing `heap_probe()` calls.
+Flashed to the real ESP32-C3 (`/dev/ttyACM0`) and captured two
+independent boot/DERP-connect cycles (reset with `espflash reset`
+between them, no reflash needed):
+
+```
+Run 1: before  total_free=52000 largest_free=40960 free_blocks=9  allocated_blocks=623 total_blocks=632
+       after   total_free=42060 largest_free=23552 free_blocks=10 allocated_blocks=639 total_blocks=649
+       delta:  total_free -9940   largest_free -17408  free_blocks +1   allocated_blocks +16
+
+Run 2: before  total_free=54712 largest_free=45056 free_blocks=5  allocated_blocks=621 total_blocks=626
+       after   total_free=38268 largest_free=15872 free_blocks=11 allocated_blocks=643 total_blocks=654
+       delta:  total_free -16444  largest_free -29184  free_blocks +6   allocated_blocks +22
+```
+
+**Read: many blocks, not one.** In both runs, `allocated_blocks` jumps by
+a double-digit count (+16, +22) across the single `tls.open()` call —
+this rules out "one big thing allocated": a single large allocation would
+show `allocated_blocks` moving by ~1, not 16-22. `free_blocks` also grows
+(+1, +6) rather than staying flat or exploding into dozens/hundreds of
+slivers, so it isn't extreme, chaotic fragmentation either — it's a
+moderate handful of small allocations landing and (mostly, not entirely)
+freeing back within the same call, consistent with a burst of similarly-
+purposed operations (TCP segment receives, most of which get consumed and
+released back to the allocator, leaving a residual few unreleased or
+oddly-positioned).
+
+The ratio of `largest_free` drop to `total_free` drop is remarkably
+consistent across both runs — **~1.75x** (17408/9940 = 1.75; 29184/16444
+= 1.77) — meaning the loss in usable contiguous space is reliably ~75%
+more than the raw bytes actually consumed. That gap is exactly the
+fragmentation signature: if the 16-22 new blocks were packed tightly at
+one end of the original free region, the remaining contiguous tail would
+only shrink by the bytes consumed (ratio ~1.0), not 1.75x. Landing at a
+consistent ~1.75x across two independent runs with different exact byte
+counts is stronger evidence of a structural (repeatable) fragmentation
+pattern than noise would produce.
+
+**Caveat, for honesty**: this device runs a cooperative single-threaded
+executor where sibling actors (WiFi housekeeping, the control-plane H2
+connection, WG timer ticks) get to run at every `.await` point inside
+`tls.open()`'s ~700-900ms duration (see "Scheduling facts" above), so the
+`multi_heap_info_t` counters are heap-wide, not scoped to only the DERP
+TLS code path. The data cannot fully rule out some of the 16-22 blocks
+being unrelated background churn coincident with the handshake window.
+But it does not need to: the practical conclusion is the same either way
+— *something* is producing a burst of several-to-two-dozen small
+allocations precisely during the DERP TLS handshake window, not one
+large one, so a pool/window-sizing style fix (option (a), or option (c)
+if (a) proves insufficient) is the right shape of fix, not a search for
+a single oversized `Box`/`Vec`. This also matches the "embedded-tls is
+heapless throughout" source-read finding from the original investigation
+— the remaining candidate producing heap traffic in this window is
+exactly the TCP layer underneath it (lwIP pbufs) or, less likely,
+background actors coincidentally sharing the window.
+
+**Conclusion for the fix plan**: this confirms option (a)
+(`CONFIG_LWIP_TCP_WND_DEFAULT` reduction) is worth prototyping next, as
+originally ranked — the data supports "many blocks churned" over "one
+big thing," which is what would make a window/pool-shaped fix effective.
+It does not yet prove lwIP specifically (vs. background actor noise)
+without further isolation (e.g. quiescing the control-plane/WG actors
+during a synthetic DERP-only reconnect, which is more invasive to set up
+than this probe), so option (a) should still be evaluated empirically
+(prototype it, re-measure, see if the collapse shrinks) rather than
+assumed to fully close the gap.
+
+Instrumentation left in place (`heap_probe_blocks`, feature-gated behind
+`etls`), same as `heap_probe` — strip both once the underlying fix lands.
+
 ## Design principle going forward
 
 Fixed-size, same-shape allocations that recur on a hot path should be

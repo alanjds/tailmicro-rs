@@ -71,7 +71,7 @@ use rand_core::RngCore;
 use sha2::Sha256;
 use typenum::{Sum, U10, U12, U32};
 
-use crate::{heap_probe, DerpError, DerpFrameType, DERP_MAGIC, MAX_DERP_PAYLOAD};
+use crate::{heap_probe, heap_probe_blocks, DerpError, DerpFrameType, DERP_MAGIC, MAX_DERP_PAYLOAD};
 
 /// Smallest-RAM record buffers (see the module RAM note).
 pub const RECORD_READ_BUF: usize = 5 * 1024;
@@ -147,10 +147,12 @@ impl<'a, S: AsyncRead + AsyncWrite> DerpTls<'a, S> {
         // UnsecureProvider = NoVerify + NoSign: certificate verification off.
         let provider = UnsecureProvider::new::<Chacha20Poly1305Sha256>(&mut rng);
         heap_probe("connect: before tls.open (TLS handshake)");
+        heap_probe_blocks("connect: before tls.open");
         tls.open(TlsContext::new(&config, provider))
             .await
             .map_err(|_| DerpError::Tls)?;
         heap_probe("connect: after tls.open (TLS handshake complete)");
+        heap_probe_blocks("connect: after tls.open");
 
         // GET /derp HTTP/1.1 Upgrade (assembled without format! to avoid an fmt
         // chain on device).
