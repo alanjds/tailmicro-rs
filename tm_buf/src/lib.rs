@@ -66,12 +66,13 @@ use heapless::pool::object::{Object, ObjectBlock};
 /// (1500 + 32), `tm_wg`'s 1500 and `tm_disco`'s 256.
 pub const PKT_CAP: usize = 1500 + 32;
 
-/// Number of pooled buffers (~1.5 KB each, ~12 KB of static RAM).
+/// Number of pooled buffers (~1.5 KB each, ~6 KB of static RAM, which
+/// comes out of the same DRAM as the heap).
 /// Realistic steady-state in-flight count is 2-4 (one packet per hop being
 /// processed plus a couple queued); bursts beyond this fall back to heap
 /// allocation and show up in [`PoolStats::allocs`]. Tune from that counter
 /// rather than guessing.
-pub const POOL_N: usize = 8;
+pub const POOL_N: usize = 4;
 
 /// The storage behind a packet buffer.
 pub type PktInner = heapless::Vec<u8, PKT_CAP>;
