@@ -85,7 +85,7 @@ pub struct OutboundPacket {
     pub dst_ip: [u8; 4],
     /// The shared channel packet buffer (`tm_buf`); the event router
     /// forwards it into `WgCmd::SendData` as-is.
-    pub data: tm_buf::PktBox,
+    pub data: tm_buf::PktBuf,
 }
 
 pub type OutboundSender = async_channel::Sender<OutboundPacket>;

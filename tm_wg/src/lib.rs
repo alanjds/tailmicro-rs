@@ -48,7 +48,7 @@ pub enum WgCmd {
     /// router forwards the very buffer `tm_derp` filled, without copying.
     InboundPacket {
         src_key: [u8; 32],
-        payload: tm_buf::PktBox,
+        payload: tm_buf::PktBuf,
     },
     /// Encrypt and send an outbound transport (app-data) IP packet to a peer.
     ///
@@ -58,7 +58,7 @@ pub enum WgCmd {
     /// stack-frame reason as the other multi-KB variants above.
     SendData {
         dst_key: [u8; 32],
-        payload: tm_buf::PktBox,
+        payload: tm_buf::PktBuf,
     },
     Shutdown,
 }
@@ -67,12 +67,12 @@ pub enum WgEvent {
     /// An outbound WireGuard packet to send via DERP.
     OutboundPacket {
         dst_key: [u8; 32],
-        payload: tm_buf::PktBox,
+        payload: tm_buf::PktBuf,
     },
     /// A decrypted inbound payload, destined for the local netstack.
     InboundDecrypted {
         src_key: [u8; 32],
-        payload: tm_buf::PktBox,
+        payload: tm_buf::PktBuf,
     },
     /// A WireGuard handshake completed with the given peer node key.
     PeerHandshook([u8; 32]),
@@ -222,6 +222,14 @@ impl WgActor {
         // allocation deferred from construction; it runs only after the control
         // plane has already parsed and freed its netmap buffer.
         self.endpoint();
+        // Same moment is the right one to carve out the channel packet-buffer
+        // pool (tm_buf, ~6 KB, once): the netmap buffer is gone and per-packet
+        // traffic has not started, so these blocks come from a heap that has
+        // not yet been fragmented by data-plane/HTTP churn. See ALLOCATIONS.md.
+        let n = tm_buf::prewarm();
+        if n > 0 {
+            tracing::info!("WgActor: pre-warmed {} packet buffers ({} B each)", n, tm_buf::PKT_CAP);
+        }
 
         // Remove peers no longer present.
         let mut to_remove: heapless::Vec<PeerId, MAX_PEERS> = heapless::Vec::new();
@@ -386,7 +394,7 @@ impl WgActor {
             let _ = events
                 .send(WgEvent::OutboundPacket {
                     dst_key,
-                    payload: pkt_to_box(pkt),
+                    payload: pkt_to_buf(pkt),
                 })
                 .await;
         }
@@ -394,7 +402,7 @@ impl WgActor {
             let _ = events
                 .send(WgEvent::InboundDecrypted {
                     src_key: dst_key,
-                    payload: pkt_to_box(pkt),
+                    payload: pkt_to_buf(pkt),
                 })
                 .await;
         }
@@ -408,7 +416,7 @@ impl WgActor {
             let _ = events
                 .send(WgEvent::OutboundPacket {
                     dst_key: key.to_bytes(),
-                    payload: pkt_to_box(&pkt),
+                    payload: pkt_to_buf(&pkt),
                 })
                 .await;
         }
@@ -420,10 +428,12 @@ impl WgActor {
     }
 }
 
-/// Copy a WireGuard `Packet` (1500-byte capacity) into the shared channel
-/// buffer (`tm_buf::PKT_CAP` = 1532, so it always fits).
-fn pkt_to_box(pkt: &Packet) -> tm_buf::PktBox {
-    let mut v = tm_buf::new_box();
+/// Copy a WireGuard `Packet` (1500-byte capacity) into a pooled channel
+/// buffer (`tm_buf::PKT_CAP` = 1532, so it always fits). Once the pool is
+/// warm this is a memcpy with no heap traffic; the buffer returns to the
+/// pool when the event router is done with it.
+fn pkt_to_buf(pkt: &Packet) -> tm_buf::PktBuf {
+    let mut v = tm_buf::PktBuf::acquire();
     let _ = v.extend_from_slice(pkt.as_slice());
     v
 }

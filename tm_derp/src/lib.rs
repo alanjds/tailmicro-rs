@@ -153,7 +153,7 @@ pub enum DerpCmd {
         /// The shared channel packet buffer (`tm_buf`), moved here as-is
         /// from `tm_wg`'s `WgEvent::OutboundPacket` by the event router --
         /// no copy, no re-box.
-        payload: tm_buf::PktBox,
+        payload: tm_buf::PktBuf,
     },
     Disconnect,
     Shutdown,
@@ -168,7 +168,7 @@ pub enum DerpEvent {
         src_key: NodePublicKey,
         /// The shared channel packet buffer (`tm_buf`). The event router
         /// forwards this same buffer to `tm_wg`/`tm_disco` without copying.
-        payload: tm_buf::PktBox,
+        payload: tm_buf::PktBuf,
     },
     /// Server sent PING — we respond automatically, but surface it for metrics.
     PingReceived,
@@ -273,7 +273,7 @@ impl DerpActor {
         // What the select! resolved to. Kept deliberately tls-free so no branch
         // handler borrows `tls` while the other branch's future still holds it.
         enum Decision {
-            Send(NodePublicKey, tm_buf::PktBox),
+            Send(NodePublicKey, tm_buf::PktBuf),
             Frame(u8, usize),
             Stop,
         }
@@ -313,7 +313,7 @@ impl DerpActor {
                             // buffer (no stack temporary). The frame buffer is
                             // MAX_DERP_PAYLOAD == PKT_CAP, so the 32-byte-shorter
                             // body always fits.
-                            if let Some(payload) = tm_buf::box_from_slice(&tls.frame()[32..n]) {
+                            if let Some(payload) = tm_buf::PktBuf::from_slice(&tls.frame()[32..n]) {
                                 let _ = events
                                     .send(DerpEvent::PacketReceived {
                                         src_key: NodePublicKey::from_bytes(src),

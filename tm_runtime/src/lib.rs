@@ -479,7 +479,7 @@ async fn event_router_task(
                                 && &payload[..6] == tm_disco::DISCO_MAGIC;
                             // Both branches MOVE the buffer tm_derp filled
                             // on to the next actor: every channel shares
-                            // one buffer type (tm_buf::PktBox), so there is
+                            // one buffer type (tm_buf::PktBuf), so there is
                             // no copy into a differently-sized re-box here.
                             // (tm_disco bounds the disco ciphertext itself.)
                             if is_disco {
@@ -529,7 +529,7 @@ async fn event_router_task(
                         // the wiring is correct and observable.)
                         info!("Runtime::join() - WgEvent::OutboundPacket {} bytes -> DERP peer {:02x}{:02x}..", payload.len(), dst_key[0], dst_key[1]);
                         // Forward tm_wg's buffer to DERP as-is (same
-                        // tm_buf::PktBox type on both channels): no copy.
+                        // tm_buf::PktBuf type on both channels): no copy.
                         let _ = derp_tx2.send(DerpCmd::SendPacket {
                             dst_key: NodePublicKey::from_bytes(dst_key),
                             payload,
@@ -546,10 +546,12 @@ async fn event_router_task(
                         // tm_netstack::tailnet's module doc comment.
                         info!("Runtime::join() - WgEvent::InboundDecrypted {} bytes from peer {:02x}{:02x}..", payload.len(), src_key[0], src_key[1]);
                         unsafe {
-                            debug!("Runtime::join() - heap after inbound-decrypted (before inject_inbound): total_free={} largest_internal={} largest_default={}",
+                            let pool = tm_buf::stats();
+                            debug!("Runtime::join() - heap after inbound-decrypted (before inject_inbound): total_free={} largest_internal={} largest_default={} pktbuf_pool: free={} allocs={} frees={}",
                                 esp_idf_sys::esp_get_free_heap_size(),
                                 esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL),
-                                esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT));
+                                esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT),
+                                pool.free, pool.allocs, pool.frees);
                         }
                         match tailnet::inject_inbound(payload.as_slice()) {
                             Ok(()) => {}
@@ -576,7 +578,7 @@ async fn event_router_task(
                                     our_ip[0], our_ip[1], our_ip[2], our_ip[3],
                                     dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3],
                                     echo.len(), key[0], key[1]);
-                                if let Some(buf) = tm_buf::box_from_slice(&echo) {
+                                if let Some(buf) = tm_buf::PktBuf::from_slice(&echo) {
                                     let _ = wg_tx2.send(WgCmd::SendData {
                                         dst_key: key,
                                         payload: buf,
@@ -1014,7 +1016,7 @@ impl Runtime {
                                     // Distinguish DISCO vs WireGuard by first byte
                                     if !payload.is_empty() && payload[0] == 0x6d {
                                         // DISCO magic prefix (simplified check).
-                                        // Buffer forwarded as-is (tm_buf::PktBox).
+                                        // Buffer forwarded as-is (tm_buf::PktBuf).
                                         let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
                                             src_ip:   [0; 4],  // from DERP src
                                             src_port: 0,

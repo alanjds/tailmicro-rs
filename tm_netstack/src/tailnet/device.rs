@@ -202,12 +202,14 @@ unsafe extern "C" fn tailnet_output_cb(
     // that budget on top of lwIP's own call depth to reach this callback --
     // the exact class of bug documented at length in
     // docs/wg-dataplane-notes.md for the (much larger) main task stack.
-    // `tm_buf::new_box` uses `Box::write` on an uninitialized heap
-    // allocation, which constructs the empty `Vec` directly on the heap (this is its documented purpose -- see the
-    // stdlib docs for `Box::write`), so the only per-packet stack cost here
-    // is the loop locals, not the packet buffer itself; every subsequent
-    // `extend_from_slice` below writes straight into that heap memory.
-    let mut buf: tm_buf::PktBox = tm_buf::new_box();
+    // `tm_buf::PktBuf::acquire` hands back a pooled heap buffer, or, if
+    // the pool is empty, allocates one via `Box::write(Box::new_uninit(),
+    // ..)`, which constructs the empty `Vec` directly on the heap. Either
+    // way the only per-packet stack cost here is the loop locals, not the
+    // packet buffer itself; every subsequent `extend_from_slice` below
+    // writes straight into that heap memory. The pool's Mutex is held only
+    // for one pop, so taking it from this (tcpip) thread is fine.
+    let mut buf: tm_buf::PktBuf = tm_buf::PktBuf::acquire();
     unsafe {
         let mut cur = p;
         while !cur.is_null() {

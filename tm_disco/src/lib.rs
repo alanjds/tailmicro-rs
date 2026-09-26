@@ -84,9 +84,9 @@ pub enum DiscoCmd {
         src_port: u16,
         /// The shared channel packet buffer (`tm_buf`), forwarded by the
         /// event router exactly as `tm_derp` filled it (no copy into a
-        /// disco-specific size). Boxed, as every channel payload is, so the
-        /// message stays pointer-sized in `async_channel`'s ring buffer.
-        data:     tm_buf::PktBox,
+        /// disco-specific size). Pointer-sized, as every channel payload is, so
+        /// the message stays small in `async_channel`'s ring buffer.
+        data:     tm_buf::PktBuf,
     },
     /// Add a peer to the allowlist.
     AllowPeer([u8; 32]),

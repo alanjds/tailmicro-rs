@@ -201,23 +201,6 @@ pub fn stats() -> PoolStats {
     }
 }
 
-// ── Unpooled API (Step 0), removed once every crate uses `PktBuf` ─────────
-/// A boxed, unpooled packet buffer.
-pub type PktBox = Box<PktInner>;
-/// Allocate an empty unpooled [`PktBox`].
-pub fn new_box() -> PktBox {
-    Box::write(Box::new_uninit(), heapless::Vec::new())
-}
-/// Allocate an unpooled [`PktBox`] holding `data`, if it fits.
-pub fn box_from_slice(data: &[u8]) -> Option<PktBox> {
-    if data.len() > PKT_CAP {
-        return None;
-    }
-    let mut b = new_box();
-    let _ = b.extend_from_slice(data);
-    Some(b)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
