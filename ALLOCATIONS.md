@@ -198,6 +198,220 @@ window where "not enough contiguous space" can happen at all.
   listed alongside this one (`tm_derp` re-boxing, the router's
   copy-and-re-box, `tm_wg::pkt_to_box`) are now fixed — see "Fixed".
 
+## Fix plan: DERP TLS handshake heap collapse
+
+Follow-up to the "Verified on real hardware, but not the whole story"
+section above: that section blamed the per-request 8192 B hyper-buffer
+failure on generic "bursty churn" eating an 18-24 KB headroom. Finer
+instrumentation (2026-09-26, commit `89cf1cf`, `heap_probe()` calls added
+at every step inside `tm_derp::tls::DerpTls::connect`) narrowed down where
+a big chunk of that headroom actually goes *before* any HTTP request ever
+arrives: establishing the DERP TLS session itself.
+
+### 1. Problem statement
+
+`largest_internal` (the biggest contiguous free heap block) collapses by
+~30 KB in one step, entirely inside the single `tls.open().await` call
+(the TLS 1.3 ClientHello/ServerHello/EncryptedExtensions/
+Certificate/CertificateVerify/Finished exchange) — e.g. 45056 -> 14336 B
+in one hardware run, 40960 -> 17408 B in another. `total_free` only drops
+~12-13 KB across the same call, so most of the 30 KB is not consumed, it
+is stranded: freed back to the allocator but never recombined into one
+block again, because the long-lived `DerpTls` state (the two record
+buffers, `frame_buf`) ends up sitting in the address range afterward and
+pins the fragments apart. Everything after the handshake (HTTP Upgrade,
+ServerKey, ClientInfo, ServerInfo) is flat to within a few hundred bytes —
+the damage is 100% inside `tls.open()`.
+
+This sets a **floor of ~14-19 KB largest_internal for the entire lifetime
+of the DERP connection** (it never recovers; only a reboot resets it).
+That floor is what makes the pre-existing "hyper's 8192 B per-connection
+buffer fails" crash (see "Verified on real hardware..." above) so easy to
+hit: the dataplane's normal per-request churn only has to eat another
+6-11 KB, not 18-24 KB, to lose the race. Fixing this collapse doesn't fix
+the hyper-buffer crash by itself, but it substantially widens the margin
+that crash currently has to close.
+
+### 2. Lead hypothesis and a cheap way to confirm it first
+
+**Hypothesis**: lwIP's TCP-receive path allocates pbufs from the general
+heap (not a dedicated pool) for the several TCP segments the ~4.4 KB
+server `Certificate` handshake record arrives in, and that burst of
+differently-sized alloc/free pairs (one per segment: partial MSS chunks,
+not a clean 1500 B multiple) during the single `tls.open()` call is what
+fragments the heap. `embedded-tls` itself was checked against its
+vendored 0.19.0 source and is heapless-bounded throughout (`heapless::Vec`
+/ `String` with fixed const generics in `key_schedule.rs`, `pki.rs`,
+`webpki.rs`, `der_certificate.rs`, `connection.rs` — no unbounded `Vec` or
+`Box` on the handshake path), so it is very unlikely to be the direct
+fragmenter; the TCP layer underneath it is the remaining suspect that
+actually touches the heap during that window.
+
+**What would need to be true for this hypothesis**: ESP-IDF's lwIP is
+configured with `PBUF_POOL` sized too small/using `PBUF_RAM`
+(heap-`malloc`-backed) for the TCP receive path on this build, so
+segments larger than the static pool's slot size (or all of them, if the
+memory type is configured as `PBUF_RAM`) come from the general heap
+instead of a fixed-size, coalescing-immune static pool. `CONFIG_LWIP_*`
+sdkconfig options control this: `CONFIG_LWIP_PBUF_POOL_SIZE` (buffer
+count for `PBUF_POOL`), the actual allocator lwIP calls
+(`pbuf_alloc(PBUF_RAW, len, PBUF_POOL)` for TCP receive normally goes
+through `memp` typically, but the ESP-IDF lwIP port has a "dynamic" mode
+routing this through system `malloc` for the TCP MSS-sized RX pbufs — needs
+checking against the exact sdkconfig this build uses).
+
+**Cheap way to confirm/rule out before touching sdkconfig** (no lwIP
+changes, ~1 evening):
+- Add `heap_caps_get_info(&info, MALLOC_CAP_INTERNAL)` (not just
+  `heap_caps_get_largest_free_block`) probes bracketing `tls.open()`, and
+  compare `total_allocated_bytes` / `total_blocks` before vs. after — a
+  large jump in `total_blocks` with only a modest jump in
+  `total_allocated_bytes` would confirm many small transient allocations
+  happened (fragmentation signature), independent of *what* allocated
+  them.
+- Instrument (temporarily) `esp_get_free_heap_size()` at a much finer
+  grain than "before/after tls.open()" — inside `embedded-tls`'s own read
+  loop is not practical without patching the vendored crate, but the
+  *transport* (`embedded_io_adapters::tokio_1::FromTokio<TcpStream>`) is
+  ours to wrap: insert a thin logging shim around its `read()`/`write()`
+  that calls `heap_probe()` on every call during the handshake window
+  only (behind a cfg flag, removed after). If the collapse happens in
+  discrete steps that line up with individual `read()` calls returning
+  partial Certificate-record data (rather than one atomic drop), that is
+  strong confirmation it is the TCP receive path, not something inside
+  `embedded-tls`'s parsing/verification code.
+- Independently: `idf.py menuconfig` (or grep the generated `sdkconfig`
+  under `target/riscv32imc-esp-espidf/*/build/esp-idf-sys-*/out/sdkconfig`)
+  to see the current `CONFIG_LWIP_PBUF_POOL_SIZE` /
+  `CONFIG_LWIP_TCP_MSS` / any `CONFIG_LWIP_*_MALLOC` values. If pbufs are
+  already coming from a fixed pool sized comfortably above what a 4.4 KB
+  record needs, the hypothesis is wrong and the search should move
+  elsewhere (e.g. mbedTLS scratch — not applicable here, `etls` is the
+  pure-Rust backend — or `chacha20poly1305`/`sha2` transient state, which
+  the earlier source read suggests is small and fixed, but hasn't been
+  measured directly).
+
+Do the sdkconfig read first — it is free (no build/flash) and might
+settle the question in five minutes before spending an evening on the
+finer probes.
+
+**Already done (2026-09-26), no build needed**: grepped the generated
+`sdkconfig` for the exact build this repo produces
+(`target/riscv32imc-esp-espidf/debug/build/esp-idf-sys-*/out/sdkconfig`,
+matched to the most recent build). Result: **there is no
+`CONFIG_LWIP_PBUF_POOL_SIZE` or `CONFIG_LWIP_PBUF_POOL_BUFSIZE` option in
+this ESP-IDF v5.5.2 sdkconfig at all** — those are the classic lwIP
+`PBUF_POOL` knobs, and this ESP-IDF port doesn't expose them, which is
+consistent with ESP-IDF's lwIP defaulting to `MEMP_MEM_MALLOC` (pbufs
+allocated straight from the heap via `mem_malloc`, not carved from a
+static slab). This **confirms the load-bearing half of the hypothesis**:
+TCP RX pbufs on this build do come from the general heap, not a
+dedicated pool, so there is no pre-existing "pool" to simply resize.
+It does not yet confirm pbufs are *the specific* fragmenter (that still
+needs the `heap_caps_get_info` block-count probe), but it rules out the
+easy "just bump `PBUF_POOL_SIZE`" fix and reshapes option (a) below: the
+available knobs on this config are `CONFIG_LWIP_TCP_MSS` (1440),
+`CONFIG_LWIP_TCP_WND_DEFAULT`/`CONFIG_LWIP_TCP_SND_BUF_DEFAULT` (both
+5760 — 4x MSS) and `CONFIG_LWIP_TCP_RECVMBOX_SIZE` (6), which govern how
+many in-flight segments/how large a receive window the DERP TCP
+connection is allowed, not a pool size. Full relevant excerpt for
+reference:
+```
+CONFIG_LWIP_TCP_MSS=1440
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
+CONFIG_LWIP_TCP_WND_DEFAULT=5760
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=6
+CONFIG_LWIP_TCP_OVERSIZE_MSS=y
+CONFIG_LWIP_TCP_QUEUE_OOSEQ=y
+CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=4
+```
+With a 5760 B window (4x the 1440 B MSS) and OOSEQ queueing enabled, a
+~4.4 KB certificate record arriving as ~3-4 MSS-sized segments is exactly
+within one window's worth of in-flight, heap-backed pbufs — plausible
+as the source of the fragmentation burst.
+
+### 3. Ranked options (cheapest / lowest-risk first)
+
+**(a) lwIP TCP window/MSS tuning that's low-risk and reversible.**
+Confirmed (see step 2): this ESP-IDF build has no `PBUF_POOL_SIZE` knob
+to resize — TCP RX pbufs come straight from the heap. The available,
+config-only lever is instead **shrinking `CONFIG_LWIP_TCP_WND_DEFAULT`**
+(currently 5760 B = 4x the 1440 B MSS) so fewer segments (and therefore
+fewer, smaller heap pbufs) can be in flight at once during the
+certificate-record burst, at the cost of a slower TCP receive window
+generally (more round-trips for large transfers, which matters more for
+the control-plane's ~29-40 KB netmap `MapResponse` pulls than for DERP's
+mostly-small relayed packets). This is a one-line sdkconfig change, no
+Rust code touched, trivially reversible, and costs no extra RAM (it
+*reduces* the peak, it doesn't reserve more). Risk: low but *shared* —
+this window setting applies to every TCP connection on the device
+(control-plane H2 stream, the HTTP server, DERP), so a value that's too
+small could slow down or destabilize the control-plane's large netmap
+pulls, which is exactly the kind of regression this repo can't easily
+catch without a real hardware pass against the live control server. This
+is the first thing to try if the finer `heap_caps_get_info` probe (step
+2) confirms many small transient blocks (not one big one) around
+`tls.open()`.
+
+**(b) Shrink the Certificate-record burst itself.** The DERP server's
+cert chain is a 4-cert RSA chain (`1286+1247+1528+359` bytes measured
+live against `derp1.tailscale.com`) — that shape is set by the server, not
+us, so we cannot make Tailscale send a smaller chain. The one lever on
+our side is `MaxFragmentLength::Bits11` (2048), already the smallest
+`embedded-tls` offers and already set — but the module doc itself notes
+"Go's `crypto/tls` server ignores it today", i.e. the server sends
+whatever size records it wants regardless of what we request. This option
+is effectively **not available** without a DERP-server-side change, which
+is out of scope. Listed for completeness / to close it off, not to
+pursue.
+
+**(c) The bigger structural change: move TCP RX off the general heap
+entirely (`CONFIG_LWIP_TCP_MSS` tuning combined with switching lwIP's
+pbuf allocation for this path away from heap-`malloc`, or wrapping the
+`etls` TCP socket in our own buffering layer that reads in one
+`RECORD_READ_BUF`-sized gulp instead of letting lwIP hand back
+however-sized segments).** This is the `tm_buf`-style fix applied one
+layer down the stack: reserve a dedicated, statically-sized region for
+DERP's TCP receive path so its churn can never fragment the heap the HTTP
+server also needs. Cost: more static RAM reserved permanently (size TBD —
+needs measuring the actual segment-size distribution during a handshake
+first; guessing risks either not fixing it or over-reserving on an
+already-tight ~128 KB heap). Risk: **meaningfully higher than (a)** —
+this is shared lwIP infrastructure underneath *all* networking (WiFi
+control frames, the control-plane H2 connection, the HTTP status server,
+DERP), so a mistake here can regress paths that are currently fine, and
+lwIP's pbuf/memp configuration is not something this repo owns test
+coverage for. Only pursue this if (a) turns out insufficient (i.e. the
+fragmentation isn't just "pool too small" but structural to how lwIP
+hands off TCP data on this build).
+
+### 4. What to measure before prototyping, and the recommended next step
+
+1. ~~Read the generated `sdkconfig`~~ — **done** (see step 2 above): no
+   pbuf pool exists to resize; TCP RX is heap-backed, and the levers are
+   `CONFIG_LWIP_TCP_WND_DEFAULT`/`CONFIG_LWIP_TCP_MSS`/
+   `CONFIG_LWIP_TCP_RECVMBOX_SIZE`, not a pool size.
+2. Add the `heap_caps_get_info` block-count probe (cheap, same pattern as
+   the existing `heap_probe()`, no architecture change) bracketing
+   `tls.open()` to distinguish "many small blocks churned" (supports
+   option (a)) from "one big thing allocated and freed" (would point
+   elsewhere, e.g. inside `chacha20poly1305`/`sha2`/embedded-tls's key
+   schedule, which the source read suggests is small but hasn't been
+   measured directly) before touching any lwIP config.
+3. Only then prototype **(a)** (sdkconfig-only, `CONFIG_LWIP_TCP_WND_DEFAULT`
+   lowered, revert-in-one-line) and re-run the same before/after
+   `tls.open()` heap probe on real hardware to see how much of the 30 KB
+   collapse it recovers, *and* re-run a normal control-plane netmap pull
+   to confirm the smaller window doesn't visibly slow or break that path.
+   If (a) closes most of the gap without regressing the control plane,
+   stop there — no need for (c)'s bigger, riskier change.
+
+**Recommended next concrete step**: implement step 2 (the
+`heap_caps_get_info` block-count probe around `tls.open()`) on real
+hardware — it's the cheapest thing that discriminates between "lwIP RX
+churn" and "something inside the crypto/TLS state machine," and the
+answer determines whether option (a) is even worth prototyping.
+
 ## Design principle going forward
 
 Fixed-size, same-shape allocations that recur on a hot path should be
