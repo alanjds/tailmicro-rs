@@ -62,35 +62,72 @@ i.e. `2 * 2 * 1500 B` + small fields).
   `tm_wg/src/lib.rs`, `tm_disco/src/lib.rs`, `tm_netstack/src/tailnet/`)
 
 - **Cross-actor packet buffers — pooled `PktBuf` with RAII return.**
-  (the free-list design in the design record below; commits `d1607a8`,
-  `b392722`.) The channel buffer
-  is `tm_buf::PktBuf`: a pointer-sized owner of a boxed `PKT_CAP` buffer
-  whose `Drop` puts the storage back into a process-wide free list
-  (`static POOL: Mutex<heapless::Vec<Box<PktInner>, POOL_N = 4>>`) instead
-  of freeing it. Producers — `tm_derp`'s `RecvPacket` handling,
-  `tm_wg::pkt_to_buf` (was `pkt_to_box`, used by `drain_recv` and
+  (commits `d1607a8`, `b392722`; storage moved to a static `heapless`
+  pool in `7e37f10`, `b72e7a3`.) The channel buffer is `tm_buf::PktBuf`,
+  a two-word owner of one `PKT_CAP` buffer. Producers — `tm_derp`'s
+  `RecvPacket` handling, `tm_wg::pkt_to_buf` (used by `drain_recv` and
   `emit_to_peer`), the lwIP netif output callback, the rung-6a ICMP echo —
-  call `PktBuf::acquire()`/`from_slice()`, which pop from the pool and
-  allocate only when it is empty (counted). `WgActor::apply_map` calls
-  `tm_buf::prewarm()` right after the lazy `WgEndpoint` allocation, so the
-  4 x 1536 B (~6 KB, held permanently) are carved before per-packet traffic
-  starts. The router's "heap after inbound-decrypted" debug line now also
-  prints `pktbuf_pool: free= allocs= frees=`: once warm, `allocs` should
-  stay at 4; growth means more than `POOL_N` packets were in flight.
-  **Verified: builds only** — host `cargo build`/`cargo test` for
-  `tm_buf`/`tm_wg`/`tm_disco`/`tm_derp` (+`etls`)/`tm_netstack` pass
-  (`tm_buf` has a pool-lifecycle unit test: reuse returns the same
-  pointer, no allocation while warm, exhaustion falls back, overflow frees
-  on return, `size_of::<PktBuf>() == size_of::<usize>()`), and
-  `tm_runtime`, `tm_netstack`, `tm_derp --features etls` and the root
-  `tailmicro` lib cross-compile for `riscv32imc-esp-espidf`. (A plain
-  `cargo build --workspace` on host fails before and after this change:
-  `tm_tls` needs a backend feature and `tm_runtime` pulls `esp-idf-sys`.)
-  **Not yet verified on hardware**: the firmware is built from
-  `tasmolike-rs`, which had someone else's uncommitted work in progress,
-  so it was deliberately not built or flashed. To verify, flash and check
-  that the `pktbuf_pool` counters stay flat under the `status 0` stress
-  test and that no `memory allocation of 15xx bytes failed` appears.
+  call `PktBuf::acquire()`/`from_slice()`; dropping the `PktBuf` returns
+  the buffer.
+  - *Storage.* `POOL_N = 4` buffers live in a `static [ObjectBlock<_>; 4]`
+    (`.bss`, ~6 KB, never on the heap) handed once to a
+    `heapless::object_pool!` (heapless 0.9's lock-free, ABA-tagged Treiber
+    stack). `acquire` pops one; `Drop` clears it and pushes it back. With
+    the pool empty, `acquire` falls back to one counted heap `Box` (the old
+    behavior, same size), freed on drop. `WgActor::apply_map` calls
+    `tm_buf::prewarm()` (logs `packet-buffer pool ready: 4 static
+    buffers`), which now allocates nothing; the first `acquire` would do
+    the same.
+  - *Why it replaced the first version* (`Mutex<heapless::Vec<Box<..>, 4>>`
+    of heap boxes): the buffers no longer occupy heap at all (the heap
+    boxes were carved at `prewarm` time, mid-heap), and there is no
+    hand-written locking; the pool is `heapless`'s code.
+  - *Atomics.* riscv32imc has no native 64-bit atomics, which heapless's
+    32-bit tagged-pointer CAS needs, so the workspace `heapless` is now
+    `0.9` with `default-features = false, features =
+    ["portable-atomic-critical-section"]` (`tm_tls` switched to
+    `heapless.workspace = true`), and `tm_buf` enables
+    `critical-section/std` (a `std::sync::Mutex`-backed impl). That is
+    correct across FreeRTOS threads — lwIP's tcpip thread is a producer —
+    unlike `unsafe-assume-single-core`. Nothing else in the firmware
+    registers a `critical-section` impl (esp-idf-hal's `critical-section`
+    feature is off), so there is no duplicate-symbol conflict. heapless 0.8
+    remains in the tree only for the esp-idf crates.
+  - *Deviations from the "use `box_pool!`" plan.* `object_pool!` instead:
+    `BoxPool::alloc(value)` takes the new value by value, i.e. a ~1.5 KB
+    stack temporary per acquire, and one producer runs on lwIP's 3 KB
+    tcpip stack; an object pool recycles the initialized buffer in place
+    ("reuse, just clear it" is exactly our semantics). The one remaining
+    `unsafe` is creating the single `&'static mut` to the static block
+    array that `manage` needs, guarded by an `AtomicBool` swap so it runs
+    once (`static_cell` would remove it but is not in the offline
+    registry).
+  - *Counters.* The router's "heap after inbound-decrypted" debug line
+    prints `pktbuf_pool: free= allocs= frees=`. `allocs` now counts only
+    fallback heap allocations: it should stay **0**; growth means more
+    than `POOL_N` packets were in flight at once.
+  - **Verified: builds/tests** — host `cargo test` for `tm_buf` (pool
+    lifecycle: managed once, reuse returns a cleared pooled buffer with no
+    allocation, exhaustion falls back and frees on drop, `from_slice`
+    bounds, `size_of::<PktBuf>() <= 4 words`), `tm_wg` (24), `tm_disco`
+    (3), `tm_derp --features etls`, `tm_netstack` pass; the tailmicro
+    crates cross-compile for `riscv32imc-esp-espidf`, and the combined
+    `tasmolike-rs` firmware builds and links against this tree. (A plain
+    `cargo build --workspace` on host fails before and after: `tm_tls`
+    needs a backend feature and `tm_runtime` pulls `esp-idf-sys`.)
+  - **Hardware (2026-09-26): partial.** Flashed to the ESP32-C3: boots,
+    logs `packet-buffer pool ready: 4 static buffers (1532 B each)`,
+    connects DERP, completes WireGuard handshakes with both peers through
+    the pool, and ran ~5 min with no `memory allocation of`, `abort` or
+    reset. The 60-request `status 0` stress test could **not** run: after
+    reboot the dev host's packets never reached the node over DERP (no
+    `RecvPacket` on the node, although the host's tailscaled showed a fresh
+    handshake and kept transmitting). The previous firmware (Mutex-pool
+    build) reflashed behaves identically, so this is the known
+    stale-peer-state issue, not this change; the fix
+    (restart the host's tailscaled) would have dropped the tailnet-routed
+    SSH session. So the `pktbuf_pool` counters under load are still to be
+    confirmed.
 
 ## Verified on real hardware, but not the whole story
 
@@ -166,8 +203,8 @@ moment) and reused, not `Box::new`'d and dropped per call:
 
 Why the pool looks the way it does, and what else was considered (written
 2026-09-26 as a proposal, then implemented as "Step 0" (one buffer size,
-router forwards instead of copying) plus the RAII free-list; see
-"Fixed" for what landed).
+router forwards instead of copying) plus the RAII free-list, later moved
+onto a static `heapless` object pool; see "Fixed" for what landed).
 
 ### Before
 
@@ -197,9 +234,11 @@ at most `POOL_N` packets are in flight.
 - `inject_inbound` copies into an lwIP `PBUF_POOL` pbuf, so lwIP never
   retains our buffer.
 
-Hence the pool is behind a `std::sync::Mutex` (not `RefCell`), held only
-for one push/pop inside `acquire`/`Drop` — never across an `.await`, and no
-allocation or free happens while holding it.
+Hence the pool must be `Sync` across FreeRTOS threads (not `RefCell`).
+The first version used a `std::sync::Mutex` held for one push/pop; the
+current one is heapless's lock-free stack, whose CAS goes through
+`portable-atomic` + `critical-section/std` on this target. Neither is held
+across an `.await`.
 
 ### Rules the implementation relies on
 
@@ -209,12 +248,13 @@ allocation or free happens while holding it.
   drains.
 - **Safety is ownership.** A `PktBuf` has one owner; returning it is
   dropping it, so use-after-return and double-return are impossible
-  without `unsafe` (there is none in `tm_buf`). Undelivered messages
+  (the only `unsafe` in `tm_buf` is the one-time `&'static mut` to the
+  static blocks). Undelivered messages
   (including those handed back in a `SendError`) are dropped and so
   recycled.
 - **The failure mode is benign.** Holding buffers longer than expected, or
   a burst beyond `POOL_N`, just degrades to the old alloc/free behavior
-  (same size) and shows up in `pktbuf_pool allocs=`.
+  (same size) and shows up in `pktbuf_pool allocs=` (otherwise 0).
 - **Sizing.** Worst-case in flight is ~6 packet channels x `CHAN_CAP = 2`
   + ~1 in hand per actor ~= 16; realistic steady state is 2-4. `POOL_N = 4`
   (~6 KB permanent) was chosen over the proposal's 6 because the heap is
@@ -237,8 +277,8 @@ allocation or free happens while holding it.
   implicit refcount-based "is it free?" check and more to audit. Still the
   right tool if packets ever need zero-copy sub-slicing.
 - **C. Static `.bss` slab with owned 1-byte index handles** (atomic
-  bitmask, `UnsafeCell` slots). Takes the packet path off the heap
-  entirely, but needs ~30-50 lines of `unsafe` and permanently shrinks
-  the heap at boot even when the tailnet is never used. Kept as the
-  upgrade path: switching `tm_buf`'s internals to it would change no call
-  site outside `tm_buf`, if the heap-based pool proves insufficient.
+  bitmask, `UnsafeCell` slots). Rejected as hand-rolled: ~30-50 lines of
+  `unsafe`. Its goal (packet path entirely off the heap) was later
+  reached with `heapless::pool` instead, with no call-site changes outside
+  `tm_buf`. Cost: the ~6 KB is now reserved in `.bss` at boot even when
+  the tailnet is never used.
