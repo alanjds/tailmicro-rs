@@ -25,7 +25,7 @@ rustls   = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
 
 [dependencies]
 tm_keys = { path = "../tm_keys" }
-heapless = { version = "0.8", default-features = false }
+heapless.workspace = true
 thiserror = { version = "1", default-features = false }
 tracing = { version = "0.1", default-features = false }
 sha2 = { version = "0.10", default-features = false }     # fingerprint

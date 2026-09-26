@@ -1240,6 +1240,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
 dependencies = [
  "hash32",
+ "portable-atomic",
  "stable_deref_trait",
 ]
 
@@ -1627,6 +1628,9 @@ name = "portable-atomic"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+dependencies = [
+ "critical-section",
+]
 
 [[package]]
 name = "ppv-lite86"
@@ -2141,7 +2145,7 @@ dependencies = [
  "embedded-svc",
  "esp-idf-hal",
  "esp-idf-svc",
- "heapless 0.8.0",
+ "heapless 0.9.3",
  "log",
  "serde",
  "serde_json",
@@ -2221,7 +2225,8 @@ dependencies = [
 name = "tm_buf"
 version = "0.1.0"
 dependencies = [
- "heapless 0.8.0",
+ "critical-section",
+ "heapless 0.9.3",
 ]
 
 [[package]]
@@ -2232,7 +2237,7 @@ dependencies = [
  "arrayvec",
  "async-channel",
  "chacha20poly1305",
- "heapless 0.8.0",
+ "heapless 0.9.3",
  "httparse",
  "log",
  "serde",
@@ -2259,7 +2264,7 @@ dependencies = [
  "embedded-io-async 0.7.0",
  "embedded-tls",
  "esp-idf-sys",
- "heapless 0.8.0",
+ "heapless 0.9.3",
  "rand",
  "rand_core",
  "sha2",
@@ -2278,7 +2283,7 @@ dependencies = [
  "arrayvec",
  "async-channel",
  "crypto_box",
- "heapless 0.8.0",
+ "heapless 0.9.3",
  "tm_buf",
  "tm_keys",
  "tokio",
@@ -2294,7 +2299,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "esp-idf-sys",
- "heapless 0.8.0",
+ "heapless 0.9.3",
  "hkdf",
  "rand",
  "rand_core",
@@ -2309,7 +2314,7 @@ version = "0.1.0"
 dependencies = [
  "async-channel",
  "esp-idf-sys",
- "heapless 0.8.0",
+ "heapless 0.9.3",
  "log",
  "tm_buf",
  "tokio",
@@ -2322,7 +2327,7 @@ dependencies = [
  "async-channel",
  "esp-idf-svc",
  "esp-idf-sys",
- "heapless 0.8.0",
+ "heapless 0.9.3",
  "log",
  "tm_buf",
  "tm_control",
@@ -2341,7 +2346,7 @@ version = "0.1.0"
 dependencies = [
  "esp-idf-svc",
  "esp-idf-sys",
- "heapless 0.8.0",
+ "heapless 0.9.3",
  "rustls",
  "sha2",
  "thiserror 1.0.69",
@@ -2361,7 +2366,7 @@ dependencies = [
  "async-channel",
  "blake2",
  "chacha20poly1305",
- "heapless 0.8.0",
+ "heapless 0.9.3",
  "hkdf",
  "rand",
  "rand_core",

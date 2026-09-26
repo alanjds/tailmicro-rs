@@ -49,7 +49,7 @@ serde_json = { version = "1", default-features = false, features = ["alloc"] }
 
 # Fixed-capacity collections — no heap surprises
 arrayvec  = { version = "0.7", default-features = false }
-heapless  = { version = "0.8", default-features = false }
+heapless  = { version = "0.9", default-features = false, features = ["portable-atomic-critical-section"] }
 
 # Minimal HTTP parsing (no full http crate needed)
 httparse = { version = "1", default-features = false }
