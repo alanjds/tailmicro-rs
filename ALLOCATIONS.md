@@ -69,13 +69,13 @@ i.e. `2 * 2 * 1500 B` + small fields).
   `emit_to_peer`), the lwIP netif output callback, the rung-6a ICMP echo —
   call `PktBuf::acquire()`/`from_slice()`; dropping the `PktBuf` returns
   the buffer.
-  - *Storage.* `POOL_N = 4` buffers live in a `static [ObjectBlock<_>; 4]`
-    (`.bss`, ~6 KB, never on the heap) handed once to a
+  - *Storage.* `POOL_N = 8` buffers live in a `static [ObjectBlock<_>; 8]`
+    (`.bss`, ~12 KB, never on the heap) handed once to a
     `heapless::object_pool!` (heapless 0.9's lock-free, ABA-tagged Treiber
     stack). `acquire` pops one; `Drop` clears it and pushes it back. With
     the pool empty, `acquire` falls back to one counted heap `Box` (the old
     behavior, same size), freed on drop. `WgActor::apply_map` calls
-    `tm_buf::prewarm()` (logs `packet-buffer pool ready: 4 static
+    `tm_buf::prewarm()` (logs `packet-buffer pool ready: 8 static
     buffers`), which now allocates nothing; the first `acquire` would do
     the same.
   - *Why it replaced the first version* (`Mutex<heapless::Vec<Box<..>, 4>>`
@@ -128,6 +128,17 @@ i.e. `2 * 2 * 1500 B` + small fields).
     (restart the host's tailscaled) would have dropped the tailnet-routed
     SSH session. So the `pktbuf_pool` counters under load are still to be
     confirmed.
+  - **`POOL_N` raised 4 -> 8 (hardware, 2026-09-26).** Boots with
+    `packet-buffer pool ready: 8 static buffers`. Boot heap after
+    `WgActor` spawn drops from 95076 to ~89000 B free (largest block 86016
+    -> 77824): the extra ~6 KB of `.bss` comes straight out of the heap.
+    Tailnet traffic did arrive this run: `pktbuf_pool` showed `free=4..7
+    allocs=0 frees=0`. The first accepted HTTP connection then aborted with
+    `memory allocation of 8192 bytes failed` (the separately tracked
+    hyper-buffer issue; `largest_internal` was 10-13 KB, `total_free` ~31
+    KB just before). That is not a pool fallback (`allocs=0`), but the ~6 KB
+    less heap may make it likelier; compare against `POOL_N = 4` before
+    keeping 8.
 
 ## Verified on real hardware, but not the whole story
 
@@ -256,9 +267,12 @@ across an `.await`.
   a burst beyond `POOL_N`, just degrades to the old alloc/free behavior
   (same size) and shows up in `pktbuf_pool allocs=` (otherwise 0).
 - **Sizing.** Worst-case in flight is ~6 packet channels x `CHAN_CAP = 2`
-  + ~1 in hand per actor ~= 16; realistic steady state is 2-4. `POOL_N = 4`
-  (~6 KB permanent) was chosen over the proposal's 6 because the heap is
-  already tight; raise it only if the counter shows sustained fallback.
+  + ~1 in hand per actor ~= 16; realistic steady state is 2-4. First `POOL_N = 4`
+  (then heap-backed, so every buffer cost heap); raised to 8 (~12 KB
+  `.bss`) once the buffers moved to static storage, for burst margin.
+  Note `.bss` still comes out of the same internal DRAM, so this shrinks
+  the boot-time heap by the same ~12 KB. It just can't fragment it. Tune
+  from `pktbuf_pool allocs=`.
 - **One size.** `tm_wg`'s vendored `Packet` stays 1500 B internally; only
   the channel type is 1532. Oversize packets are dropped at the `tm_wg`
   boundary (see "Fixed").
@@ -280,5 +294,5 @@ across an `.await`.
   bitmask, `UnsafeCell` slots). Rejected as hand-rolled: ~30-50 lines of
   `unsafe`. Its goal (packet path entirely off the heap) was later
   reached with `heapless::pool` instead, with no call-site changes outside
-  `tm_buf`. Cost: the ~6 KB is now reserved in `.bss` at boot even when
+  `tm_buf`. Cost: the ~12 KB (`POOL_N = 8`) is now reserved in `.bss` at boot even when
   the tailnet is never used.
