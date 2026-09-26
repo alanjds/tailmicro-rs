@@ -35,11 +35,11 @@
 //!   `OutboundSender::try_send` (a synchronous, non-blocking, thread-safe
 //!   call per `async_channel`'s API -- it does not require an executor).
 
-use heapless::Vec as HVec;
-
-/// Matches the workspace's packet-buffer convention (`heapless::Vec<u8,
-/// 1500>`) used throughout `tm_wg`/`tm_runtime` for a single IP packet.
-pub const MAX_PACKET: usize = 1500;
+/// Capacity of the outbound packet buffer: the workspace-wide channel packet
+/// buffer capacity (`tm_buf::PKT_CAP`, 1532), shared by every crate that
+/// moves packets between actors so the event router can forward buffers
+/// instead of copying them into differently-sized ones.
+pub const MAX_PACKET: usize = tm_buf::PKT_CAP;
 
 /// Tailnet CIDR block (`100.64.0.0/10`, RFC 6598 CGNAT space) that Tailscale
 /// assigns node addresses from. The netif's netmask is set to this block's
@@ -83,7 +83,9 @@ pub struct OutboundPacket {
     /// no lwIP address-object conversion needed, these are already the wire
     /// bytes.
     pub dst_ip: [u8; 4],
-    pub data: Box<HVec<u8, MAX_PACKET>>,
+    /// The shared channel packet buffer (`tm_buf`); the event router
+    /// forwards it into `WgCmd::SendData` as-is.
+    pub data: tm_buf::PktBox,
 }
 
 pub type OutboundSender = async_channel::Sender<OutboundPacket>;

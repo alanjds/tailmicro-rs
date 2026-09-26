@@ -26,7 +26,7 @@
 //! This reduces memory usage for ESP32-C3 at the cost of lower throughput.
   
 use tm_control::{ControlActor, ControlCmd, ControlEvent, Config as ControlConfig};
-use tm_derp::{DerpActor, DerpCmd, DerpEvent, MAX_DERP_PAYLOAD};
+use tm_derp::{DerpActor, DerpCmd, DerpEvent};
 use tm_disco::{DiscoActor, DiscoCmd, DiscoEvent};
 use tm_wg::{WgActor, WgCmd, WgEvent};
 use tm_keys::{NodeState, NodePublicKey};
@@ -477,22 +477,23 @@ async fn event_router_task(
                             // neither -- disco magic byte 0 is 0x54.)
                             let is_disco = payload.len() >= 6
                                 && &payload[..6] == tm_disco::DISCO_MAGIC;
+                            // Both branches MOVE the buffer tm_derp filled
+                            // on to the next actor: every channel shares
+                            // one buffer type (tm_buf::PktBox), so there is
+                            // no copy into a differently-sized re-box here.
+                            // (tm_disco bounds the disco ciphertext itself.)
                             if is_disco {
-                                let mut data = heapless::Vec::new();
-                                let _ = data.extend_from_slice(&payload);
                                 let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
                                     src_ip:   [0; 4],
                                     src_port: 0,
-                                    data: Box::new(data),
+                                    data: payload,
                                 }).await;
                                 #[cfg(target_os = "espidf")]
                                 tokio_freertos_yield().await;
                             } else {
-                                let mut pkt = heapless::Vec::new();
-                                let _ = pkt.extend_from_slice(&payload);
                                 let _ = wg_tx2.send(WgCmd::InboundPacket {
                                     src_key: *src_key.as_bytes(),
-                                    payload: Box::new(pkt),
+                                    payload,
                                 }).await;
                                 #[cfg(target_os = "espidf")]
                                 tokio_freertos_yield().await;
@@ -527,13 +528,12 @@ async fn event_router_task(
                         // these are dropped by the DerpActor for now;
                         // the wiring is correct and observable.)
                         info!("Runtime::join() - WgEvent::OutboundPacket {} bytes -> DERP peer {:02x}{:02x}..", payload.len(), dst_key[0], dst_key[1]);
-                        let mut buf: heapless::Vec<u8, MAX_DERP_PAYLOAD> = heapless::Vec::new();
-                        if buf.extend_from_slice(&payload).is_ok() {
-                            let _ = derp_tx2.send(DerpCmd::SendPacket {
-                                dst_key: NodePublicKey::from_bytes(dst_key),
-                                payload: Box::new(buf),
-                            }).await;
-                        }
+                        // Forward tm_wg's buffer to DERP as-is (same
+                        // tm_buf::PktBox type on both channels): no copy.
+                        let _ = derp_tx2.send(DerpCmd::SendPacket {
+                            dst_key: NodePublicKey::from_bytes(dst_key),
+                            payload,
+                        }).await;
                         #[cfg(target_os = "espidf")]
                         tokio_freertos_yield().await;
                     }
@@ -576,11 +576,10 @@ async fn event_router_task(
                                     our_ip[0], our_ip[1], our_ip[2], our_ip[3],
                                     dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3],
                                     echo.len(), key[0], key[1]);
-                                let mut buf: heapless::Vec<u8, 1500> = heapless::Vec::new();
-                                if buf.extend_from_slice(&echo).is_ok() {
+                                if let Some(buf) = tm_buf::box_from_slice(&echo) {
                                     let _ = wg_tx2.send(WgCmd::SendData {
                                         dst_key: key,
-                                        payload: Box::new(buf),
+                                        payload: buf,
                                     }).await;
                                     #[cfg(target_os = "espidf")]
                                     tokio_freertos_yield().await;
@@ -1014,21 +1013,18 @@ impl Runtime {
                                 DerpEvent::PacketReceived { src_key, payload } => {
                                     // Distinguish DISCO vs WireGuard by first byte
                                     if !payload.is_empty() && payload[0] == 0x6d {
-                                        // DISCO magic prefix (simplified check)
-                                        let mut data = heapless::Vec::new();
-                                        let _ = data.extend_from_slice(&payload);
+                                        // DISCO magic prefix (simplified check).
+                                        // Buffer forwarded as-is (tm_buf::PktBox).
                                         let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
                                             src_ip:   [0; 4],  // from DERP src
                                             src_port: 0,
-                                            data: Box::new(data),
+                                            data: payload,
                                         }).await;
                                     } else {
-                                        // WireGuard packet
-                                        let mut pkt = heapless::Vec::new();
-                                        let _ = pkt.extend_from_slice(&payload);
+                                        // WireGuard packet, forwarded as-is.
                                         let _ = wg_tx2.send(WgCmd::InboundPacket {
                                             src_key: *src_key.as_bytes(),
-                                            payload: Box::new(pkt),
+                                            payload,
                                         }).await;
                                     }
                                 }

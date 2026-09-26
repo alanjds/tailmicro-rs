@@ -16,6 +16,7 @@ etls = [
 
 [dependencies]
 tm_keys.workspace = true
+tm_buf.workspace = true
 heapless  = { workspace = true }
 arrayvec  = { workspace = true }
 tokio     = { workspace = true, features = ["sync", "macros"] }

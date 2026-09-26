@@ -130,7 +130,10 @@ impl DerpHeader {
 
 /// Maximum WireGuard packet size + DERP header.
 /// WG max is 1500 (Ethernet MTU), DERP overhead is 32 bytes.
-pub const MAX_DERP_PAYLOAD: usize = 1500 + 32;
+///
+/// Deliberately equal to `tm_buf::PKT_CAP`, the one capacity shared by every
+/// packet buffer that crosses an inter-actor channel (see `tm_buf`).
+pub const MAX_DERP_PAYLOAD: usize = tm_buf::PKT_CAP;
 
 // ── Message types ─────────────────────────────────────────────────────────────
 
@@ -147,14 +150,10 @@ pub enum DerpCmd {
     /// Send a WireGuard packet to a peer identified by their node public key.
     SendPacket {
         dst_key: NodePublicKey,
-        /// Caller-owned buffer; actor copies out of it before returning.
-        ///
-        /// Boxed: async_channel's ring buffer (concurrent-queue) reserves 31
-        /// slots per block and returns each block by value, so an unboxed
-        /// MAX_DERP_PAYLOAD-sized buffer here balloons the caller's combined
-        /// async stack frame by 31x (see the ESP32-C3 stack overflow at
-        /// Runtime::join()'s tokio::join! entry).
-        payload: Box<heapless::Vec<u8, MAX_DERP_PAYLOAD>>,
+        /// The shared channel packet buffer (`tm_buf`), moved here as-is
+        /// from `tm_wg`'s `WgEvent::OutboundPacket` by the event router --
+        /// no copy, no re-box.
+        payload: tm_buf::PktBox,
     },
     Disconnect,
     Shutdown,
@@ -167,8 +166,9 @@ pub enum DerpEvent {
     /// A WireGuard packet arrived from a peer.
     PacketReceived {
         src_key: NodePublicKey,
-        /// Boxed for the same reason as DerpCmd::SendPacket's payload above.
-        payload: Box<heapless::Vec<u8, MAX_DERP_PAYLOAD>>,
+        /// The shared channel packet buffer (`tm_buf`). The event router
+        /// forwards this same buffer to `tm_wg`/`tm_disco` without copying.
+        payload: tm_buf::PktBox,
     },
     /// Server sent PING — we respond automatically, but surface it for metrics.
     PingReceived,
@@ -273,7 +273,7 @@ impl DerpActor {
         // What the select! resolved to. Kept deliberately tls-free so no branch
         // handler borrows `tls` while the other branch's future still holds it.
         enum Decision {
-            Send(NodePublicKey, Box<heapless::Vec<u8, MAX_DERP_PAYLOAD>>),
+            Send(NodePublicKey, tm_buf::PktBox),
             Frame(u8, usize),
             Stop,
         }
@@ -309,15 +309,18 @@ impl DerpActor {
                                 src[0],
                                 src[1]
                             );
-                            let mut payload: heapless::Vec<u8, MAX_DERP_PAYLOAD> =
-                                heapless::Vec::new();
-                            let _ = payload.extend_from_slice(&tls.frame()[32..n]);
-                            let _ = events
-                                .send(DerpEvent::PacketReceived {
-                                    src_key: NodePublicKey::from_bytes(src),
-                                    payload: Box::new(payload),
-                                })
-                                .await;
+                            // Copied straight into the heap-resident channel
+                            // buffer (no stack temporary). The frame buffer is
+                            // MAX_DERP_PAYLOAD == PKT_CAP, so the 32-byte-shorter
+                            // body always fits.
+                            if let Some(payload) = tm_buf::box_from_slice(&tls.frame()[32..n]) {
+                                let _ = events
+                                    .send(DerpEvent::PacketReceived {
+                                        src_key: NodePublicKey::from_bytes(src),
+                                        payload,
+                                    })
+                                    .await;
+                            }
                         }
                     } else if ft == DerpFrameType::Ping as u8 {
                         let body: heapless::Vec<u8, 8> = {

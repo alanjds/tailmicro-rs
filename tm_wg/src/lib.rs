@@ -43,9 +43,12 @@ pub enum WgCmd {
     /// the ESP32-C3 stack overflow at `Runtime::join()`'s `tokio::join!` entry.
     ApplyMap(Box<MapState<MAX_PEERS, 4>>),
     /// Route an incoming WireGuard packet received from DERP.
+    ///
+    /// `payload` is the shared channel packet buffer (`tm_buf`): the event
+    /// router forwards the very buffer `tm_derp` filled, without copying.
     InboundPacket {
         src_key: [u8; 32],
-        payload: Box<heapless::Vec<u8, 1500>>,
+        payload: tm_buf::PktBox,
     },
     /// Encrypt and send an outbound transport (app-data) IP packet to a peer.
     ///
@@ -55,7 +58,7 @@ pub enum WgCmd {
     /// stack-frame reason as the other multi-KB variants above.
     SendData {
         dst_key: [u8; 32],
-        payload: Box<heapless::Vec<u8, 1500>>,
+        payload: tm_buf::PktBox,
     },
     Shutdown,
 }
@@ -64,12 +67,12 @@ pub enum WgEvent {
     /// An outbound WireGuard packet to send via DERP.
     OutboundPacket {
         dst_key: [u8; 32],
-        payload: Box<heapless::Vec<u8, 1500>>,
+        payload: tm_buf::PktBox,
     },
     /// A decrypted inbound payload, destined for the local netstack.
     InboundDecrypted {
         src_key: [u8; 32],
-        payload: Box<heapless::Vec<u8, 1500>>,
+        payload: tm_buf::PktBox,
     },
     /// A WireGuard handshake completed with the given peer node key.
     PeerHandshook([u8; 32]),
@@ -288,9 +291,16 @@ impl WgActor {
     async fn on_inbound(
         &mut self,
         src_key: [u8; 32],
-        payload: &heapless::Vec<u8, 1500>,
+        payload: &[u8],
         events: &async_channel::Sender<WgEvent>,
     ) {
+        // The channel buffer is PKT_CAP (1532) wide, but the vendored
+        // `Packet::from_wire` panics on anything over its 1500-byte capacity.
+        // A real WireGuard message never exceeds that; drop anything larger.
+        if payload.len() > vendor::packet::CAPACITY {
+            tracing::debug!("WgActor: dropping oversize inbound packet ({} bytes)", payload.len());
+            return;
+        }
         // Primary disco demux happens at the runtime edge; recv_one also
         // sniffs the WireGuard type byte defensively.
         let from = Endpoint::Derp {
@@ -312,9 +322,16 @@ impl WgActor {
     async fn on_send_data(
         &mut self,
         dst_key: [u8; 32],
-        payload: &heapless::Vec<u8, 1500>,
+        payload: &[u8],
         events: &async_channel::Sender<WgEvent>,
     ) {
+        // `Packet::from_plaintext` panics past MAX_INNER (1500 - header -
+        // tag). The netif MTU (1380) keeps real traffic well under it; guard
+        // anyway now that the channel buffer is PKT_CAP (1532) wide.
+        if payload.len() > vendor::packet::MAX_INNER {
+            tracing::warn!("WgActor: dropping oversize outbound packet ({} bytes)", payload.len());
+            return;
+        }
         // No endpoint means no sessions; nothing to send (and we must not force
         // the ~28 KB lazy allocation for a stray send).
         if self.endpoint.is_none() {
@@ -403,10 +420,12 @@ impl WgActor {
     }
 }
 
-fn pkt_to_box(pkt: &Packet) -> Box<heapless::Vec<u8, 1500>> {
-    let mut v: heapless::Vec<u8, 1500> = heapless::Vec::new();
+/// Copy a WireGuard `Packet` (1500-byte capacity) into the shared channel
+/// buffer (`tm_buf::PKT_CAP` = 1532, so it always fits).
+fn pkt_to_box(pkt: &Packet) -> tm_buf::PktBox {
+    let mut v = tm_buf::new_box();
     let _ = v.extend_from_slice(pkt.as_slice());
-    Box::new(v)
+    v
 }
 
 /// Current Unix time in seconds, but only if the clock looks synced

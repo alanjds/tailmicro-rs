@@ -9,6 +9,7 @@ tm_derp.workspace    = true
 tm_disco.workspace   = true
 tm_wg.workspace      = true
 tm_keys.workspace    = true
+tm_buf.workspace = true
 tm_netstack.workspace = true
 heapless  = { workspace = true }
 async-channel.workspace = true

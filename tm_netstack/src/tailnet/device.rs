@@ -1,7 +1,7 @@
 //! On-device lwIP glue for the tailnet netif. See `super` for the threading
 //! rules this file is built against.
 
-use super::{OutboundPacket, OutboundSender, TailnetError, MAX_PACKET, MTU, TAILNET_NETMASK};
+use super::{OutboundPacket, OutboundSender, TailnetError, MTU, TAILNET_NETMASK};
 
 use core::ffi::c_void;
 use core::mem::MaybeUninit;
@@ -202,13 +202,12 @@ unsafe extern "C" fn tailnet_output_cb(
     // that budget on top of lwIP's own call depth to reach this callback --
     // the exact class of bug documented at length in
     // docs/wg-dataplane-notes.md for the (much larger) main task stack.
-    // `Box::write` on an uninitialized heap allocation constructs the empty
-    // `Vec` directly on the heap (this is its documented purpose -- see the
+    // `tm_buf::new_box` uses `Box::write` on an uninitialized heap
+    // allocation, which constructs the empty `Vec` directly on the heap (this is its documented purpose -- see the
     // stdlib docs for `Box::write`), so the only per-packet stack cost here
     // is the loop locals, not the packet buffer itself; every subsequent
     // `extend_from_slice` below writes straight into that heap memory.
-    let mut buf: Box<heapless::Vec<u8, MAX_PACKET>> =
-        Box::write(Box::new_uninit(), heapless::Vec::new());
+    let mut buf: tm_buf::PktBox = tm_buf::new_box();
     unsafe {
         let mut cur = p;
         while !cur.is_null() {
@@ -217,7 +216,7 @@ unsafe extern "C" fn tailnet_output_cb(
             // Silently truncates past MAX_PACKET; this matches every other
             // packet buffer in this workspace (see tm_wg/tm_runtime), and a
             // legitimate IP packet destined for us never exceeds MTU (1380)
-            // + headers, well under MAX_PACKET (1500).
+            // + headers, well under MAX_PACKET (1532).
             let _ = buf.extend_from_slice(seg);
             cur = (*cur).next;
         }

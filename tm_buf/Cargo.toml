@@ -1,0 +1,8 @@
+[package]
+name = "tm_buf"
+version.workspace = true
+edition.workspace = true
+description = "Shared fixed-capacity packet buffer for tailmicro's cross-actor channels"
+
+[dependencies]
+heapless = { workspace = true }

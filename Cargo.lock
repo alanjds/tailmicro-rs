@@ -2218,6 +2218,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tm_buf"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.8.0",
+]
+
+[[package]]
 name = "tm_control"
 version = "0.1.0"
 dependencies = [
@@ -2257,6 +2264,7 @@ dependencies = [
  "rand_core",
  "sha2",
  "thiserror 1.0.69",
+ "tm_buf",
  "tm_keys",
  "tokio",
  "tracing",
@@ -2271,6 +2279,7 @@ dependencies = [
  "async-channel",
  "crypto_box",
  "heapless 0.8.0",
+ "tm_buf",
  "tm_keys",
  "tokio",
 ]
@@ -2302,6 +2311,7 @@ dependencies = [
  "esp-idf-sys",
  "heapless 0.8.0",
  "log",
+ "tm_buf",
  "tokio",
 ]
 
@@ -2314,6 +2324,7 @@ dependencies = [
  "esp-idf-sys",
  "heapless 0.8.0",
  "log",
+ "tm_buf",
  "tm_control",
  "tm_derp",
  "tm_disco",
@@ -2354,6 +2365,7 @@ dependencies = [
  "hkdf",
  "rand",
  "rand_core",
+ "tm_buf",
  "tm_control",
  "tm_keys",
  "tokio",

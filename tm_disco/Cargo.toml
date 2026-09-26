@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 tm_keys.workspace   = true
+tm_buf.workspace = true
 # NaCl crypto_box (X25519 + XSalsa20-Poly1305) — the actual primitive real
 # Tailscale disco uses, replacing the previous (wrong) XChaCha20Poly1305.
 # Version pinned to match the authoritative `ts_disco_protocol` /

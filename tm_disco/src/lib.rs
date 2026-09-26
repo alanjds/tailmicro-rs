@@ -82,12 +82,11 @@ pub enum DiscoCmd {
     MaybeDisco {
         src_ip:   [u8; 4],
         src_port: u16,
-        /// Boxed: async_channel's ring buffer (concurrent-queue) reserves 31
-        /// slots per block and returns each block by value, so an unboxed
-        /// buffer here balloons the caller's combined async stack frame by
-        /// 31x (see the ESP32-C3 stack overflow at Runtime::join()'s
-        /// tokio::join! entry).
-        data:     Box<heapless::Vec<u8, 256>>,
+        /// The shared channel packet buffer (`tm_buf`), forwarded by the
+        /// event router exactly as `tm_derp` filled it (no copy into a
+        /// disco-specific size). Boxed, as every channel payload is, so the
+        /// message stays pointer-sized in `async_channel`'s ring buffer.
+        data:     tm_buf::PktBox,
     },
     /// Add a peer to the allowlist.
     AllowPeer([u8; 32]),
