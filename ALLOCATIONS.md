@@ -499,6 +499,57 @@ assumed to fully close the gap.
 Instrumentation left in place (`heap_probe_blocks`, feature-gated behind
 `etls`), same as `heap_probe` — strip both once the underlying fix lands.
 
+### Step 3 result (2026-09-26): option (a) prototyped, confirmed effective
+
+Lowered `CONFIG_LWIP_TCP_WND_DEFAULT` from 5760 (4x MSS) to 2880 (2x MSS)
+in `tasmolike-rs/sdkconfig.defaults` (that repo's own change to commit,
+not this one's — this file only records the result). Built, flashed, and
+captured two independent boot/DERP-connect cycles with the same
+`heap_probe`/`heap_probe_blocks` bracketing `tls.open()`:
+
+```
+Run 1: before  total_free=43780 largest_free=30720
+       after   total_free=41804 largest_free=27648
+       delta:  total_free -1976   largest_free -3072
+
+Run 2: before  total_free=43780 largest_free=30720
+       after   total_free=41660 largest_free=27648
+       delta:  total_free -1660   largest_free -3072
+       (largest_internal_block recovered back to 30720 within the same
+       connect sequence, after HTTP Upgrade/ServerKey/ClientInfo/ServerInfo)
+```
+
+Compare to the pre-fix baseline (Step 2 result above): `largest_free`
+drop across `tls.open()` went from **17408-29184 bytes, permanent, never
+recovering** down to **3072 bytes, and it recovers back to the
+pre-handshake value** by the time the DERP connection finishes setting
+up. This closes almost all of the previously-unaccounted collapse.
+
+Sanity checks with the change in place, all clean:
+- Control-plane connect/register/netmap-pull (H2 over the same lwIP TCP
+  stack) completed normally, no new errors or timeouts, 4096-byte DATA
+  frames still arriving fine.
+- 5 sequential `status 0` HTTP requests over DERP: all 200 OK.
+- 30-request burst over DERP: device stayed up the whole time (uptime
+  confirmed continuous via serial log, no `rst:0x`/`abort()` at any
+  point). 25 of 30 requests failed at the transport level (`curl` exit
+  000, couldn't connect) — traced to the already-documented
+  `bospill`<->`esp32c3` stale-DERP-peer flakiness (see project memory:
+  "DERP reachability diagnostics"), not a firmware crash: no crash
+  signature anywhere in the capture, and the failure pattern (sudden full
+  connection refusal, unrelated to request size or timing) doesn't match
+  the 8192-byte-allocation crash signature at all.
+
+**Conclusion**: option (a) works as predicted by the Step 2 data. This is
+still a prototype — one MSS multiplier picked as a conservative first
+step, not yet stress-tested to the same depth as the original crash
+repro (that needs the `bospill` connectivity issue out of the way first
+to get a clean high-volume burst). Recommended before shipping: rerun the
+original 60-request stress test that reliably reproduced the 8192-byte
+crash pre-fix, once `bospill`<->`esp32c3` connectivity is stable, to get
+a real 0-vs-N crash comparison rather than relying on the heap-probe
+numbers alone.
+
 ## Design principle going forward
 
 Fixed-size, same-shape allocations that recur on a hot path should be
