@@ -6,3 +6,11 @@ description = "Shared fixed-capacity packet buffer for tailmicro's cross-actor c
 
 [dependencies]
 heapless = { workspace = true }
+# Registers the `critical_section::Impl` that heapless's portable-atomic
+# backend (`portable-atomic-critical-section`, set on the workspace heapless
+# dependency) uses for the 64-bit tagged-pointer CAS in `heapless::pool` --
+# riscv32imc has no native 64-bit atomics. The `std` impl is a
+# `std::sync::Mutex`, correct across FreeRTOS threads (lwIP's tcpip thread
+# is one of our producers); `unsafe-assume-single-core` would NOT be, since
+# FreeRTOS preempts.
+critical-section = { version = "1", features = ["std"] }

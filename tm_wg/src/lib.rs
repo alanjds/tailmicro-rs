@@ -222,13 +222,13 @@ impl WgActor {
         // allocation deferred from construction; it runs only after the control
         // plane has already parsed and freed its netmap buffer.
         self.endpoint();
-        // Same moment is the right one to carve out the channel packet-buffer
-        // pool (tm_buf, ~6 KB, once): the netmap buffer is gone and per-packet
-        // traffic has not started, so these blocks come from a heap that has
-        // not yet been fragmented by data-plane/HTTP churn. See ALLOCATIONS.md.
+        // Hand the channel packet-buffer pool (tm_buf) its static buffers
+        // before per-packet traffic starts. They live in .bss, so this
+        // allocates nothing; the first `acquire` would do it anyway -- this
+        // just makes it explicit and logged. See ALLOCATIONS.md.
         let n = tm_buf::prewarm();
         if n > 0 {
-            tracing::info!("WgActor: pre-warmed {} packet buffers ({} B each)", n, tm_buf::PKT_CAP);
+            tracing::info!("WgActor: packet-buffer pool ready: {} static buffers ({} B each)", n, tm_buf::PKT_CAP);
         }
 
         // Remove peers no longer present.

@@ -11,30 +11,38 @@
 //!
 //! ## The pool
 //!
-//! A [`PktBuf`] is a boxed buffer that, when dropped, goes back into a
-//! small process-wide free list ([`POOL_N`] entries) instead of being
-//! deallocated; [`PktBuf::acquire`] pops from that list and only allocates
-//! when it is empty. After [`prewarm`] (called once when the WireGuard
-//! endpoint is created) the packet path does no heap traffic at all as long
-//! as no more than `POOL_N` packets are in flight at once. Past that it
-//! falls back to exactly the old behavior (one alloc, one free, same size)
-//! and counts it in [`stats`].
+//! [`POOL_N`] buffers live in a static array (`.bss`, never on the heap),
+//! handed to a `heapless::pool::object` pool (`object_pool!`: a lock-free,
+//! ABA-tagged Treiber stack). [`PktBuf::acquire`] pops one; dropping the
+//! `PktBuf` clears it and pushes it back. So the packet path does no heap
+//! traffic at all while no more than `POOL_N` packets are in flight. Past
+//! that, `acquire` falls back to exactly the old behavior (one heap
+//! alloc/free of the same size) and counts it in [`stats`].
+//!
+//! Why `object_pool!` and not `box_pool!`: `BoxPool::alloc(value)` takes
+//! the new value *by value*, i.e. a ~1.5 KB `heapless::Vec` temporary per
+//! acquire, and one producer (lwIP's netif output callback) runs on the
+//! tcpip thread's 3 KB stack. An object pool recycles the already
+//! initialized buffer in place, so nothing packet-sized is ever built on a
+//! stack -- and "reuse the buffer, just clear it" is exactly our semantics.
 //!
 //! ## Safety argument
 //!
-//! There is no `unsafe` here. A `PktBuf` owns its `Box`; Rust's move
-//! semantics guarantee exactly one owner at a time, and returning the
-//! buffer to the pool *is* dropping it, which happens once and only after
-//! its last use. That holds across `async_channel` hops too: a message
-//! that is never received, or is handed back inside a `SendError`, is
-//! dropped and so recycled.
+//! The pool itself (the lock-free stack, the raw node pointers) is
+//! `heapless`'s audited code. Our only `unsafe` is creating the one
+//! `&'static mut` to the static block array that `manage` requires, and it
+//! runs at most once (guarded by an atomic flag). Beyond that, ownership
+//! does the work: a `PktBuf` has exactly one owner, returning the buffer to
+//! the pool *is* dropping it, which happens once and only after its last
+//! use -- including across `async_channel` hops (an undelivered message, or
+//! one handed back inside a `SendError`, is dropped and so recycled).
 //!
-//! The pool is a `std::sync::Mutex` because one producer, lwIP's netif
-//! output callback (`tm_netstack`), runs on the tcpip FreeRTOS thread, not
-//! on the tokio task. The lock is held only for a single push/pop inside
-//! [`PktBuf::acquire`] / `Drop` (never across an `.await`, which is
-//! impossible from those sync functions anyway) and nothing is allocated or
-//! freed while holding it.
+//! Atomics: riscv32imc has no native 64-bit atomics, which heapless's
+//! 32-bit tagged-pointer CAS needs, so the workspace enables heapless's
+//! `portable-atomic-critical-section` feature and this crate enables
+//! `critical-section/std` (a `std::sync::Mutex`-backed impl). That is
+//! correct across FreeRTOS threads -- lwIP's tcpip thread is a producer --
+//! unlike `unsafe-assume-single-core`, which FreeRTOS preemption breaks.
 //!
 //! `acquire` NEVER waits for a buffer to come back. Waiting could deadlock:
 //! e.g. `tm_derp` blocked on a buffer while the free buffers sit in its own
@@ -47,8 +55,10 @@
 
 use core::fmt;
 use core::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+
+use heapless::object_pool;
+use heapless::pool::object::{Object, ObjectBlock};
 
 /// Capacity of every channel-facing packet buffer.
 ///
@@ -56,57 +66,80 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 /// (1500 + 32), `tm_wg`'s 1500 and `tm_disco`'s 256.
 pub const PKT_CAP: usize = 1500 + 32;
 
-/// Number of buffers the pool keeps (~1.5 KB each, so ~6 KB held once
-/// warm). Realistic steady-state in-flight count is 2-4 (one packet per
-/// hop being processed plus a couple queued); bursts beyond this fall back
-/// to allocation and show up in [`PoolStats::allocs`]. Tune from that
-/// counter rather than guessing.
+/// Number of pooled buffers (~1.5 KB each, ~6 KB of static RAM).
+/// Realistic steady-state in-flight count is 2-4 (one packet per hop being
+/// processed plus a couple queued); bursts beyond this fall back to heap
+/// allocation and show up in [`PoolStats::allocs`]. Tune from that counter
+/// rather than guessing.
 pub const POOL_N: usize = 4;
 
 /// The storage behind a packet buffer.
 pub type PktInner = heapless::Vec<u8, PKT_CAP>;
 
-static POOL: Mutex<heapless::Vec<Box<PktInner>, POOL_N>> = Mutex::new(heapless::Vec::new());
-static PREWARMED: AtomicBool = AtomicBool::new(false);
-/// Buffers allocated fresh (pool empty) -- includes the pre-warm ones.
+object_pool!(PktPool: PktInner);
+
+/// Backing storage for the pool, in `.bss`. Only ever touched through the
+/// single `&'static mut` created in [`ensure_managed`].
+static mut BLOCKS: [ObjectBlock<PktInner>; POOL_N] =
+    [const { ObjectBlock::new(heapless::Vec::new()) }; POOL_N];
+static MANAGED: AtomicBool = AtomicBool::new(false);
+/// Pooled buffers currently checked out.
+static POOL_OUT: AtomicUsize = AtomicUsize::new(0);
+/// Fallback heap allocations (pool empty).
 static ALLOCS: AtomicU32 = AtomicU32::new(0);
-/// Buffers deallocated on drop because the pool was already full.
+/// Fallback heap buffers freed again.
 static FREES: AtomicU32 = AtomicU32::new(0);
 
-fn pool() -> MutexGuard<'static, heapless::Vec<Box<PktInner>, POOL_N>> {
-    // A panic while holding this lock cannot leave the Vec inconsistent
-    // (push/pop only), so a poisoned lock is safe to keep using.
-    POOL.lock().unwrap_or_else(PoisonError::into_inner)
+/// Hand the static blocks to the pool, once. Returns how many were added.
+fn ensure_managed() -> usize {
+    if MANAGED.load(Ordering::Acquire) || MANAGED.swap(true, Ordering::AcqRel) {
+        return 0;
+    }
+    // SAFETY: the swap above lets exactly one caller, ever, reach this
+    // line, so this is the only reference to BLOCKS that will ever exist;
+    // `manage` then owns each block for the rest of the program.
+    let blocks: &'static mut [ObjectBlock<PktInner>; POOL_N] =
+        unsafe { &mut *core::ptr::addr_of_mut!(BLOCKS) };
+    for block in blocks.iter_mut() {
+        PktPool.manage(block);
+    }
+    POOL_N
 }
 
-/// Allocate an empty buffer directly on the heap.
-///
-/// `Box::write(Box::new_uninit(), ..)` constructs the empty `Vec` in the
-/// heap allocation instead of building a ~1.5 KB temporary on the stack and
-/// copying it in (this matters on lwIP's 3 KB tcpip-thread stack).
-fn alloc_inner() -> Box<PktInner> {
-    ALLOCS.fetch_add(1, Ordering::Relaxed);
-    Box::write(Box::new_uninit(), heapless::Vec::new())
+enum Storage {
+    Pooled(Object<PktPool>),
+    Heap(Box<PktInner>),
 }
 
 /// A pooled packet buffer, as moved through the inter-actor channels.
 ///
-/// Pointer-sized (`Option<Box<_>>` uses the null niche), so channel
-/// messages stay small: `async_channel`'s ring buffer reserves 31 slots per
-/// block and returns each block by value, and an unboxed ~1.5 KB payload
-/// there overflowed the ESP32-C3 main-task stack at `Runtime::join()`.
+/// A couple of words (pool handle or heap pointer), so channel messages
+/// stay small: `async_channel`'s ring buffer reserves 31 slots per block
+/// and returns each block by value, and an unboxed ~1.5 KB payload there
+/// overflowed the ESP32-C3 main-task stack at `Runtime::join()`.
 ///
 /// Derefs to [`PktInner`] (a `heapless::Vec<u8, PKT_CAP>`). Dropping it
-/// returns the storage to the pool.
-pub struct PktBuf(Option<Box<PktInner>>);
+/// returns the storage to the pool (or frees a fallback heap buffer).
+pub struct PktBuf(Storage);
 
 impl PktBuf {
-    /// Take an empty buffer from the pool, allocating only if it is empty.
-    /// Never blocks or waits.
+    /// Take an empty buffer from the pool, falling back to a heap
+    /// allocation if the pool is empty. Never blocks or waits.
     pub fn acquire() -> Self {
-        let pooled = pool().pop();
-        // Allocate (if needed) after the guard above is released.
-        PktBuf(Some(pooled.unwrap_or_else(alloc_inner)))
+        ensure_managed();
+        match PktPool.request() {
+            Some(obj) => {
+                POOL_OUT.fetch_add(1, Ordering::Relaxed);
+                debug_assert!(obj.is_empty());
+                PktBuf(Storage::Pooled(obj))
+            }
+            None => {
+                ALLOCS.fetch_add(1, Ordering::Relaxed);
+                // Built directly in the heap allocation: no ~1.5 KB stack
+                // temporary (this matters on lwIP's 3 KB tcpip stack).
+                PktBuf(Storage::Heap(Box::write(Box::new_uninit(), heapless::Vec::new())))
+            }
+        }
     }
 
     /// Acquire a buffer holding a copy of `data`, or `None` if `data` is
@@ -120,39 +153,40 @@ impl PktBuf {
         let _ = b.extend_from_slice(data);
         Some(b)
     }
-
-    fn inner(&self) -> &PktInner {
-        // Only `Drop` takes the box out.
-        self.0.as_deref().expect("PktBuf used after drop")
-    }
-
-    fn inner_mut(&mut self) -> &mut PktInner {
-        self.0.as_deref_mut().expect("PktBuf used after drop")
-    }
 }
 
 impl Deref for PktBuf {
     type Target = PktInner;
     fn deref(&self) -> &PktInner {
-        self.inner()
+        match &self.0 {
+            Storage::Pooled(o) => o,
+            Storage::Heap(b) => b,
+        }
     }
 }
 
 impl DerefMut for PktBuf {
     fn deref_mut(&mut self) -> &mut PktInner {
-        self.inner_mut()
+        match &mut self.0 {
+            Storage::Pooled(o) => o,
+            Storage::Heap(b) => b,
+        }
     }
 }
 
 impl Drop for PktBuf {
     fn drop(&mut self) {
-        let Some(mut b) = self.0.take() else { return };
-        b.clear();
-        // `push` hands the box back on a full pool; it is then freed after
-        // the lock guard (a temporary of this statement) is released.
-        let rejected = pool().push(b).err();
-        if rejected.is_some() {
-            FREES.fetch_add(1, Ordering::Relaxed);
+        match &mut self.0 {
+            // The Object's own Drop (right after this) pushes it back to
+            // the pool without dropping its value, so clear it here: the
+            // next `acquire` must get an empty buffer.
+            Storage::Pooled(o) => {
+                o.clear();
+                POOL_OUT.fetch_sub(1, Ordering::Relaxed);
+            }
+            Storage::Heap(_) => {
+                FREES.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -163,39 +197,30 @@ impl fmt::Debug for PktBuf {
     }
 }
 
-/// Fill the pool up to [`POOL_N`] buffers, once. Later calls are no-ops.
-///
-/// Call it early, at a moment when the heap is known to be in good shape,
-/// so the buffers are carved out before per-request churn fragments the
-/// heap and then simply stay allocated. Returns how many were allocated.
+/// Hand the pool its static buffers now (otherwise the first `acquire`
+/// does it). Allocates nothing; kept so start-up can make it explicit.
+/// Returns how many buffers were added (`POOL_N` the first time, then 0).
 pub fn prewarm() -> usize {
-    if PREWARMED.swap(true, Ordering::Relaxed) {
-        return 0;
-    }
-    let want = POOL_N - pool().len();
-    for _ in 0..want {
-        // Acquire-free cycle: allocate, then drop into the pool.
-        drop(PktBuf(Some(alloc_inner())));
-    }
-    want
+    ensure_managed()
 }
 
 /// Snapshot of pool counters, for heap-debug logging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolStats {
-    /// Buffers currently idle in the pool.
+    /// Pooled buffers currently idle.
     pub free: usize,
-    /// Total fresh allocations so far (pre-warm included). Once warm, any
-    /// growth here means more than `POOL_N` packets were in flight.
+    /// Total fallback heap allocations (pool was empty). Stays 0 while no
+    /// more than `POOL_N` packets are ever in flight at once.
     pub allocs: u32,
-    /// Total buffers freed because the pool was full on return.
+    /// Total fallback heap buffers freed again.
     pub frees: u32,
 }
 
 /// Current pool counters.
 pub fn stats() -> PoolStats {
+    let managed = if MANAGED.load(Ordering::Acquire) { POOL_N } else { 0 };
     PoolStats {
-        free: pool().len(),
+        free: managed.saturating_sub(POOL_OUT.load(Ordering::Relaxed)),
         allocs: ALLOCS.load(Ordering::Relaxed),
         frees: FREES.load(Ordering::Relaxed),
     }
@@ -209,37 +234,41 @@ mod tests {
     // runs tests on parallel threads.
     #[test]
     fn pool_lifecycle() {
+        assert_eq!(stats().free, 0, "nothing managed before first use");
         assert_eq!(prewarm(), POOL_N);
-        assert_eq!(prewarm(), 0, "prewarm is once-only");
+        assert_eq!(prewarm(), 0, "managed once only");
         let s0 = stats();
         assert_eq!(s0.free, POOL_N);
+        assert_eq!(s0.allocs, 0);
 
-        // Reuse: a dropped buffer comes back as the next acquire, cleared.
+        // Reuse: a dropped buffer comes back cleared, from static storage.
         let mut a = PktBuf::acquire();
         a.extend_from_slice(&[1, 2, 3]).unwrap();
-        let p = a.as_ptr();
+        assert_eq!(stats().free, POOL_N - 1);
         drop(a);
         let b = PktBuf::acquire();
-        assert_eq!(b.as_ptr(), p);
         assert!(b.is_empty());
+        assert!(matches!(b.0, Storage::Pooled(_)));
         drop(b);
-        assert_eq!(stats().allocs, s0.allocs, "no allocation while warm");
+        assert_eq!(stats().free, POOL_N);
+        assert_eq!(stats().allocs, 0, "no heap allocation while the pool suffices");
 
-        // Exhaustion falls back to allocation; overflow on return is freed.
+        // Exhaustion falls back to the heap; those buffers are freed on drop.
         let held: Vec<PktBuf> = (0..POOL_N + 2).map(|_| PktBuf::acquire()).collect();
         assert_eq!(stats().free, 0);
-        assert_eq!(stats().allocs, s0.allocs + 2);
+        assert_eq!(stats().allocs, 2);
+        assert_eq!(held.iter().filter(|p| matches!(p.0, Storage::Heap(_))).count(), 2);
         drop(held);
         let s1 = stats();
         assert_eq!(s1.free, POOL_N);
-        assert_eq!(s1.frees, s0.frees + 2);
+        assert_eq!(s1.frees, 2);
 
         // from_slice bounds.
         assert_eq!(PktBuf::from_slice(&[9, 8]).unwrap().as_slice(), &[9, 8]);
         assert!(PktBuf::from_slice(&[0u8; PKT_CAP]).is_some());
         assert!(PktBuf::from_slice(&[0u8; PKT_CAP + 1]).is_none());
 
-        // Pointer-sized in channel messages.
-        assert_eq!(core::mem::size_of::<PktBuf>(), core::mem::size_of::<usize>());
+        // Small in channel messages.
+        assert!(core::mem::size_of::<PktBuf>() <= 4 * core::mem::size_of::<usize>());
     }
 }
