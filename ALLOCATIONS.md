@@ -658,6 +658,63 @@ crash myself. Saying so plainly rather than guessing at numbers.
    structural/pool-based rework of the TCP-RX path) — still the most
    invasive option and nothing found this round changes that ranking.
 
+### Step 4 result (2026-09-27): disco crypto ruled out; TLS collapse got worse anyway
+
+Built and flashed the `fd9cf76` instrumentation (this session has working
+build/flash access to `tasmolike-rs`/`tailmicro-rs`, unlike the sandbox the
+prior round's agent was blocked in). Captured boot + a real `tailscale
+ping esp32c3` (3 disco PING/PONG round trips over DERP) on real hardware.
+
+**Disco crypto's own allocations: ruled out.** `largest_free` does not
+move at all across `bx.decrypt`/`build_sealed_pong` — flat at 20480 bytes
+across all three ping/pong exchanges (only `total_free` and `free_blocks`
+wobble by a few dozen bytes/blocks, consistent with the "tens of bytes,
+mostly freed back" prediction from the Step 4 hypothesis). This
+specific suspicion is closed: the disco PONG crypto is not what's eating
+the TCP-window fix's headroom.
+
+**But the underlying TLS-handshake collapse itself is measurably worse
+than the Step 3 prototype run, on the same `CONFIG_LWIP_TCP_WND_DEFAULT
+=2880`:**
+
+```
+Step 3 (TCP window fix alone):
+  before tls.open: total_free=43780 largest_free=30720
+  after  tls.open: total_free=41660 largest_free=27648   (-3072, recovers to 30720 later)
+
+Step 4 (same window fix + DERP-reconnect + disco-PONG code now linked in):
+  before DerpTls::connect:        total_free=64876 largest_internal=53248  (more headroom at boot than Step 3!)
+  before tls.open:                total_free=57736 largest_internal=47104
+  after  tls.open:                total_free=46644 largest_internal=29696  (-17408)
+  after ServerInfo decrypt (handshake done): total_free=45388 largest_internal=20480  (further -9216, no recovery)
+  floor for rest of connection's life: 20480
+```
+
+So even though this build has *more* free heap and a *larger* largest
+block before the handshake even starts, it ends up at a **lower, worse
+floor** (20480 vs 27648-30720) after the exact same handshake. The disco
+PONG crypto calls happen well after this collapse (confirmed flat at
+20480 through all three probes), so they aren't the cause — something
+about linking the new `tm_disco` code (the `crypto_box`/`rand`/`tracing`/
+`esp-idf-sys` additions to `tm_disco/Cargo.toml`, or just more actors
+being constructed before `DerpActor` runs) has shifted the heap's layout
+enough that the same TLS handshake now fragments a worse region. This
+was reproduced as a live crash: the 8192-byte hyper-buffer allocation
+failed on the first HTTP connection after boot with this exact build,
+serial-confirmed (`connection accepted` -> `memory allocation of 8192
+bytes failed` -> abort -> reboot), despite the TCP-window fix being in
+place and working as designed in isolation.
+
+**Conclusion**: the TCP-window fix (option a) is real and still worth
+keeping, but it is not sufficient on its own once the rest of the
+firmware's code/RAM footprint grows — the safety margin it bought was
+consumed by something structurally unrelated to disco's own crypto
+allocations. Per the ranked list above, the next lever to try is
+tightening the window further (1x MSS = 1440B) and re-measuring against
+this now-larger firmware, since the "3072-byte floor" assumption used to
+rank that option was based on the smaller Step-3 firmware and no longer
+holds.
+
 ## Design principle going forward
 
 Fixed-size, same-shape allocations that recur on a hot path should be
