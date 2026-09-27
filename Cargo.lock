@@ -2284,6 +2284,7 @@ dependencies = [
  "async-channel",
  "crypto_box",
  "heapless 0.9.3",
+ "rand",
  "tm_buf",
  "tm_keys",
  "tokio",

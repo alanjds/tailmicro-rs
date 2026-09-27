@@ -358,6 +358,13 @@ async fn event_router_task(
     // see `apply_tailnet_address`/`log_unknown_netif_dest`.
     let mut netif_applied_ip: Option<[u8; 4]> = None;
     let mut last_unknown_dst: Option<[u8; 4]> = None;
+    // Belt-and-suspenders for the DERP reconnect fix (2026-09): DerpActor now
+    // redials its own last target with backoff on a connection error, but
+    // keeping the last-known-good target here too costs nothing and gives a
+    // second, independent path back onto the data plane if a future change
+    // to the actor's redial logic regresses -- see DerpEvent::Disconnected
+    // below.
+    let mut last_derp_target: Option<(heapless::String<64>, u16)> = None;
     loop {
         #[cfg(target_os = "espidf")]
         tokio_freertos_yield().await;
@@ -411,6 +418,7 @@ async fn event_router_task(
                                     info!("Runtime::join() - DERP connect -> home region {} ({}) host={} port={}",
                                         region.region_id, region.region_code.as_str(),
                                         region.host.as_str(), port);
+                                    last_derp_target = Some((region.host.clone(), port));
                                     let _ = derp_tx2.send(DerpCmd::Connect {
                                         host: region.host.clone(),
                                         port,
@@ -419,6 +427,24 @@ async fn event_router_task(
                                     #[cfg(target_os = "espidf")]
                                     tokio_freertos_yield().await;
                                 }
+                                // Bug 2 fix: keep tm_disco's peer allowlist in
+                                // sync with the netmap. Without this, every
+                                // inbound PING is dropped by `DiscoActor::process`
+                                // (the allowlist gate) because nothing outside
+                                // tm_disco's own tests ever populated it --
+                                // `tailscale ping` against this node could never
+                                // succeed. Also tell tm_disco our current home
+                                // region, needed to fill a PONG's src_ipport
+                                // (the `127.3.3.40:<region>` DERP-relay
+                                // convention) with something meaningful.
+                                let _ = disco_tx2.send(DiscoCmd::SetHomeRegion(rid)).await;
+                                #[cfg(target_os = "espidf")]
+                                tokio_freertos_yield().await;
+                            }
+                            for p in map.peers.iter() {
+                                let _ = disco_tx2.send(DiscoCmd::AllowPeer(p.disco_key)).await;
+                                #[cfg(target_os = "espidf")]
+                                tokio_freertos_yield().await;
                             }
                             // Capture addressing for rung-6a and the tailnet
                             // netif's outbound routing BEFORE the map is
@@ -483,9 +509,19 @@ async fn event_router_task(
                             // no copy into a differently-sized re-box here.
                             // (tm_disco bounds the disco ciphertext itself.)
                             if is_disco {
+                                // Bug 2 fix: forward the peer's real DERP
+                                // frame sender (their node key) instead of
+                                // the placeholder `[0; 4]` -- without it,
+                                // `DiscoActor` has no way to address a PONG
+                                // back to the peer over DERP (DERP routes by
+                                // node key, not IP). `src_ip`/`src_port` stay
+                                // zeroed: they're reserved for a future
+                                // direct-UDP disco path, unused today since
+                                // DERP is the only transport.
                                 let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
                                     src_ip:   [0; 4],
                                     src_port: 0,
+                                    src_node_key: *src_key.as_bytes(),
                                     data: payload,
                                 }).await;
                                 #[cfg(target_os = "espidf")]
@@ -504,7 +540,25 @@ async fn event_router_task(
                         }
                         DerpEvent::PingReceived => {}
                         DerpEvent::Disconnected => {
-                            tracing::debug!("DERP disconnected");
+                            // Raised from debug to info (2026-09 DERP-reconnect
+                            // fix): a DERP drop used to be visible only in
+                            // debug builds. DerpActor itself now redials with
+                            // backoff; this is a belt-and-suspenders nudge in
+                            // case that ever regresses -- re-sending the same
+                            // last-known-good Connect target here is harmless
+                            // even while the actor is already redialing on its
+                            // own (a repeat Connect to an already-connecting
+                            // actor is a no-op).
+                            if let Some((host, port)) = last_derp_target.clone() {
+                                info!("Runtime::join() - DERP disconnected; nudging reconnect to {}:{}", host.as_str(), port);
+                                let _ = derp_tx2.send(DerpCmd::Connect {
+                                    host,
+                                    port,
+                                    cert_fingerprint: None,
+                                }).await;
+                            } else {
+                                info!("Runtime::join() - DERP disconnected (no known target yet)");
+                            }
                         }
                         DerpEvent::Error(e) => {
                             log_derp_error(&e);
@@ -600,12 +654,28 @@ async fn event_router_task(
             // ── DISCO events ──────────────────────────────────────────
             evt = disco_ev_rx.recv() => {
                 match evt {
-                    Ok(DiscoEvent::SendPong { payload, .. }) => {
-                        // A wire-correct PONG must be sealed and
-                        // addressed to the peer over DERP; that is
-                        // gated on the DERP transport (stub). Surface
-                        // it so a real PING-from-peer is observable.
-                        info!("Runtime::join() - DiscoEvent::SendPong (tx_id {:02x}{:02x}..) [not relayed: DERP stub]", payload[0], payload[1]);
+                    Ok(DiscoEvent::SendPong { dst_node_key, payload }) => {
+                        // Bug 2 fix: `tm_disco` now hands back a fully
+                        // sealed, wire-ready PONG datagram (magic ||
+                        // our_disco_pub || nonce || SalsaBox(...)) -- this
+                        // used to be logged and dropped ("[not relayed: DERP
+                        // stub]"), stale wording from before the DERP relay
+                        // existed. Forward it to the peer over DERP exactly
+                        // like any other outbound payload: DERP routes by
+                        // node key, which `tm_disco` now receives from the
+                        // router (see `DerpEvent::PacketReceived` above)
+                        // instead of the placeholder `[0; 4]`.
+                        info!("Runtime::join() - DiscoEvent::SendPong -> DERP peer {:02x}{:02x}..", dst_node_key[0], dst_node_key[1]);
+                        if let Some(buf) = tm_buf::PktBuf::from_slice(&payload) {
+                            let _ = derp_tx2.send(DerpCmd::SendPacket {
+                                dst_key: NodePublicKey::from_bytes(dst_node_key),
+                                payload: buf,
+                            }).await;
+                            #[cfg(target_os = "espidf")]
+                            tokio_freertos_yield().await;
+                        } else {
+                            warn!("Runtime::join() - sealed PONG ({} bytes) did not fit tm_buf::PktBuf; dropped", payload.len());
+                        }
                     }
                     Ok(DiscoEvent::PingFrom(key)) => {
                         info!("Runtime::join() - DiscoEvent::PingFrom peer {:02x}{:02x}..", key[0], key[1]);
@@ -1020,6 +1090,7 @@ impl Runtime {
                                         let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
                                             src_ip:   [0; 4],  // from DERP src
                                             src_port: 0,
+                                            src_node_key: *src_key.as_bytes(),
                                             data: payload,
                                         }).await;
                                     } else {
