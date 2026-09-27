@@ -225,26 +225,139 @@ pub struct DerpActor {
     node_priv: [u8; 32],
 }
 
+/// Why [`DerpActor::run_connection`] returned without an I/O error.
+///
+/// Distinguishing these matters to [`DerpActor::run`]'s redial loop: an
+/// explicit `Disconnect` means "go idle, wait for the next `Connect`" (no
+/// retry), while `Shutdown` means "end the actor" -- neither should be
+/// treated as a transient failure worth backing off and redialing, which is
+/// reserved for `run_connection` returning `Err` (see the caller).
+enum StopReason {
+    /// `DerpCmd::Disconnect` was received.
+    Disconnected,
+    /// `DerpCmd::Shutdown` was received, or the command channel closed.
+    Shutdown,
+}
+
+/// Initial redial delay after a DERP connection drops with an error.
+const RECONNECT_INITIAL_MS: u64 = 1_000;
+/// Cap on the exponential redial backoff.
+const RECONNECT_MAX_MS: u64 = 30_000;
+
+/// Pure doubling-with-cap step of the redial backoff, pulled out of
+/// `DerpActor::run` so it's unit-testable without spinning up an actor or
+/// a tokio runtime.
+fn next_backoff_ms(current_ms: u64) -> u64 {
+    current_ms.saturating_mul(2).min(RECONNECT_MAX_MS)
+}
+
 impl DerpActor {
     pub fn new(our_key: NodePublicKey, node_priv: [u8; 32]) -> Self {
         Self { our_key, node_priv }
     }
 
+    /// Drives the DERP connection lifecycle: dial the last `Connect` target,
+    /// service it until it ends, and react to *why* it ended.
+    ///
+    /// Bug fix (2026-09, confirmed live): `run_connection` returning `Err`
+    /// (a TCP reset, a TLS read error, any `frame?` failure) used to be
+    /// treated as terminal -- `run` sent `Disconnected` and then just idled
+    /// on `cmds.recv()`, waiting for a fresh `Connect` that, on a quiet
+    /// tailnet, might never come (nothing but a `MapUpdate` delta sends
+    /// `Connect`, and empty-snapshot keepalives are skipped upstream in
+    /// `tm_control`). The device would go permanently deaf on the DERP data
+    /// plane after any drop, with the control-plane connection looking
+    /// perfectly healthy. Confirmed with `tailscale status --json`: a
+    /// peer's `TxBytes` climbing (repeated handshake attempts) while
+    /// `RxBytes` stayed flat for 10+ minutes, recovering only after a
+    /// manual reboot.
+    ///
+    /// Fix: on `Err`, redial the SAME target with exponential backoff
+    /// (starting at `RECONNECT_INITIAL_MS`, capped at `RECONNECT_MAX_MS`),
+    /// indefinitely, until either a reconnection succeeds (backoff resets)
+    /// or a new `Connect`/`Shutdown` command interrupts the backoff sleep.
     pub async fn run(
         self,
         mut cmds:  async_channel::Receiver<DerpCmd>,
         events:    async_channel::Sender<DerpEvent>,
     ) {
-        loop {
-            match cmds.recv().await {
-                Ok(DerpCmd::Connect { host, port, cert_fingerprint }) => {
-                    let _ = self.run_connection(
-                        &host, port, cert_fingerprint, &mut cmds, &events,
-                    ).await;
-                    let _ = events.send(DerpEvent::Disconnected).await;
+        // The most recent dial target, kept so a connection error can
+        // redial it without needing a fresh `Connect` command.
+        let mut target: Option<(heapless::String<64>, u16, Option<[u8; 32]>)> = None;
+        let mut backoff_ms: u64 = RECONNECT_INITIAL_MS;
+
+        'outer: loop {
+            if target.is_none() {
+                match cmds.recv().await {
+                    Ok(DerpCmd::Connect { host, port, cert_fingerprint }) => {
+                        target = Some((host, port, cert_fingerprint));
+                        backoff_ms = RECONNECT_INITIAL_MS;
+                    }
+                    Ok(DerpCmd::Shutdown) | Err(_) => break,
+                    Ok(_) => continue,
                 }
-                Ok(DerpCmd::Shutdown) | Err(_) => break,
-                Ok(_) => {}
+            }
+
+            let (host, port, cert_fingerprint) = target.clone().expect("checked above");
+            let result = self.run_connection(
+                &host, port, cert_fingerprint, &mut cmds, &events,
+            ).await;
+            // Raised from debug to info (2026-09 DERP-reconnect fix): a DERP
+            // drop used to be visible only in debug builds, which hid the
+            // very outage this fix addresses from normal serial logs.
+            match &result {
+                Ok(StopReason::Disconnected) => tracing::info!(
+                    "DerpActor: connection to {}:{} ended: Disconnect requested", host, port),
+                Ok(StopReason::Shutdown) => tracing::info!(
+                    "DerpActor: connection to {}:{} ended: Shutdown requested", host, port),
+                Err(e) => tracing::info!(
+                    "DerpActor: connection to {}:{} ended with error: {:?}", host, port, e),
+            }
+            let _ = events.send(DerpEvent::Disconnected).await;
+
+            match result {
+                Ok(StopReason::Shutdown) => break,
+                Ok(StopReason::Disconnected) => {
+                    target = None;
+                }
+                Err(_) => {
+                    // Transient failure: redial `target` (unchanged) after a
+                    // backoff, unless a new command interrupts the wait.
+                    tracing::info!(
+                        "DerpActor: reconnecting to {}:{} in {} ms",
+                        host, port, backoff_ms
+                    );
+                    let sleep = tokio::time::sleep(core::time::Duration::from_millis(backoff_ms));
+                    tokio::pin!(sleep);
+                    let mut interrupted = false;
+                    loop {
+                        tokio::select! {
+                            _ = &mut sleep => break,
+                            cmd = cmds.recv() => match cmd {
+                                Ok(DerpCmd::Connect { host, port, cert_fingerprint }) => {
+                                    target = Some((host, port, cert_fingerprint));
+                                    interrupted = true;
+                                    break;
+                                }
+                                Ok(DerpCmd::Disconnect) => {
+                                    target = None;
+                                    interrupted = true;
+                                    break;
+                                }
+                                Ok(DerpCmd::Shutdown) | Err(_) => break 'outer,
+                                Ok(DerpCmd::SendPacket { .. }) => {
+                                    // Nothing to send to while disconnected; drop
+                                    // and keep waiting out the backoff.
+                                }
+                            }
+                        }
+                    }
+                    if interrupted {
+                        backoff_ms = RECONNECT_INITIAL_MS;
+                    } else {
+                        backoff_ms = next_backoff_ms(backoff_ms);
+                    }
+                }
             }
         }
     }
@@ -267,7 +380,7 @@ impl DerpActor {
         _fingerprint:     Option<[u8; 32]>,
         cmds:             &mut async_channel::Receiver<DerpCmd>,
         events:           &async_channel::Sender<DerpEvent>,
-    ) -> Result<(), DerpError> {
+    ) -> Result<StopReason, DerpError> {
         use embedded_io_adapters::tokio_1::FromTokio;
         use tls::{DerpTls, RECORD_READ_BUF, RECORD_WRITE_BUF};
 
@@ -307,7 +420,7 @@ impl DerpActor {
         enum Decision {
             Send(NodePublicKey, tm_buf::PktBuf),
             Frame(u8, usize),
-            Stop,
+            Stop(StopReason),
         }
 
         loop {
@@ -315,7 +428,8 @@ impl DerpActor {
                 biased;
                 cmd = cmds.recv() => match cmd {
                     Ok(DerpCmd::SendPacket { dst_key, payload }) => Decision::Send(dst_key, payload),
-                    Ok(DerpCmd::Disconnect) | Ok(DerpCmd::Shutdown) | Err(_) => Decision::Stop,
+                    Ok(DerpCmd::Disconnect) => Decision::Stop(StopReason::Disconnected),
+                    Ok(DerpCmd::Shutdown) | Err(_) => Decision::Stop(StopReason::Shutdown),
                     Ok(DerpCmd::Connect { .. }) => continue, // already connected
                 },
                 frame = tls.read_frame_buffered() => {
@@ -325,7 +439,7 @@ impl DerpActor {
             };
 
             match decision {
-                Decision::Stop => return Ok(()),
+                Decision::Stop(reason) => return Ok(reason),
                 Decision::Send(dst_key, payload) => {
                     tls.send_packet(dst_key.as_bytes(), &payload).await?;
                 }
@@ -384,10 +498,11 @@ impl DerpActor {
         _fingerprint:     Option<[u8; 32]>,
         cmds:             &mut async_channel::Receiver<DerpCmd>,
         _events:          &async_channel::Sender<DerpEvent>,
-    ) -> Result<(), DerpError> {
+    ) -> Result<StopReason, DerpError> {
         loop {
             match cmds.recv().await {
-                Ok(DerpCmd::Disconnect) | Ok(DerpCmd::Shutdown) | Err(_) => return Ok(()),
+                Ok(DerpCmd::Disconnect) => return Ok(StopReason::Disconnected),
+                Ok(DerpCmd::Shutdown) | Err(_) => return Ok(StopReason::Shutdown),
                 Ok(_) => {}
             }
         }
@@ -441,4 +556,87 @@ pub trait IoStream: Send {
         -> impl core::future::Future<Output = Result<(), ()>> + 'a;
     fn write_all<'a>(&'a mut self, buf: &'a [u8])
         -> impl core::future::Future<Output = Result<(), ()>> + 'a;
+}
+
+// ── DERP reconnect-with-backoff tests (2026-09 fix) ─────────────────────────
+//
+// `run_connection` under `feature = "etls"` is the only path that can
+// actually return `Err` (a real TCP/TLS failure), so the redial-after-error
+// branch itself is only exercised on real hardware / a Wokwi run with a
+// forced disconnect. What IS host-testable in isolation, and covered here:
+//
+//   1. The pure backoff arithmetic (`next_backoff_ms`): doubles, caps at
+//      `RECONNECT_MAX_MS`, never panics on overflow.
+//   2. The actor-level state machine around `StopReason`, using the
+//      `not(feature = "etls")` stub `run_connection`: an explicit
+//      `Disconnect` resets `target` to `None` (idle, no redial) rather than
+//      looping forever or dropping a subsequent `Connect`, and `Shutdown`
+//      ends the actor task.
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+
+    #[test]
+    fn next_backoff_ms_doubles_and_caps() {
+        let mut ms = RECONNECT_INITIAL_MS;
+        assert_eq!(ms, 1_000);
+        ms = next_backoff_ms(ms);
+        assert_eq!(ms, 2_000);
+        ms = next_backoff_ms(ms);
+        assert_eq!(ms, 4_000);
+        ms = next_backoff_ms(ms);
+        assert_eq!(ms, 8_000);
+        ms = next_backoff_ms(ms);
+        assert_eq!(ms, 16_000);
+        ms = next_backoff_ms(ms);
+        assert_eq!(ms, RECONNECT_MAX_MS, "must cap at 30s");
+        ms = next_backoff_ms(ms);
+        assert_eq!(ms, RECONNECT_MAX_MS, "must stay capped, not overflow past it");
+    }
+
+    #[test]
+    fn next_backoff_ms_never_panics_near_u64_max() {
+        // saturating_mul must not panic even from a pathological start.
+        assert_eq!(next_backoff_ms(u64::MAX), RECONNECT_MAX_MS);
+    }
+
+    /// Explicit `Disconnect` must go idle (no redial target) rather than
+    /// exiting the actor -- a subsequent `Connect` must still be honoured.
+    /// This is the "belt-and-suspenders" half of the fix: even without any
+    /// I/O error, the actor's own command handling must not get stuck.
+    #[tokio::test]
+    async fn disconnect_then_reconnect_is_honoured() {
+        let our_key = NodePublicKey::from_bytes([0x11; 32]);
+        let actor = DerpActor::new(our_key, [0x22; 32]);
+        let (cmd_tx, cmd_rx) = async_channel::bounded::<DerpCmd>(4);
+        let (ev_tx, ev_rx) = async_channel::bounded::<DerpEvent>(4);
+
+        let run_task = tokio::spawn(actor.run(cmd_rx, ev_tx));
+
+        cmd_tx.send(DerpCmd::Connect {
+            host: heapless::String::try_from("example.derp").unwrap(),
+            port: 443,
+            cert_fingerprint: None,
+        }).await.unwrap();
+        // Stub `run_connection` does no I/O; it just waits on the next
+        // command, so the actor is now "connected" (idle in run_connection).
+        cmd_tx.send(DerpCmd::Disconnect).await.unwrap();
+        assert!(matches!(ev_rx.recv().await, Ok(DerpEvent::Disconnected)),
+            "Disconnect must surface a Disconnected event");
+
+        // A fresh Connect after the Disconnect must be accepted, not ignored
+        // -- proves `target` was really reset to `None`, not left dangling.
+        cmd_tx.send(DerpCmd::Connect {
+            host: heapless::String::try_from("example2.derp").unwrap(),
+            port: 443,
+            cert_fingerprint: None,
+        }).await.unwrap();
+        cmd_tx.send(DerpCmd::Shutdown).await.unwrap();
+        assert!(matches!(ev_rx.recv().await, Ok(DerpEvent::Disconnected)));
+
+        tokio::time::timeout(core::time::Duration::from_secs(5), run_task)
+            .await
+            .expect("actor must end after Shutdown, not hang")
+            .unwrap();
+    }
 }

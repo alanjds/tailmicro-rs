@@ -19,7 +19,7 @@ tm_keys.workspace = true
 tm_buf.workspace = true
 heapless  = { workspace = true }
 arrayvec  = { workspace = true }
-tokio     = { workspace = true, features = ["sync", "macros"] }
+tokio     = { workspace = true, features = ["sync", "macros", "time"] }
 async-channel = { workspace = true }
 tracing   = { workspace = true }
 thiserror = { workspace = true }
@@ -46,3 +46,6 @@ rand                  = { workspace = true, features = ["getrandom"], optional =
 # building for the espidf target, so host builds/tests are unaffected.
 [target.'cfg(target_os = "espidf")'.dependencies]
 esp-idf-sys = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }
