@@ -890,6 +890,90 @@ build/flash access should: rebuild with the current
 use the new `recv_one_into` bracket to finally localize the remaining
 ~12.8-16 KB collapse.
 
+### Step 6 (2026-09-27): hardware-verified — collapse localized to `drain_recv`, not `recv_one_into`; still crashes
+
+**Context**: build/flash access was restored (a different environment than
+the one that lost it in Step 5). Rebuilt `tasmolike-rs` against
+`tailmicro-rs@c2c8c81` (the static-buffer + Kconfig-2440 state from Step
+5) and flashed real hardware to finally run the combined pass Step 5
+couldn't complete.
+
+**Static-buffer fix confirmed working on this fresh flash**: all three
+"binding static ... on first use" log lines (`WgEndpoint`, dispatch
+scratch, `RecvOut` scratch) each fire exactly once during boot/first
+traffic and never recur — same result as Step 5's earlier capture, now
+reproduced independently.
+
+**The crash still reproduces.** A 30-request HTTP burst against the real
+device over the tailnet (`curl` to its Tailscale IP) got 1-2 successes
+then `memory allocation of 8192 bytes failed` / `abort()` at the same PC
+(`0x420abeb3`) / `rst:0xc (RTC_SW_CPU_RST)`, reproduced 4 times across two
+capture runs.
+
+**New finding — the new `recv_one_into` bracket probe (added in Step 5,
+hardware-verified for the first time this step) answers Step 5's open
+question**: the collapse is NOT inside `recv_one_into`. Serial capture
+shows `largest_free` reads identically before and after `recv_one_into`
+across every observed inbound packet (e.g. `before recv_one_into:
+largest_free=20480` -> `after recv_one_into, before drain_recv:
+largest_free=20480`, unchanged). The very next probe, `after drain_recv`,
+is where the collapse shows up (one representative capture: `total_free`
+36240 -> 30024, `largest_free` 25600 -> 19456, `allocated_blocks` 659 ->
+665, i.e. +6 blocks, all inside the single `drain_recv` call for one
+inbound event). This matches Step 5's already-correlated crash-adjacent
+window (`before serve_connection` probe: `largest_free=20480`,
+`total_free=31004`; next `on_inbound: after drain_recv` probe:
+`total_free=14304`, `largest_free=7680`, `allocated_blocks` 667 -> 673,
+again +6 blocks) — same signature, same call.
+
+**`tm_buf::PktBuf` pool fallback ruled out as the cause of this specific
+collapse**, contrary to what the +6-blocks number might suggest at first
+glance: correlating a different capture window where the same
+`largest_free` collapse happens (22528 -> 7680, `total_free` 32956 ->
+15368) shows `pktbuf_pool allocs=2 frees=1` **unchanged** on both sides of
+the drop — no new fallback heap allocation fired in that window. So the
+~6 new allocated blocks / ~15-17 KB consumed inside `drain_recv` are not
+(all) `PktBuf` fallbacks; something else in `drain_recv`'s call chain
+(`events.send` on the `WgCmd`/`WgEvent` channel, or something the send
+wakes downstream in the *same* scheduler turn before the next `.await`
+actually yields — e.g. the event router in `tm_runtime` or a lwIP-side
+callback interleaved into the same window) is the real remaining
+consumer. Not yet pinned to a single line.
+
+**Two live hypotheses for the next step, not yet distinguished**:
+1. The `events.send(...).await` calls in `drain_recv` don't just enqueue —
+   on this single-threaded executor, a `.send` that wakes and resumes
+   `tm_runtime`'s router *inline* (rather than yielding back to
+   `on_inbound`'s caller first) would mean the "after drain_recv" probe
+   is actually downstream of the router already having processed the
+   event and called `tailnet::inject_inbound` — which Step 5 ruled out
+   only for the *specific* probe ordering it had at the time (before
+   `inject_inbound`), not for a scenario where the whole router turn
+   completes inside the `.send().await` itself. Worth adding a probe
+   immediately inside `tm_runtime`'s router, bracketing its own call to
+   `inject_inbound`, to see if it fires between the two `drain_recv`
+   probes.
+2. `inject_inbound` feeds the decrypted packet into the tailnet virtual
+   netif, which lwIP treats as ordinary inbound IP/TCP traffic for the
+   HTTP server's *own* accepted connection — meaning the same class of
+   TCP-RX-pbuf churn Step 2/3's `CONFIG_LWIP_TCP_WND_DEFAULT` fix
+   targeted on the DERP TLS connection could equally apply here, on the
+   virtual netif's TCP reassembly for the HTTP request itself. If so,
+   `2440` (this Kconfig's hard floor per Step 5) is already the best that
+   specific knob can do — this axis may be exhausted, and the real fix
+   would need to reduce pbuf *count* (`CONFIG_LWIP_NUM_TCP_PCB`/
+   `CONFIG_LWIP_PBUF_MEM_POOL_SIZE`, currently 16/256 in
+   `tasmolike-rs/sdkconfig.defaults`) or the number of concurrent
+   in-flight segments some other way, not the window size.
+
+**Honest bottom line**: Step 5's fixes are real, hardware-confirmed, and
+necessary but not sufficient. The remaining crash is now narrowed to one
+specific `.await` window (`drain_recv`'s `events.send` calls) rather than
+"somewhere in the WG receive path," but the exact allocation site inside
+that window is still unidentified. `tasmolike-rs/sdkconfig.defaults` and
+`src/server.rs` remain uncommitted there (per the standing rule); no
+`tailmicro-rs` code was changed this step, only this log entry.
+
 ## Design principle going forward
 
 Fixed-size, same-shape allocations that recur on a hot path should be
