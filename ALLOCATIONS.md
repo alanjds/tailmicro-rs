@@ -550,6 +550,114 @@ crash pre-fix, once `bospill`<->`esp32c3` connectivity is stable, to get
 a real 0-vs-N crash comparison rather than relying on the heap-probe
 numbers alone.
 
+### Step 4 (2026-09-27): live crash resurfaced with disco PONG in the mix — analysis and instrumentation
+
+**Trigger**: after Step 3 landed, a separate change added real DERP-reconnect-
+with-backoff and a real sealed disco PONG (allowlist population via
+`DiscoCmd::AllowPeer`, `SalsaBox` sealing with `OsRng`, DERP-relay
+`src_ipport` addressing — `tm_disco`/`tm_runtime`, commits `989da2d`,
+`57c9c81`, `6b9ab65`). On real hardware, with the Step 3 `TCP_WND=2880`
+prototype still in place, the **exact 8192-byte-allocation crash signature**
+(`connection accepted` -> `memory allocation of 8192 bytes failed` -> abort
+-> reboot) reappeared on the very first HTTP connection after boot, despite
+Step 3 previously getting a clean 30-request burst with zero crashes.
+
+**Hypothesis to check**: the new disco/PONG code path consumes heap margin
+that the TCP-window fix had freed up, on top of the still-present DERP-TLS
+handshake collapse (Step 2/3).
+
+**What I could confirm by reading the code (no hardware run yet — see
+blocker below):**
+
+`tm_disco/src/lib.rs`'s module doc says "No heap allocation. All state is in
+fixed-size arrays on the struct." That's no longer true. `tm_disco/Cargo.toml`
+pulls in `crypto_box` with the `"alloc"` feature enabled, and both crypto
+calls in the PING/PONG path use the **allocating** side of the `aead::Aead`
+trait, not the in-place, no-heap side:
+
+- `DiscoActor::process()`: `bx.decrypt(&nonce, ciphertext.as_ref())` —
+  `Aead::decrypt`'s default impl allocates a `Vec<u8>` (message length + tag),
+  fills it, and calls `decrypt_in_place` on that heap buffer internally. This
+  runs on **every** disco datagram that passes the allowlist check, not just
+  PINGs.
+- `build_sealed_pong()`: `bx.encrypt(&nonce, pong_plaintext.as_ref())` — same
+  story in the encrypt direction, on **every** PONG sent (so, potentially,
+  every PING received from an allowed peer, subject to the 100ms rate limit).
+
+Each of these allocations is small on its own (the PONG plaintext is 32
+bytes, so `encrypt` allocates ~48 bytes; the PING decrypt path is similarly
+tiny), so this is very unlikely to be the direct cause of an *8192-byte*
+allocation failing outright. But it is real, previously-undocumented heap
+churn added squarely onto the hottest path in the new code (every allowed
+peer's PING now does a heap alloc+free on top of whatever's happening in
+`tm_derp`/`tm_control`/`tm_wg` in the same cooperative-scheduler window), and
+per the Step 2 finding, this firmware's crash mode is about **fragmentation**
+(largest contiguous block), not total free bytes — small, frequent,
+differently-sized allocations churning the allocator are exactly the kind of
+thing that can knock a borderline `largest_free_block` down below whatever a
+subsequent 8192-byte request needs, even though each individual alloc is
+small. `OsRng` itself (`esp_fill_random`-backed on this target, same as
+`tm_derp`/`tm_wg` already use) is not expected to allocate and is not a
+suspect here.
+
+I added `heap_probe_blocks` calls (same `heap_caps_get_info`-based helper as
+`tm_derp`'s, duplicated locally in `tm_disco` rather than adding a
+`tm_disco -> tm_derp` dependency for a debug aid) bracketing:
+- `DiscoCmd::AllowPeer` / `add_peer()` in `DiscoActor::run()`,
+- `bx.decrypt(...)` in `process()`,
+- the `OsRng` nonce fill + `build_sealed_pong()` call in `process()`.
+
+This needed a small `tm_disco/Cargo.toml` addition (`tracing` +
+`esp-idf-sys` under `[target.'cfg(target_os = "espidf")'.dependencies]`,
+mirroring `tm_derp`'s existing pattern) since `tm_disco` previously had
+neither. Verified with `cargo check -p tm_disco` on host — compiles clean
+(only a pre-existing, unrelated `unused_mut` warning).
+
+**Blocker — no live numbers yet**: I was not able to build/flash this round
+(a build-permission restriction in my environment blocked running the
+`cargo build` toolchain invocation entirely, independent of anything in this
+repo). So the probe calls above are staged and committed, but I have **not**
+captured actual before/after `largest_free`/`allocated_blocks` numbers for
+the disco/PONG path, and I have **not** re-confirmed the live 8192-byte
+crash myself. Saying so plainly rather than guessing at numbers.
+
+**Ranked next steps** (cheapest/lowest-risk first, none implemented yet):
+
+1. **(Recommended next concrete step.)** Get the instrumentation above onto
+   hardware (build + flash, from whoever/wherever has build-toolchain
+   access) and re-run one disco PING/PONG exchange with a real peer,
+   capturing the bracketed `heap_probe_blocks` output the same way Step 2/3
+   did for `tls.open()`. This settles, with data instead of code-reading,
+   whether the disco path's churn is transient noise or is actually landing
+   on top of the DERP-TLS collapse's already-thin margin at the moment the
+   8192-byte allocation is attempted. Zero code risk — instrumentation only.
+2. **If confirmed a contributor**: switch `tm_disco`'s two `Aead::encrypt`/
+   `Aead::decrypt` calls to the `AeadInPlace::encrypt_in_place`/
+   `decrypt_in_place` methods against a fixed-size `heapless::Vec` (the
+   `ciphertext` buffer at line ~278 is already a `heapless::Vec<u8, 256>` —
+   the decrypt side could operate on it in place instead of handing it to
+   the allocating `Aead::decrypt`; the encrypt side would need a similar
+   fixed `heapless`/`GenericArray` scratch buffer sized to
+   `PONG_PLAINTEXT_LEN + TAG_LEN`, which is a compile-time constant). This
+   removes the heap allocation from the disco hot path entirely — same shape
+   as the `tm_buf::PktBuf` fix already applied elsewhere in this repo, and
+   would also make the module's "No heap allocation" doc comment true again.
+   Low risk (no behavior change, same crypto primitive, just a different
+   buffer-ownership API on the same `crypto_box` crate), but needs a
+   correctness re-check against `tools/wg_validator/disco.py` /
+   `aead_crosscheck` the way every other crypto change in this file has been
+   cross-checked, since the ciphertext layout must stay byte-identical.
+3. **If the disco path is not the dominant contributor** (i.e. Step 4's
+   numbers show it's small relative to the still-present ~3072-byte
+   post-`tls.open()` floor from Step 3): the TCP window may need to go lower
+   still (e.g. 1x MSS / 1440B) as a second, more aggressive step down from
+   the Step 3 prototype — same lever, one more notch. This was explicitly
+   out of scope to touch this round per instructions, so it's listed here
+   only as the fallback if step 1 rules out the disco hypothesis.
+4. **Not recommended yet**: option (c) from the original fix plan (a
+   structural/pool-based rework of the TCP-RX path) — still the most
+   invasive option and nothing found this round changes that ranking.
+
 ## Design principle going forward
 
 Fixed-size, same-shape allocations that recur on a hot path should be

@@ -34,6 +34,30 @@ use crypto_box::aead::Aead;
 use rand::RngCore;
 use tm_keys::DiscoPrivateKey;
 
+// ── TEMPORARY instrumentation (round 6, ALLOCATIONS.md "Fix plan: DERP TLS
+// handshake heap collapse" -> Step 4) ──────────────────────────────────────
+//
+// Same probe pattern as `tm_derp::heap_probe_blocks` (not reused directly to
+// avoid adding a tm_disco -> tm_derp dependency for a temporary debug aid).
+// Device-only; no-ops on host builds. Remove once Step 4 is resolved, or
+// promote to a shared crate if it proves broadly useful.
+#[inline(never)]
+pub(crate) fn heap_probe_blocks(tag: &str) {
+    #[cfg(target_os = "espidf")]
+    unsafe {
+        let mut info: esp_idf_sys::multi_heap_info_t = core::mem::zeroed();
+        esp_idf_sys::heap_caps_get_info(&mut info, esp_idf_sys::MALLOC_CAP_INTERNAL);
+        tracing::info!(
+            "DiscoActor heap-blocks [{}]: total_free={} largest_free={} \
+             free_blocks={} allocated_blocks={} total_blocks={}",
+            tag, info.total_free_bytes, info.largest_free_block,
+            info.free_blocks, info.allocated_blocks, info.total_blocks,
+        );
+    }
+    #[cfg(not(target_os = "espidf"))]
+    tracing::info!("DiscoActor heap-blocks [{}]: (host build; probe is device-only)", tag);
+}
+
 // ── DISCO wire format ─────────────────────────────────────────────────────────
 
 /// DISCO message magic: the literal `TS💬` (6 bytes) that prefixes every disco
@@ -207,7 +231,9 @@ impl DiscoActor {
                     }
                 }
                 Ok(DiscoCmd::AllowPeer(key)) => {
+                    heap_probe_blocks("run: before AllowPeer/add_peer");
                     self.add_peer(key);
+                    heap_probe_blocks("run: after AllowPeer/add_peer");
                 }
                 Ok(DiscoCmd::RemovePeer(key)) => {
                     self.remove_peer(&key);
@@ -279,7 +305,9 @@ impl DiscoActor {
         ciphertext.extend_from_slice(&data[ct_start..]).ok()?;
 
         let nonce = crypto_box::Nonce::from(nonce_bytes);
+        heap_probe_blocks("process: before bx.decrypt (Aead::decrypt allocates a Vec)");
         let plaintext = bx.decrypt(&nonce, ciphertext.as_ref()).ok()?;
+        heap_probe_blocks("process: after bx.decrypt");
 
         if plaintext.is_empty() { return None; }
 
@@ -307,6 +335,7 @@ impl DiscoActor {
                 let tx_id: [u8; PING_LEN] =
                     plaintext[2..2 + PING_LEN].try_into().ok()?;
 
+                heap_probe_blocks("process: before OsRng nonce + build_sealed_pong");
                 let mut nonce_bytes = [0u8; NONCE_LEN];
                 rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
                 let wire = build_sealed_pong(
@@ -316,6 +345,7 @@ impl DiscoActor {
                     tx_id,
                     nonce_bytes,
                 );
+                heap_probe_blocks("process: after build_sealed_pong (SalsaBox seal done)");
 
                 Some(DiscoEvent::SendPong {
                     dst_node_key: *src_node_key,

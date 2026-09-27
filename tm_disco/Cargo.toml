@@ -20,3 +20,13 @@ async-channel = { workspace = true }
 # ESP32-C3, getrandom is served by esp_fill_random, the same source tm_derp
 # and tm_wg already use). Same pattern as tm_derp's Cargo.toml.
 rand                = { workspace = true, features = ["getrandom"] }
+tracing             = { workspace = true }
+
+# Heap probes bracketing AllowPeer / build_sealed_pong (round 6 of the
+# tailmicro-rs heap-fragmentation investigation, ALLOCATIONS.md "Fix plan:
+# DERP TLS handshake heap collapse" -> Step 4). Device-only, same pattern as
+# tm_derp's Cargo.toml comment above this block: esp-idf-sys is a shared sys
+# crate already pulled in by tm_runtime, so this only affects the espidf
+# target, not host builds/tests.
+[target.'cfg(target_os = "espidf")'.dependencies]
+esp-idf-sys = { workspace = true }
