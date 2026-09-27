@@ -447,3 +447,103 @@ open-ended. Step 7 is excluded, not squeezed in.
   114) and `CONFIG_LWIP_UDP_RECVMBOX_SIZE=3`.
 - `Cargo.toml`: `tm_runtime = { ..., features = ["lan-direct"] }`, or pass
   it through `tailmicro`.
+
+## Step 0 status (2026-09-27): harness built and run; genuinely BLOCKED by this sandbox's networking, not by the protocol
+
+Built `tools/wg_validator/validate_lan_direct.py`, the corrected Spike 2
+harness Step 0 calls for. It fixes both harness bugs identified above:
+
+1. Derives our real LAN IPv4 (D1's own technique: the control-plane TCP
+   socket's `getsockname()`, filtered — IPv4 only, no loopback/unspecified,
+   no `100.64.0.0/10`) and publishes `["<lan_ip>:41641", "127.3.3.40:<region>"]`
+   instead of `0.0.0.0:<port>`.
+2. Actually answers a peer's UDP disco PING with a real, sealed
+   `disco.build_pong(..., src_endpoint=<peer's observed UDP address>)` sent
+   back over the same UDP socket — `disco.py` gained a `pack_endpoint(ip,
+   port)` helper for this (the literal-address form, as opposed to
+   `encode_derp_relay_src_ipport`'s `127.3.3.40:<region>` convention).
+3. Brings up the DERP leg (`derp_client.py`) alongside, so a WireGuard
+   response has a path either way, same as a real node.
+
+It also independently registers as its own ephemeral tailnet node (own
+node/disco keys via an auth key from `.env.wokwi`, same pattern as the
+existing `validate_live_udp.py`) — no `tailscale` CLI or existing tailscaled
+identity needed.
+
+**Result of actually running it** (`tools/wg_validator/validate_lan_direct.py`,
+from this workspace's sandbox, `bospill`): control-plane registration
+succeeded, the tailnet's real online peers were correctly enumerated
+(`esp32c3` — the real hardware device — and `alanjds-s25`, both genuinely
+online right now), but the D1 IPv4-LAN-address step came back empty:
+
+```
+control-plane TCP local_addr=('2804:7f0:18:3049:...', 47632, 0, 0) -> D1 lan_ip=None
+[BLOCKED] D1: a usable IPv4 LAN address is derivable from this host's control-plane socket
+```
+
+Verified this is a real, hard environment property of this specific sandbox,
+not a bug in the script: `ip -4 addr show` on `eno1` (the only up, non-loopback
+interface) returns **nothing** — no IPv4 address at all, only IPv6 (the box
+is IPv6-only to the internet). `ip route` shows no IPv4 route, and a raw
+`socket.connect(('8.8.8.8', 53))` fails with `[Errno 101] Network is
+unreachable`. `tailscale0`'s `100.85.218.10` is the *overlay* address, not a
+usable underlay LAN endpoint (Tier 1 is explicitly the underlay-LAN path,
+D1). So no host process here — this harness or a real `tailscaled` — has any
+IPv4 LAN address to publish or any way to originate an IPv4 UDP datagram at
+all. This also rules out "test against `bospill`'s own tailscaled instead":
+`bospill`'s own `Self.Addrs` in `tailscale status` are IPv6-only for the same
+reason (same host, same missing IPv4 stack).
+
+**This is a scoping/environment constraint on *this sandbox*, not a finding
+about the plan or the disco/WireGuard protocol.** The plan's mechanism claim
+(D2–D4, and the original Spike 2's disco PING/PONG round trip) is unaffected:
+it was never re-tested and disproven here, it was simply never reachable to
+test from a box with no IPv4 LAN stack. The original Spike 2 *did* prove the
+disco crypto round-trips against a real peer, from a runner that actually
+shared an IPv4 LAN (`192.168.15.0/24` with `lenovopill`) — that evidence
+stands. What Step 0 needed to add on top (a real endpoint + a real PONG) is
+now implemented and ready to run, just not exercisable from here.
+
+**What was still validated from here, independent of LAN reachability:**
+- The corrected harness is syntactically and logically complete, imports and
+  runs cleanly, correctly talks to the live control plane, and correctly
+  aborts with a clear, honest BLOCKED verdict instead of silently publishing
+  a bogus/unreachable address (which is exactly the D2 failure mode the
+  original Spike 2 fell into, just for a different underlying reason).
+- The Step 1 validation asset the plan asks for is done: see
+  `tools/wg_validator/gen_udp_pong_vector.py` (output committed at
+  `tools/wg_validator/udp_pong_vector.txt`) — a fixed-nonce pynacl reference
+  vector for a UDP disco PONG whose `src_ipport` carries a real literal
+  endpoint (`::ffff:192.168.15.139` port 41641, the plan's own example),
+  built with the *same* fixed `receiver_priv`/`sender_pub` fixture already
+  hardcoded in `tm_disco/src/lib.rs`'s `aead_crosscheck` / `framing` /
+  `pong_seal_crosscheck` tests, so a Step 1 `udp_pong_wire_matches_
+  pynacl_reference` test can drop in next to the existing one with no new
+  key fixtures. This does not depend on any live network access.
+
+**Recommendation — do not revise the plan; re-scope where Step 0's live leg
+runs:**
+- Step 0's actual pass/fail is still open — it needs to run once from a host
+  with a real IPv4 LAN interface reachable to an online tailnet peer
+  (`alanjds-s25` the phone, or a machine sharing the ESP32's home WiFi
+  subnet, the way the original Spike 2 used `lenovopill`). That is an
+  environment choice, not a code change: `validate_lan_direct.py` needs no
+  edits to run there, just `TS_ENV=...` and optionally `PEER_HOSTNAME=...`.
+- **Step 1 (Rust `tm_disco` UDP PONG) can start now.** It is host-testable,
+  has its pynacl reference vector ready, and does not depend on live LAN
+  access or on Step 0's live leg completing. This matches the plan's own
+  ordering (Steps 1/3/4 are described as "harmless and tested" independent
+  of live hardware).
+- **Do not start Step 2 (on-device UDP socket) or later** until Step 0's live
+  leg actually runs somewhere with real IPv4 LAN reachability and the
+  PING→PONG→(ideally)WG-init sequence is observed, per the plan's own
+  stopping rule ("If Step 0 fails, stop... do not build Steps 1-6" — read
+  literally that's about a live pass/fail this round couldn't produce either
+  way; the prudent reading is: Step 1 is safe host-only work, Steps 2+ that
+  touch the device should wait for that live confirmation).
+- Hard rules were respected throughout: nothing was flashed to the ESP32 at
+  `/dev/ttyACM0` (it was never touched — only read passively via the control
+  plane's netmap, which shows it online), no production traffic was
+  disrupted, and only new files in `tools/wg_validator/` plus this doc
+  section were changed in `tailmicro-rs` (`wg-dispatch-scratch`); nothing was
+  pushed, and `tasmolike-rs` was not modified.
