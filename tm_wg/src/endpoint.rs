@@ -299,6 +299,55 @@ impl RecvOut {
     }
 }
 
+/// Hand out a `&'static mut RecvOut` backed by `.bss`, once. Unlike
+/// `WgEndpoint::new_static`, `RecvOut` has no runtime-dependent fields (both
+/// `ArrayVec`s are const-constructible via `new_const()`, and `handshook`/
+/// `peer` have trivial const defaults), so the whole value can be a directly
+/// const-initialized `static mut` -- no `MaybeUninit`/field-by-field write
+/// needed. Same rationale as `WgEndpoint::new_static`: one instance, held
+/// forever, so a static removes its ~6 KB one-time heap contribution
+/// entirely (ALLOCATIONS.md Step 5).
+///
+/// # Panics
+/// Panics if called more than once, for the same aliasing reason as
+/// `WgEndpoint::new_static`.
+#[inline(never)]
+pub fn recv_out_static() -> &'static mut RecvOut {
+    static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static mut STORAGE: RecvOut = RecvOut {
+        to_peer: ArrayVec::new_const(),
+        decrypted: ArrayVec::new_const(),
+        handshook: false,
+        peer: None,
+    };
+
+    if TAKEN.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        panic!("recv_out_static called more than once");
+    }
+    // SAFETY: the swap above guarantees exactly one caller, ever, reaches
+    // this point, so this is the only `&'static mut` that will ever be
+    // created to this function-local static.
+    unsafe { &mut *core::ptr::addr_of_mut!(STORAGE) }
+}
+
+/// Hand out a `&'static mut DispatchOut` backed by `.bss`, once. Same
+/// rationale and safety argument as [`recv_out_static`]; `DispatchOut` is a
+/// plain `ArrayVec` type alias, const-constructible via `new_const()`.
+///
+/// # Panics
+/// Panics if called more than once.
+#[inline(never)]
+pub fn dispatch_out_static() -> &'static mut DispatchOut {
+    static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static mut STORAGE: DispatchOut = ArrayVec::new_const();
+
+    if TAKEN.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        panic!("dispatch_out_static called more than once");
+    }
+    // SAFETY: same argument as `recv_out_static` above.
+    unsafe { &mut *core::ptr::addr_of_mut!(STORAGE) }
+}
+
 struct EndpointState {
     my_key: NodeKeyPair,
     my_cookie: MACReceiver,
@@ -402,6 +451,58 @@ impl WgEndpoint {
             core::ptr::addr_of_mut!((*ptr).state.next_peer_id).write(0);
             core::ptr::addr_of_mut!((*ptr).peers).copy_from_nonoverlapping(&EMPTY_PEERS, 1);
             b.assume_init()
+        }
+    }
+
+    /// Construct directly into a static `.bss` slot instead of a heap `Box`,
+    /// field-by-field -- identical technique to [`Self::new_boxed`] (see its
+    /// doc comment for why the raw-pointer, field-by-field write is needed
+    /// to avoid an ~28 KB stack temporary), just targeting a fixed static
+    /// address instead of a fresh heap allocation.
+    ///
+    /// There is exactly one `WgEndpoint` for the lifetime of this firmware
+    /// (one `WgActor`, built once by `Runtime::join`), allocated lazily on
+    /// first use and then held forever -- exactly the shape a `static` is
+    /// for, and exactly the same "fixed-size, single instance, never freed"
+    /// pattern already applied to `tm_buf::PktBuf`. Moving it off the heap
+    /// removes its ~6 KB one-time contribution to heap fragmentation
+    /// entirely (ALLOCATIONS.md, "Fix plan: DERP TLS handshake heap
+    /// collapse", Step 5), at the cost of ~6 KB of permanent `.bss` --
+    /// the same heap-cost-for-no-fragmentation tradeoff already accepted
+    /// for `tm_buf::PKT_CAP`.
+    ///
+    /// # Panics
+    /// Panics if called more than once: a second call would hand out a
+    /// second `&'static mut` aliasing the same storage as the first, which
+    /// would be unsound. This is enforced with an atomic flag rather than
+    /// relied upon by convention. Callers (just `WgActor::endpoint()`) only
+    /// ever call this once, guarded by their own `Option`.
+    #[inline(never)]
+    pub fn new_static(my_key: NodeKeyPair) -> &'static mut WgEndpoint {
+        static EMPTY_PEERS: ArrayVec<Peer, MAX_PEERS> = ArrayVec::new_const();
+        static EMPTY_SESSIONS: ArrayVec<(SessionId, PeerId), SESSION_MAP_CAP> = ArrayVec::new_const();
+        static STORAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static mut ENDPOINT_STORAGE: core::mem::MaybeUninit<WgEndpoint> =
+            core::mem::MaybeUninit::uninit();
+
+        if STORAGE.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            panic!("WgEndpoint::new_static called more than once");
+        }
+        // SAFETY: the swap above guarantees exactly one caller, ever,
+        // reaches this point, so this is the only reference to
+        // ENDPOINT_STORAGE that will ever exist (it is a function-local
+        // static, unreachable from anywhere else). Each field is written
+        // exactly once, in full, before `assume_init_mut()`, with the same
+        // per-field safety argument as `new_boxed` above.
+        unsafe {
+            let ptr = core::ptr::addr_of_mut!(ENDPOINT_STORAGE).cast::<WgEndpoint>();
+            core::ptr::addr_of_mut!((*ptr).state.sessions).copy_from_nonoverlapping(&EMPTY_SESSIONS, 1);
+            core::ptr::addr_of_mut!((*ptr).state.my_key).write(my_key);
+            core::ptr::addr_of_mut!((*ptr).state.my_cookie).write(MACReceiver::new(&my_key.public));
+            core::ptr::addr_of_mut!((*ptr).state.timestamps).write(TAI64NClock::new());
+            core::ptr::addr_of_mut!((*ptr).state.next_peer_id).write(0);
+            core::ptr::addr_of_mut!((*ptr).peers).copy_from_nonoverlapping(&EMPTY_PEERS, 1);
+            &mut *ptr
         }
     }
 

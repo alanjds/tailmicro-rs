@@ -715,6 +715,181 @@ this now-larger firmware, since the "3072-byte floor" assumption used to
 rank that option was based on the smaller Step-3 firmware and no longer
 holds.
 
+### Step 5 (2026-09-27): Kconfig floor bug found, static `.bss` conversion implemented, 20480-vs-8192 mismatch narrowed but not yet pinned
+
+**Context**: a follow-up live test (run by the requester, not from this
+session) tightened `CONFIG_LWIP_TCP_WND_DEFAULT` to 1440 (1x MSS). Reported
+result: the DERP-TLS handshake collapse itself improved a lot (recovers to
+43008 after `DerpTls::connect`, vs the 20480 floor from Step 4's 2x-MSS
+build), but the crash still reproduced — this time apparently caused by
+three lazy "on first use" tm_wg heap allocations (`WgEndpoint`,
+`RecvOut`/recv scratch, `DispatchOut`/dispatch scratch, ~6 KB each) firing
+in sequence once real WG peer traffic starts, dropping `largest_free` from
+43008 straight to 20480 and pinning it there. Then, with a reported 20480
+bytes free, an 8192-byte allocation (hyper's h1 buffer) still failed —
+the "20480-vs-8192 mismatch" this step set out to root-cause.
+
+**Bug found before any of that: the 1440 test never ran at 1440.**
+`components/lwip/Kconfig` in this ESP-IDF release (v5.5.2) defines:
+
+```
+config LWIP_TCP_WND_DEFAULT
+    int "Default receive window size"
+    default 5760 # 4 * default MSS
+    range 2440 65535 if !LWIP_WND_SCALE
+```
+
+A value below 2440 is **silently clamped back to the Kconfig `default`
+(5760)** during sdkconfig generation — not to 2440, not to the
+out-of-range value requested. Confirmed by grepping the freshly-generated
+`target/riscv32imc-esp-espidf/debug/build/esp-idf-sys-*/out/sdkconfig`
+after a clean rebuild with `1440` in `sdkconfig.defaults`: it read back
+`CONFIG_LWIP_TCP_WND_DEFAULT=5760`. This means the "1x MSS" test that
+reported the 43008-after-TLS improvement was actually still running at
+the original default (5760), not a tighter window — the causal story
+built on that test (tighter window -> better TLS recovery) is not
+supported by what was actually flashed. **Corrected to 2440**, the true
+Kconfig-enforced floor, and re-verified via the same sdkconfig grep that
+2440 actually took effect. `sdkconfig.defaults` is left at
+`CONFIG_LWIP_TCP_WND_DEFAULT=2440` (uncommitted, per the usual
+tasmolike-rs prototype-only rule).
+
+**Capability mismatch: ruled out.** Added `heap_probe_at_accept()` in
+`tasmolike-rs/src/server.rs`, checking `MALLOC_CAP_INTERNAL` and
+`MALLOC_CAP_DEFAULT` side by side at three points around
+`serve_connection` (after accept, immediately before serve_connection,
+immediately after it returns). On this ESP32-C3 build (no PSRAM, single
+RAM pool) the two capability buckets reported **identical
+`largest_free_block` at every probe**, so hyper's allocator wanting a
+different capability flag than what was being measured is not the
+explanation.
+
+**Heap-state-changes-between-probe-and-allocation: confirmed, and
+the actual mechanism is cooperative-scheduler interleaving with a
+different actor, not a bad probe placement.** Correlating precise serial
+timestamps in `serial-lwip2440-http.log`: the "before serve_connection"
+probe read `largest_free=20480` at t=42151ms; 86ms later, the only log
+line in between is `WgEvent::InboundDecrypted 160 bytes`; the very next
+probe (in `tm_runtime`'s router, logged for that event, *before*
+`tailnet::inject_inbound` is even called) already reads
+`largest_free=7680`; the crash's `memory allocation of 8192 bytes failed`
+follows immediately after. Since this firmware runs a single-threaded
+Tokio executor (`tm_runtime::Runtime::join`'s `tokio::join!`), nothing
+runs "in between" two synchronous statements without an actual `.await`
+yield — so the WG actor's inbound-packet handling and the HTTP server's
+connection setup are provably interleaved on the same executor, and the
+~12.8 KB (largest-block) / ~16.4 KB (total-free) collapse attributed to
+that single WG event happened for real, in that window. The reported
+20480 in the "before" probe was genuine; it just didn't survive to the
+point where hyper's allocation was actually attempted, because the WG
+event got a turn on the executor first.
+
+**What was ruled out as the source of that ~12.8-16 KB collapse**, in
+the WG event's own code path (`WgActor::on_inbound` ->
+`WgEndpoint::recv_one_into` -> `drain_recv` -> `pkt_to_buf` ->
+`events.send`):
+- The three now-converted-to-static buffers (see below) — confirmed by
+  their own log line ("binding static ... on first use") firing once,
+  early, and never again.
+- WG data-plane decrypt: `session.rs` already uses no-heap
+  `AeadInPlace::decrypt_in_place` (`use aead::AeadInPlace;` at
+  `tm_wg/src/vendor/session.rs:16`, called from
+  `endpoint.rs:800`'s `decrypt_one`), not the allocating `Aead` trait.
+  `chacha20poly1305`'s `"alloc"` feature is enabled in `tm_wg/Cargo.toml`
+  but is only exercised by the unused `Vec`-returning convenience
+  wrapper and tests, not this hot path.
+- `tm_buf::PktBuf::acquire()` (used by `pkt_to_buf`): confirmed
+  pool-only for this event, `pktbuf_pool: allocs=0 frees=0` in the log —
+  no heap fallback fired.
+- The `events: Sender<WgEvent>` channel's own first-block allocation:
+  ruled out, since this specific channel had already carried an earlier
+  `WgEvent::OutboundPacket` message earlier in the same boot session.
+- The handshake-response path's `Vec::new()` at
+  `tm_wg/src/vendor/handshake.rs:490` (`.decrypt(&packet.auth_tag, &mut
+  Vec::new())`): an empty `Vec` doesn't heap-allocate until pushed to,
+  and this path only fires once per handshake completion, not per
+  established-session data packet (the incident packet was 160 bytes of
+  ordinary data-plane traffic, not a handshake response) — ruled out.
+- `tailnet::inject_inbound` itself: ruled out by construction — the
+  probe that already reads the collapsed 7680 value sits *before* that
+  call in `tm_runtime`, so whatever consumed the heap did so before
+  `inject_inbound` ever ran.
+
+**Not yet pinned down**: the exact allocation site. A tighter probe
+(`heap_probe_blocks` immediately before/after `self.endpoint()
+.recv_one_into(...)` in `WgActor::on_inbound`, `tm_wg/src/lib.rs`) has
+been added this step to localize whether the collapse happens inside
+`recv_one_into` itself (i.e., somewhere in the vendored WG session/
+handshake state machine not yet examined) or after it (in `drain_recv`/
+channel machinery, already mostly ruled out above, or in a genuinely
+different, unlogged actor that happened to get a scheduler turn in the
+same window). Hardware verification of this new probe is the next
+concrete step once build/flash access is available again (see below).
+
+**Implemented (not just proposed): static `.bss` conversion of the
+three ~6 KB tm_wg "on first use" scratch buffers.** Checked first for
+any reason this couldn't be static: all three (`WgEndpoint`, `RecvOut`,
+`DispatchOut`) are fixed-size (`ArrayVec`-backed, no runtime-dependent
+capacity), constructed exactly once per boot, and held for the process's
+entire lifetime — the same "fixed-size, single instance, allocated once,
+held forever" shape already established for `tm_buf::PktBuf`'s pool. The
+only per-instance runtime state (`WgEndpoint`'s `my_key`) is written
+in-place after zero-cost const-initializing the rest, same technique
+`new_boxed` already used, just targeting a function-local `static` instead
+of a heap `Box`:
+
+- `WgEndpoint::new_static()` (`tm_wg/src/endpoint.rs`) — mirrors
+  `new_boxed`'s field-by-field raw-pointer init, writing into a
+  `static mut ENDPOINT_STORAGE: MaybeUninit<WgEndpoint>` guarded by a
+  `static TAKEN: AtomicBool` that panics on a second call.
+- `RecvOut::recv_out_static()` and `dispatch_out_static()`
+  (`tm_wg/src/endpoint.rs`) — same `AtomicBool`-guarded pattern, both
+  const-initializable directly (`ArrayVec::new_const()` for every
+  field), so no `MaybeUninit`/raw-pointer writes needed.
+- `WgActor`'s three `Option<Box<T>>` fields became `Option<&'static mut
+  T>` (`tm_wg/src/lib.rs`); accessors (`endpoint()`,
+  `take_scratch`/`return_scratch`, `take_dispatch_scratch`/
+  `return_dispatch_scratch`) now bind from the `_static()` constructors
+  instead of `Box::new`. Call sites (`on_inbound`, `on_send_data`,
+  `on_tick`) needed **no changes** — `&mut &'static mut T` coerces to
+  `&mut T` at the call site the same way `&mut Box<T>` did.
+- Cost: ~18 KB of permanent `.bss`, in exchange for removing these three
+  allocations' fragmentation impact entirely — the same accepted
+  heap-cost-for-no-fragmentation tradeoff as `tm_buf::PKT_CAP`.
+- Verified on host: `cargo check -p tm_wg` clean (only a pre-existing,
+  unrelated `tm_control` warning); `cargo test -p tm_wg` — all 24 tests
+  pass (none of them exercise the new `_static()` constructors directly,
+  since the unit tests build `WgEndpoint` via `WgEndpoint::new()`, so no
+  cross-test static-singleton collision risk).
+- Verified on real hardware (Step 4/5 capture,
+  `serial-lwip2440-http.log`): the "binding static WgEndpoint (~6 KB,
+  .bss) on first use" log line (and the equivalent for the two scratch
+  buffers) fires exactly once, early in the WG peer's first-traffic
+  window, and never recurs — confirming the conversion works as
+  designed and these three allocations no longer contribute heap churn
+  after boot.
+
+**Honest bottom line on this step**: the static-buffer conversion is a
+real, verified win (removes a genuine ~18 KB one-time fragmentation
+event), and the Kconfig floor bug is a real, useful correction to the
+investigation's own methodology (a prior test's conclusion was invalid).
+But **neither of these, individually or combined, has yet been confirmed
+to get a real HTTP request through without crashing** — that combined
+hardware pass (static buffers + `CONFIG_LWIP_TCP_WND_DEFAULT=2440` +
+the new `recv_one_into` bracket probe) could not be completed this step:
+build/flash access to real hardware became unavailable mid-step (the
+sandbox running this session lost outbound network entirely — `curl`,
+`ping`, and DNS all fail to every host, including `github.com` and
+`dl.espressif.com` — which `esp-idf-sys`'s build script needs for its
+managed ESP-IDF checkout/tooling validation, even when no ESP-IDF version
+change is involved). This is an environment problem, not a code problem;
+the changes above are believed correct (host-verified) but **not yet
+hardware-verified end-to-end**. Next session/step with working
+build/flash access should: rebuild with the current
+`tm_wg`/`tasmolike-rs` state, capture a boot + real HTTP request, and
+use the new `recv_one_into` bracket to finally localize the remaining
+~12.8-16 KB collapse.
+
 ## Design principle going forward
 
 Fixed-size, same-shape allocations that recur on a hot path should be

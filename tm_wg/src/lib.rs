@@ -32,6 +32,29 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// path.
 const TICK: Duration = Duration::from_millis(400);
 
+// Heap probe bracketing recv_one_into/drain_recv (round 6 of the
+// tailmicro-rs heap-fragmentation investigation, ALLOCATIONS.md Step 5:
+// root-causing the 20480-vs-8192 mismatch). Same pattern as
+// `tm_disco::heap_probe_blocks` (not reused directly to avoid a cross-crate
+// dependency for a temporary debug aid). Device-only; no-op on host builds.
+// Remove once Step 5 is resolved.
+#[inline(never)]
+fn heap_probe_blocks(tag: &str) {
+    #[cfg(target_os = "espidf")]
+    unsafe {
+        let mut info: esp_idf_sys::multi_heap_info_t = core::mem::zeroed();
+        esp_idf_sys::heap_caps_get_info(&mut info, esp_idf_sys::MALLOC_CAP_INTERNAL);
+        tracing::info!(
+            "WgActor heap-blocks [{}]: total_free={} largest_free={} \
+             free_blocks={} allocated_blocks={} total_blocks={}",
+            tag, info.total_free_bytes, info.largest_free_block,
+            info.free_blocks, info.allocated_blocks, info.total_blocks,
+        );
+    }
+    #[cfg(not(target_os = "espidf"))]
+    tracing::info!("WgActor heap-blocks [{}]: (host build; probe is device-only)", tag);
+}
+
 // ── Message types ─────────────────────────────────────────────────────────────
 
 pub enum WgCmd {
@@ -81,39 +104,44 @@ pub enum WgEvent {
 // ── WgActor ───────────────────────────────────────────────────────────────────
 
 pub struct WgActor {
-    // Boxed: `WgEndpoint` is ~28 KB (fixed peer table + session state). Kept
-    // by value it was embedded — and duplicated — inside the `run()` async
-    // state machine, ballooning that future to ~90 KB. `Box::pin`-ing the
-    // future at spawn time then tried to build all ~90 KB on the ESP32-C3's
-    // 32 KB main-task stack, hitting a Guru Meditation stack-protection fault
-    // in Runtime::join. Boxing the endpoint keeps only an 8-byte pointer in
-    // the future. See docs/wg-dataplane-notes.md.
+    // STATIC, not boxed (Step 5, ALLOCATIONS.md "Fix plan: DERP TLS
+    // handshake heap collapse"): `WgEndpoint` is ~28 KB (fixed peer table +
+    // session state). It used to be embedded by value inside the `run()`
+    // async state machine, ballooning that future to ~90 KB; `Box::pin`-ing
+    // the future at spawn time then tried to build all ~90 KB on the
+    // ESP32-C3's 32 KB main-task stack, hitting a Guru Meditation
+    // stack-protection fault in Runtime::join. Boxing the endpoint (heap)
+    // fixed the stack problem by keeping only an 8-byte pointer in the
+    // future; `WgEndpoint::new_static` (now, `.bss`) keeps the same
+    // 8-byte-reference shape in the future *and* removes this ~6 KB
+    // allocation from the heap entirely, closing its contribution to
+    // fragmentation (same "fixed-size, single instance, held forever" shape
+    // already applied to `tm_buf::PktBuf`). See docs/wg-dataplane-notes.md.
     //
-    // LAZY (`Option`): the ~28 KB endpoint is not allocated at construction but
-    // on first use (the first `ApplyMap`/inbound packet). Runtime::join builds
-    // all actors up front, so an eager endpoint took ~28 KB out of the heap
-    // BEFORE the control plane even connected — dropping the largest contiguous
-    // block to ~69 KB, too small to also buffer the live ~40 KB netmap during
-    // the control read (confirmed live: a concurrent "12100 bytes failed" OOM
-    // abort while our map buffer held the last big block). Deferring the
-    // allocation until `apply_map` — which runs only AFTER the control plane
-    // has parsed the netmap and freed its buffer — keeps that ~28 KB free
-    // exactly when the map read needs it. See docs/wg-dataplane-notes.md.
-    endpoint: Option<Box<WgEndpoint>>,
-    /// Reusable scratch buffer for `RecvOut` (~6 KB), allocated once on first
-    /// use and refilled in place thereafter instead of `Box::new`'d fresh on
-    /// every inbound packet / send / tick. That per-call churn was the exact
-    /// ~6 KB block behind the `memory allocation of 6052 bytes failed` heap
-    /// fragmentation aborts observed after a couple of HTTP requests interleaved
-    /// with data-plane traffic. See ALLOCATIONS.md.
-    recv_scratch: Option<Box<RecvOut>>,
-    /// Reusable scratch buffer for `dispatch()`'s output (~6 KB), allocated
-    /// once on first use and overwritten in place thereafter instead of
-    /// `Box::new`'d fresh every ~400ms tick. Same fragmentation shape as
-    /// `recv_scratch`, but on a periodic timer rather than per-packet, so it
-    /// fires independently of (and can coincide with) any HTTP/data-plane
+    // LAZY (`Option`): the endpoint's *static storage* is reserved at link
+    // time regardless, but the reference is only taken on first use (the
+    // first `ApplyMap`/inbound packet), preserving the original ordering
+    // reasoning below for the heap-backed version -- it no longer matters
+    // for the endpoint itself (no heap competes with the netmap buffer now),
+    // but the `Option` is kept as-is rather than restructured, since
+    // `WgEndpoint::new_static` panics if called twice and `endpoint()`
+    // already guards that via this `Option`.
+    endpoint: Option<&'static mut WgEndpoint>,
+    /// Reusable scratch buffer for `RecvOut` (~6 KB). STATIC, not boxed
+    /// (Step 5): was `Box::new`'d fresh on first use and refilled in place
+    /// thereafter; that per-call churn (before the refill-in-place fix) was
+    /// the exact ~6 KB block behind the `memory allocation of 6052 bytes
+    /// failed` heap fragmentation aborts. `endpoint::recv_out_static` now
+    /// hands out a `.bss`-backed reference instead of a heap `Box`, removing
+    /// even its one-time allocation from the heap. See ALLOCATIONS.md.
+    recv_scratch: Option<&'static mut RecvOut>,
+    /// Reusable scratch buffer for `dispatch()`'s output (~6 KB). STATIC,
+    /// not boxed (Step 5), same rationale and mechanism as `recv_scratch`
+    /// above, via `endpoint::dispatch_out_static`. Same fragmentation shape
+    /// as `recv_scratch`, but on a periodic timer rather than per-packet, so
+    /// it fires independently of (and can coincide with) any HTTP/data-plane
     /// traffic. See ALLOCATIONS.md.
-    dispatch_scratch: Option<Box<DispatchOut>>,
+    dispatch_scratch: Option<&'static mut DispatchOut>,
     /// Node keypair, retained so the endpoint can be built lazily on first use.
     kp: NodeKeyPair,
     /// Never-evicted peer (MicroLink: priority_peer). Retained for API
@@ -136,48 +164,50 @@ impl WgActor {
         }
     }
 
-    /// Get the endpoint, allocating (and boxing) it on first use. `new_boxed`
-    /// builds+boxes in its own `#[inline(never)]` frame to keep it off this
-    /// caller's stack. Size is ~6 KB since QUEUE_DEPTH = 0 dropped the inline
-    /// per-peer packet queues (was ~28 KB, which OOM-aborted here on device).
+    /// Get the endpoint, binding its static (`.bss`) storage on first use.
+    /// `new_static` builds it in its own `#[inline(never)]` frame to keep it
+    /// off this caller's stack. Size is ~6 KB since QUEUE_DEPTH = 0 dropped
+    /// the inline per-peer packet queues (was ~28 KB, which OOM-aborted here
+    /// on device, back when this was heap-`Box`-allocated).
     fn endpoint(&mut self) -> &mut WgEndpoint {
         if self.endpoint.is_none() {
-            tracing::info!("WgActor: allocating WgEndpoint (~6 KB) on first use");
-            self.endpoint = Some(WgEndpoint::new_boxed(self.kp));
+            tracing::info!("WgActor: binding static WgEndpoint (~6 KB, .bss) on first use");
+            self.endpoint = Some(WgEndpoint::new_static(self.kp));
         }
-        self.endpoint.as_mut().unwrap()
+        self.endpoint.as_deref_mut().unwrap()
     }
 
-    /// Take the persistent `RecvOut` scratch buffer, allocating it once on
-    /// first use. Pair with [`Self::return_scratch`] once done so the buffer
-    /// is reused (not dropped and re-allocated) on the next call.
-    fn take_scratch(&mut self) -> Box<RecvOut> {
+    /// Take the persistent `RecvOut` scratch buffer, binding its static
+    /// (`.bss`) storage on first use. Pair with [`Self::return_scratch`]
+    /// once done so the reference is handed back (not left dangling in a
+    /// local) for the next call.
+    fn take_scratch(&mut self) -> &'static mut RecvOut {
         self.recv_scratch.take().unwrap_or_else(|| {
-            tracing::info!("WgActor: allocating RecvOut scratch (~6 KB) on first use");
-            Box::new(RecvOut::default())
+            tracing::info!("WgActor: binding static RecvOut scratch (~6 KB, .bss) on first use");
+            endpoint::recv_out_static()
         })
     }
 
     /// Clear and return the scratch buffer taken via [`Self::take_scratch`].
-    fn return_scratch(&mut self, mut out: Box<RecvOut>) {
+    fn return_scratch(&mut self, out: &'static mut RecvOut) {
         out.reset();
         self.recv_scratch = Some(out);
     }
 
-    /// Take the persistent `dispatch()` output scratch buffer, allocating it
-    /// once on first use. Pair with [`Self::return_dispatch_scratch`] once
-    /// done so the buffer is reused (not dropped and re-allocated) on the
-    /// next tick.
-    fn take_dispatch_scratch(&mut self) -> Box<DispatchOut> {
+    /// Take the persistent `dispatch()` output scratch buffer, binding its
+    /// static (`.bss`) storage on first use. Pair with
+    /// [`Self::return_dispatch_scratch`] once done so the reference is
+    /// handed back for the next tick.
+    fn take_dispatch_scratch(&mut self) -> &'static mut DispatchOut {
         self.dispatch_scratch.take().unwrap_or_else(|| {
-            tracing::info!("WgActor: allocating dispatch scratch (~6 KB) on first use");
-            Box::new(DispatchOut::new())
+            tracing::info!("WgActor: binding static dispatch scratch (~6 KB, .bss) on first use");
+            endpoint::dispatch_out_static()
         })
     }
 
     /// Clear and return the scratch buffer taken via
     /// [`Self::take_dispatch_scratch`].
-    fn return_dispatch_scratch(&mut self, mut out: Box<DispatchOut>) {
+    fn return_dispatch_scratch(&mut self, out: &'static mut DispatchOut) {
         out.clear();
         self.dispatch_scratch = Some(out);
     }
@@ -322,8 +352,11 @@ impl WgActor {
         // ALLOCATIONS.md). Filling a heap-resident RecvOut still keeps those
         // 6 KB off the stack, same as before.
         let mut out = self.take_scratch();
+        heap_probe_blocks("on_inbound: before recv_one_into");
         self.endpoint().recv_one_into(payload, from, Instant::now(), &mut out);
+        heap_probe_blocks("on_inbound: after recv_one_into, before drain_recv");
         self.drain_recv(src_key, &out, events).await;
+        heap_probe_blocks("on_inbound: after drain_recv");
         self.return_scratch(out);
     }
 
@@ -373,7 +406,7 @@ impl WgActor {
         // ~6 KB block off the stack (writing into the boxed slot in place) and,
         // once allocated, off the heap-churn path entirely. Iterate by
         // reference and clone each packet, same as before.
-        let mut outbound = self.take_dispatch_scratch();
+        let outbound = self.take_dispatch_scratch();
         *outbound = self.endpoint().dispatch(now, now_unix());
         for (id, pkt) in outbound.iter() {
             self.emit_to_peer(*id, pkt.clone(), events).await;

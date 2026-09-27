@@ -24,3 +24,12 @@ aead             = { version = "0.5", default-features = false, features = ["all
 rand             = { version = "0.8", features = ["getrandom"] }
 rand_core        = "0.6"
 zerocopy         = { version = "0.8", features = ["derive"] }
+
+# Heap probes bracketing recv_one_into/drain_recv (round 6 of the
+# tailmicro-rs heap-fragmentation investigation, ALLOCATIONS.md Step 5:
+# root-causing the 20480-vs-8192 mismatch). Device-only, same pattern as
+# tm_disco's Cargo.toml block: esp-idf-sys is a shared sys crate already
+# pulled in by tm_runtime, so this only affects the espidf target, not host
+# builds/tests.
+[target.'cfg(target_os = "espidf")'.dependencies]
+esp-idf-sys = { workspace = true }
