@@ -1890,3 +1890,15 @@ a ~32-peer tailnet) was not chased: the live netmap during this pass only
 had 2 peers, so there was no evidence of it firing, and the reconnect fix
 above fully explains the originally reported symptom (DERP going silently
 deaf). Left as a documented open suspicion, not a confirmed bug.
+
+## Plan: LAN-only direct UDP path (2026-09-27, plan only)
+
+See `docs/lan-direct-path-plan.md`. Summary: a staged, feature-gated
+(`lan-direct`, default off) plan to publish the device's WiFi LAN IP as a
+disco endpoint, answer disco PINGs with PONGs over UDP `:41641`, and carry
+WireGuard directly to same-LAN peers, with DERP kept up as the permanent
+fallback. Re-reading Spike 2 above: it published a bogus `0.0.0.0:port`
+endpoint and never answered the peer's UDP PING with a PONG, so the peer
+never trusted the direct path. That was a harness gap, not proof the path
+cannot work. The plan's Step 0 re-runs the spike properly in Python before
+any Rust is written.
