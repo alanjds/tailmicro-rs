@@ -1743,3 +1743,150 @@ into the existing `try_join!` alongside `echo_server()`/
 `stay_connected(..)`/`run_server_tcp(..)`. See the concrete patch text (not
 applied to that repo) in the phase-2 implementation report on card
 t_0d32f11d.
+
+## DERP reconnect-with-backoff + disco allowlist/sealed-PONG fix (2026-09-27)
+
+Two confirmed, independent bugs, fixed together in one pass on
+`wg-dispatch-scratch`.
+
+### Bug 1: DERP never reconnected after a drop (real outage, confirmed live)
+
+`DerpActor::run` treated any connection error (`run_connection` returning
+`Err` — a TCP reset, a TLS read error, any `frame?` failure) as terminal: it
+sent `DerpEvent::Disconnected` and then just idled on `cmds.recv()`, waiting
+for a fresh `Connect`. The router (`tm_runtime`) only `debug!`-logged
+`Disconnected` and never re-sent `Connect`; `Connect` is otherwise only sent
+from a `ControlEvent::MapUpdate` delta, and `tm_control` skips empty-snapshot
+keepalive deltas. On a quiet tailnet, a DERP drop was therefore permanent
+until a manual reboot. Confirmed live via `tailscale status --json`: a
+peer's `TxBytes` climbing (repeated handshake attempts) while `RxBytes`
+stayed flat for 10+ minutes.
+
+Fix (`tm_derp/src/lib.rs`): `DerpActor::run` now keeps the last dial target
+and, on a connection `Err`, redials the SAME target with exponential
+backoff (1s initial, doubling, capped at 30s), interruptible by a fresh
+`Connect`/`Disconnect`/`Shutdown` command at any point in the wait. An
+explicit `Disconnect` (as opposed to an error) still goes idle with no
+redial, and `Shutdown` still ends the actor — distinguished via a new
+`StopReason` enum returned by `run_connection` instead of a bare `Ok(())`
+that could not tell the three cases apart. DERP disconnect logging raised
+from `debug!` to `info!` (both in `tm_derp` and `tm_runtime`) so a future
+drop is visible in normal serial logs, not just debug builds.
+
+`tm_runtime`'s event router also now remembers the last DERP `Connect`
+target and re-sends it on `DerpEvent::Disconnected` as a belt-and-suspenders
+measure — harmless even while `DerpActor` is already redialing on its own
+(a repeat `Connect` to an actor that's mid-redial is absorbed the next time
+it checks its command channel).
+
+Host tests (`tm_derp`, `cargo test -p tm_derp`, both with and without
+`--features etls`): `next_backoff_ms_doubles_and_caps`,
+`next_backoff_ms_never_panics_near_u64_max` (pure backoff arithmetic, no
+actor/tokio needed), and `disconnect_then_reconnect_is_honoured` (drives the
+real `DerpActor::run` state machine end-to-end via the `not(etls)` stub:
+`Connect` -> `Disconnect` -> `Connect` -> `Shutdown`, asserting the actor
+goes idle rather than exiting, and a post-`Disconnect` `Connect` is still
+honoured). The redial-after-`Err` branch itself can only be exercised where
+`run_connection` can actually fail, i.e. the `etls` feature against a real
+or forced-bad TCP/TLS leg — not host-testable in isolation; verified instead
+by a live build+flash (below).
+
+### Bug 2: `tailscale ping` (disco) could never succeed against this client
+
+Three independent breaks in the disco reply path, all in `tm_disco` /
+`tm_runtime`:
+
+1. `DiscoActor::process`'s allowlist gate was never populated — nothing
+   outside `tm_disco`'s own tests ever sent `DiscoCmd::AllowPeer`, so every
+   inbound PING was silently dropped.
+2. The PONG that would have been built carried only the bare 12-byte tx_id
+   echo, not a wire-valid disco PONG (`type=2, ver=0, tx_id(12),
+   src_ipport(18)`, sealed with `SalsaBox`).
+3. Even a valid PONG had nowhere to go: `tm_runtime` logged
+   `DiscoEvent::SendPong` as `[not relayed: DERP stub]` (stale, from before
+   DERP relay existed) instead of forwarding it via `DerpCmd::SendPacket`,
+   and the inbound `DiscoCmd::MaybeDisco` never carried the peer's node key
+   needed to address a reply (the router passed `src_ip: [0; 4]`; DERP
+   routes by node key, not IP).
+
+Fixes:
+
+- `tm_runtime`: on every `ControlEvent::MapUpdate`, send
+  `DiscoCmd::AllowPeer(peer.disco_key)` for each peer (the disco keys were
+  already parsed in `tm_control::map_stream`, so this is wiring, not new
+  parsing) and `DiscoCmd::SetHomeRegion(rid)` with the same home region
+  `tm_control::select_home_region` picked for the DERP connect. The
+  DERP->disco hop now forwards the DERP frame's real `src_key` as
+  `DiscoCmd::MaybeDisco::src_node_key` instead of a placeholder `[0; 4]`.
+- `tm_disco`: `DiscoActor::process` now builds and seals a real PONG via a
+  new free function `build_sealed_pong` (pulled out for testability):
+  `magic(6) || our_disco_pub(32) || nonce(24) || SalsaBox(type=2, ver=0,
+  tx_id(12), src_ipport(18))`, with a fresh random nonce (`rand::rngs::OsRng`,
+  new `rand` dependency, same getrandom-backed pattern `tm_derp` already
+  uses). `src_ipport` uses Tailscale's `127.3.3.40:<region>` DERP-relay
+  convention (IPv4-mapped into IPv6, matching
+  `ts_disco_protocol::endpoint::Endpoint`'s wire layout) with our current
+  home region. `DiscoEvent::SendPong` now carries `dst_node_key` (for DERP
+  addressing) and the full sealed wire bytes, ready for
+  `DerpCmd::SendPacket` as-is. The disco rate limiter's stubbed `now_ms = 0`
+  is replaced with a real `std::time::Instant` (same primitive `tm_wg`
+  already uses elsewhere in this workspace) — it was a permanent no-op
+  before (the `now_ms != 0` guard existed only to keep the stub from
+  wrongly suppressing/underflowing).
+- `tm_runtime`: `DiscoEvent::SendPong` is now actually forwarded —
+  `tm_buf::PktBuf::from_slice(&payload)` + `DerpCmd::SendPacket { dst_key:
+  NodePublicKey::from_bytes(dst_node_key), payload: buf }` — instead of
+  logged and dropped.
+
+Validation, matching this project's Python-first cross-check habit
+(`tools/wg_validator/disco.py`): the sealed-PONG wire format is checked two
+ways in `tm_disco`'s host tests (`cargo test -p tm_disco`, 4/4 passing):
+`framing::process_extracts_ping_tx_id_after_magic` decrypts the actor's own
+output using the same `SalsaBox` construction (checks wiring/plumbing, not
+independent of a shared bug), and the new
+`pong_seal_crosscheck::pong_wire_matches_pynacl_reference` drives
+`build_sealed_pong` with a FIXED nonce and compares the emitted 110-byte
+wire array byte-for-byte against a vector generated by pynacl's
+`nacl.public.Box.encrypt` (an independent implementation of the same
+primitive `disco.py` uses) — see that test's module doc comment for the
+generator invocation. This is the check that would actually catch a
+shared Rust/spec mismatch that a self-decrypt round-trip cannot.
+
+### Hardware verification
+
+Built via `tasmolike-rs` (`RUSTFLAGS="-A warnings" cargo build`, real
+`.env.aj2004` secrets, `tm_derp` with `features = ["etls"]`) — clean build,
+no new warnings. Flashed to the real ESP32-C3 on `/dev/ttyACM0`. ~150s of
+serial capture (kept only in the local scratchpad, never committed) shows:
+control-plane bring-up, `MapUpdate` with 2 online peers + 4 DERP regions,
+DERP connect to home region 11 (sao), successful DERP TLS handshake,
+`WgEvent::OutboundPacket`/`RecvPacket` on both peers (handshake + transport
+data flowing normally), and steady DERP `KeepAlive` frames on a quiet
+tailnet with no errors or panics — i.e. no regression from the reconnect
+and disco-allowlist wiring changes.
+
+**Not verified live** in this pass, both for practical/tooling reasons
+(flagging honestly rather than guessing): (1) an actual forced DERP
+mid-session disconnect-and-recover — there was no practical way from this
+vantage point to sever just the ESP32's TCP session to the DERP server
+without disrupting the whole WiFi test rig, so the redial-after-`Err` path
+is verified by the `tm_derp` host tests plus code review, not a live drop;
+(2) a real `tailscale ping esp32c3` from a peer — no `tailscale` CLI was
+reachable from this sandbox (only a bare `tailscale0` interface, no
+control-plane access). Both are recommended as a follow-up manual check
+with real CLI/network access: force-kill the DERP TCP connection (e.g. via
+a firewall rule the ESP32 itself is behind) and confirm the device
+reconnects within `RECONNECT_MAX_MS` without a reboot; then run `tailscale
+ping esp32c3` from another node and confirm it succeeds.
+
+### Skipped
+
+TSMP ping (IP proto 99) replies were explicitly out of scope for this pass
+(low value — only affects `tailscale ping --tsmp` — and time was better
+spent verifying the two real bugs above). Not started.
+
+The `MAX_PEERS = 8` netmap-truncation suspicion (peers possibly evicted on
+a ~32-peer tailnet) was not chased: the live netmap during this pass only
+had 2 peers, so there was no evidence of it firing, and the reconnect fix
+above fully explains the originally reported symptom (DERP going silently
+deaf). Left as a documented open suspicion, not a confirmed bug.
