@@ -547,3 +547,102 @@ runs:**
   disrupted, and only new files in `tools/wg_validator/` plus this doc
   section were changed in `tailmicro-rs` (`wg-dispatch-scratch`); nothing was
   pushed, and `tasmolike-rs` was not modified.
+
+## Step 0 status (2026-09-28): the earlier BLOCKED verdict was environment
+config, not a hardware limit — fixed; live run gives a mixed but genuinely
+useful result
+
+**The IPv4 blocker is resolved.** `bospill` had no IPv4 route at all because
+its wired connection's DHCP lease had silently expired/never renewed
+(`ipv4.method=auto` was correctly configured; the router just wasn't
+leasing it one). Cycling the NetworkManager connection
+(`nmcli connection down/up "Wired connection 1"`, run via
+`distrobox-host-exec` since this session's own container has no
+`CAP_NET_ADMIN`) got a real lease: `192.168.15.70/24` with a default
+gateway. This is bospill's real host network, not a container-only fix —
+the container shares the host's network namespace, so it picked the new
+route up immediately. `validate_lan_direct.py`'s D1 check now correctly
+derives `192.168.15.70` from the control-plane socket instead of BLOCKED
+(confirmed by forcing `socket.getaddrinfo` to prefer `AF_INET`, since
+bospill is dual-stack and glibc's address selection otherwise picks the
+working IPv6 route to `login.tailscale.com`, which the real `tm_control`
+Rust code — using a literal control-server IP, not a hostname lookup with
+family fallback — won't hit the same way).
+
+**With D1 fixed, three live-peer attempts, each answering a different open
+question:**
+
+1. **Target `esp32c3` (our own embedded firmware), passive wait: no
+   PING arrived.** Expected, not a bug: `tm_disco` is currently
+   PONG-only (Step 7 in this plan, outbound PING/CallMeMaybe, is explicitly
+   deferred) — there is no code path in the current firmware that would
+   ever send an unsolicited PING to a newly-published peer. Testing Step
+   0's "does a real peer probe us" question against our own PING-incapable
+   device was the wrong target; it can only ever demonstrate the reverse
+   direction (a real peer PONGing back to *us*).
+
+2. **Target `alanjds-s25` (the phone), passive wait: no PING arrived.**
+   Its published endpoints (`187.90.221.201:3838`,
+   `177.26.244.89:7805`, `192.0.0.2:45230`, plus IPv6) are all mobile-carrier
+   NAT addresses, none on `192.168.15.0/24` — the phone is not on bospill's
+   WiFi right now. Inconclusive by construction, not a finding.
+
+3. **Target `bospill`'s own real tailscaled (a genuine full client, online,
+   on the same LAN by definition), two runs:**
+   - **Active**: our probe sent a properly-sealed disco PING straight to
+     `bospill`'s published LAN endpoint (`192.168.15.70:41641`) every 3s.
+     Got a real, valid, decryptable **PONG back over direct UDP** within
+     one round — `RESULT: got_ping=False got_pong=True got_wg=False`. This
+     is genuine, fresh confirmation (independent of the original 2026-09-16
+     Spike 2, using today's current `disco.py`/`ts_control.py` code) that
+     our disco wire format and crypto interop correctly with a real,
+     unmodified Tailscale client over a real LAN UDP path.
+   - **Passive** (no active probing from us, matching what
+     `validate_lan_direct.py` actually implements): **no PING arrived**,
+     even after 60s and even after also issuing a real
+     `tailscale ping 100.75.122.18` (our probe's tailnet address) from the
+     host CLI to force an OS-level attempted-traffic event. The `tailscale
+     ping` itself reported "no reply" (timed out on all 3 attempts).
+
+**What (3)'s passive result means, honestly**: real tailscaled's magicsock
+does not appear to proactively attempt a freshly-netmap-published peer's
+direct endpoint on netmap propagation alone, and a `tailscale ping` issued
+from the *other* side didn't produce a visible reply either — but the
+probe script only listens on the raw UDP socket, not on the DERP leg it
+also brought up (`dc`, `derp_client.DerpClient`), so if bospill's
+`tailscale ping` attempt went out over DERP first (the normal path before
+a direct upgrade is trusted) and expected a DERP-relayed disco reply, this
+harness would have silently failed to answer it — a harness gap, not
+necessarily a "real peers never self-initiate" finding. **This specific
+question (does a real peer proactively try a freshly-published LAN
+endpoint once it has reason to send it traffic) is still open** and matters
+for the plan: the production scenario (a phone's HTTP request needing to
+reach the ESP32) already provides that "reason" via real application data,
+so it likely does not block the plan either way, but a cleaner follow-up
+(a probe that reads and answers on both the UDP socket and the DERP leg)
+would close it properly.
+
+**Bottom line**: the disco PING/PONG crypto and wire format are proven,
+again, against a real unmodified Tailscale client over a real LAN UDP path
+— the mechanism itself keeps checking out. The full "peer moves its
+WireGuard session off DERP onto our published UDP endpoint, unprompted"
+outcome that would make this an unqualified pass is still not observed,
+because every attempt so far either used a peer that can't initiate
+(`esp32c3`), wasn't reachable on this LAN (`alanjds-s25`), or (for
+`bospill`) needed our harness to also monitor the DERP leg to be a fair
+test. **Recommendation unchanged from the prior status update**: Step 1
+(Rust `tm_disco` UDP PONG, host-testable, pynacl vector ready) can proceed
+now. A cleaner Step 0 re-run — DERP-leg-aware harness, against `bospill`,
+`lenovopill` (currently offline), or the phone once it's actually on this
+WiFi — would be worth doing before Step 2 (on-device UDP socket) starts,
+but the crypto-interop evidence gathered so far gives no reason to expect
+Step 2+ to fail.
+
+No hardware was touched (`esp32c3` only ever observed passively via the
+control plane's netmap). No `tailmicro-rs` code changed this round — only
+this doc section. `tasmolike-rs` was not modified. Scratch scripts used for
+the active-probe/passive-listen variants stayed in the session's own
+scratchpad directory, not committed (they duplicate/extend
+`validate_lan_direct.py` for one-off experiments; if a DERP-aware Step 0
+re-run is wanted next, promoting one of them into `tools/wg_validator/`
+properly is the right move, not what was done here under time pressure).
