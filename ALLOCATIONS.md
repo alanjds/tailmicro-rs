@@ -1119,6 +1119,143 @@ buffers (or a smaller HTTP server for `/cm`), `PBUF_RAM` sized to the packet
 in `inject_inbound`, trim the main stack further (needs a worst-case
 stack measurement first); strip `heapdiag`/probes once this holds up.
 
+### Step 8 (2026-09-28): hyper replaced, send-queue pileup found and fixed; clean soak with 15.8 KB minimum largest block
+
+**Context**: Step 7's residual failure was hyper needing 8 KiB contiguous
+blocks per connection (a `WriteBuf` headers `Vec::with_capacity(8192)` plus
+a read `reserve(8192)`). hyper's server `max_buf_size` cannot go below
+`MINIMUM_MAX_BUFFER_SIZE` (8192), so the buffers could not be shrunk.
+
+**Fix 1 (tasmolike-rs `src/server.rs`, `Cargo.toml`): replace hyper with a
+minimal HTTP/1.1 responder.** The responder does the following:
+
+- Keeps the axum `Router` (all handlers unchanged) and calls it via
+  `tower::ServiceExt::oneshot`.
+- Parses the request with `httparse`: a 1 KiB buffer allocated once at
+  startup, 24 headers max, and a Content-Length body only (chunked request
+  bodies get 501).
+- Writes the response through that same buffer, coalescing body frames:
+  `content-length` when the body size is exact, and `connection: close`.
+- Serves one connection at a time with a 10 s cap.
+- Runs the server loop in a spawned task. Inlining it in `block_on` put its
+  state on the main stack and dropped the stack high-water mark to 5016 B.
+
+`hyper`/`hyper-util` are gone. After this, no allocation over about 3.2 KB
+remains on the request path (the largest is a `U3168`).
+
+Result: back-to-back requests were 60/60, and largest_free at every accept
+and close stayed at 19456 or above. But 4-way **parallel** `Status 0`
+requests (about 3 KB responses) then **aborted** on a 3168 B allocation
+with only about 7 KB free in total.
+
+**Root-cause refinement, from annotated heap maps.** `heapdiag` now marks
+lwIP pbuf blocks as `P<size>:<type>/<len>/<ref>{srcport>dstport}`.
+
+- At the failure, 15 to 18 `P1344:80` blocks (PBUF_RAM, 1280/532/132 byte
+  segments, i.e. TCP MSS 1240 + 40 B headers) held about 24 KB.
+- Their ports showed they were the tailnet HTTP server's (`80>...`) *sent,
+  unACKed* segments from connections the app had **already closed**.
+- lwIP keeps a closed socket's unACKed data and retransmits it for up to
+  `TCP_MAXRTX`=12 backoffs. These were typically clients that had timed out
+  on the slow relay path.
+- There were no PBUF_POOL (`0x82`) inbound pbufs of note, so switching
+  `inject_inbound` to PBUF_RAM (a Step 7 lever) would not help.
+- The 10 `U1664` blocks are the WiFi driver's static RX buffers
+  (`ESP_WIFI_STATIC_RX_BUFFER_NUM=10`), a fixed cost.
+
+A subtle trap, found via the port annotation: setting `SO_LINGER=0` *after*
+`shutdown()` did not free those segments. lwIP turns a `shutdown(SHUT_WR)`
+into the full close when the receive side is already closed, and
+`netconn_recv` issues `SHUT_RD` on reading the client's FIN, which turns a
+socket already in FIN_WAIT into the full close. The full close then runs
+with the default linger, detaches the pcb from the socket, and keeps its
+queue, so a later `setsockopt` cannot reach it.
+
+**Fix 2 (tasmolike-rs):**
+- **Lingering then abortive close:**
+  1. `set_zero_linger()` **before** `shutdown()`.
+  2. Send our FIN.
+  3. Wait up to 5 s for the client's FIN.
+  4. Drop.
+
+  A well-behaved client ACKs everything before its FIN, so the normal path
+  closes gracefully. An abandoned connection gets RST and its send queue
+  is freed at once.
+- `CONFIG_LWIP_SO_LINGER=y`, which `set_zero_linger` needs.
+- Listen backlog 2 (`TcpSocket::listen(2)`), so queued connections cannot
+  take heap from the one being served.
+
+**Fix 3 (this commit, plus the app-side log levels): console throughput.**
+With `CONFIG_LOG_DEFAULT_LEVEL_VERBOSE` on a blocking 115200-baud UART, log
+bytes are data-plane time. The following were saturating the UART (about
+13 KB/s of output against about 11.5 KB/s of capacity) and throttling the
+tailnet to a few packets/s:
+
+- per-packet `info!` lines (`RecvPacket`, `OutboundPacket`,
+  `InboundDecrypted`);
+- one `warn!` per router drop;
+- the Step 5 to 7 per-packet heap probes;
+- per-request efuse/nvs debug lines.
+
+That throttling caused channel drops, then retransmits, then more queued
+segments.
+
+Changes:
+- `heapdiag::ENABLED` (off unless the `heap-trace` feature is on) now gates
+  every per-packet probe.
+- The per-packet lines are `trace!`.
+- The drop warning is rate-limited to powers of two and every 256th drop.
+- The app caps `tm_derp`/`tm_runtime`/`tm_wg`/`efuse`/`nvs`/`pthread`/
+  `registry` at Info.
+
+This commit also adds `heapdiag::dump_heap_map()` (on demand, allocation-free)
+and `heapdiag::count_pbufs()`. The failed-allocation dump threshold is now
+3000 B.
+
+**Results** (real ESP32-C3 on `/dev/ttyACM0`, built from this repo's main
+checkout at `6d5d23d` + this commit; requests from bospill over DERP `sao`,
+RTT 400 to 700 ms, `curl /cm?cmnd=Status`):
+```
+full soak (one boot, about 21 min of load):
+  back-to-back:           60/60
+  parallel 4x20 Status 0: 80/80   (client timeout 40 s)
+  slow soak (1 per 10 s): 36/36
+  final burst:            30/30
+  resets 0, alloc failures 0, server-side timeouts 0
+  largest_free, sampled every 250 ms: min 15872  (Step 7: 8100)
+  largest_free at accept/close (n=209): min 18432, p10 26624, median 32768
+  min_ever_free 24248, main-task stack min free 7248 B (Step 7: 6088)
+  pbuf bytes live at any accept/close: max 3072
+```
+Abusive case: 4-way parallel with a 10 s client timeout, so most clients
+give up mid-response:
+
+| run | fixes in place | largest_free min | outcome |
+|---|---|---|---|
+| before Fix 2 | none | down to 2304 | abort on the 3168 B alloc |
+| with linger=0 after `shutdown` | partial | 4096 | no crash; up to 16 pbufs / 18 KB live after close |
+| final | all | 12288 | 0 resets; at most 3 KB of pbufs live at any close |
+
+The client success rate in the abusive case is low, 4/32. That is
+throughput, not memory:
+- one `Status 0` takes about 5 s end to end over this relay path (TCP slow
+  start with `TCP_WND` 2440 and a 400 to 700 ms RTT);
+- connections are served one at a time;
+- so the 4th parallel client waits past 10 s.
+
+**Bottom line**: the heap-margin issue is closed for this workload. The
+smallest largest-free block seen under any load is 12288 B, and 15872 B in
+the realistic soak. The largest request-path allocation is about 3.2 KB and
+hyper's 8 KiB blocks are gone, so that is about 4x headroom, not 92 B.
+
+Remaining, not heap:
+- request latency over DERP (about 5 s for 3 KB), which a direct LAN path
+  (LAN-direct plan) or a larger `TCP_WND`/initial cwnd would address;
+- router drops still occur under parallel load (at least 256 in the soak,
+  with `CHAN_CAP`=2);
+- the temporary `heap_watch`/`heap-probe` instrumentation in tasmolike-rs
+  `server.rs` should come out once this is accepted.
+
 ## Design principle going forward
 
 Fixed-size, same-shape allocations that recur on a hot path should be

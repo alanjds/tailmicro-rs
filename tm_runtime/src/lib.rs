@@ -31,7 +31,7 @@ use tm_disco::{DiscoActor, DiscoCmd, DiscoEvent};
 use tm_wg::{WgActor, WgCmd, WgEvent};
 use tm_keys::{NodeState, NodePublicKey};
 use tm_netstack::tailnet;
-use log::{info, debug, warn, error};
+use log::{info, debug, trace, warn, error};
 use async_channel;
 
 /// FreeRTOS yield function for ESP32-C3 watchdog servicing.
@@ -332,7 +332,12 @@ fn forward_or_drop<T>(tx: &async_channel::Sender<T>, msg: T, what: &str) {
         Ok(()) => {}
         Err(async_channel::TrySendError::Full(_)) => {
             let n = ROUTER_DROPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-            warn!("Runtime::join() - {} channel full; dropped packet instead of blocking the router (drops so far: {})", what, n);
+            // Rate-limited: under load drops come in bursts, and a line per
+            // drop on a blocking UART console slows the data plane further,
+            // which causes more drops.
+            if n.is_power_of_two() || n % 256 == 0 {
+                warn!("Runtime::join() - {} channel full; dropped packet instead of blocking the router (drops so far: {})", what, n);
+            }
         }
         Err(async_channel::TrySendError::Closed(_)) => {
             debug!("Runtime::join() - {} channel closed; packet dropped", what);
@@ -617,7 +622,7 @@ async fn event_router_task(
                         // today -- see docs/wg-dataplane-notes.md -- so
                         // these are dropped by the DerpActor for now;
                         // the wiring is correct and observable.)
-                        info!("Runtime::join() - WgEvent::OutboundPacket {} bytes -> DERP peer {:02x}{:02x}..", payload.len(), dst_key[0], dst_key[1]);
+                        trace!("Runtime::join() - WgEvent::OutboundPacket {} bytes -> DERP peer {:02x}{:02x}..", payload.len(), dst_key[0], dst_key[1]);
                         // Forward tm_wg's buffer to DERP as-is (same
                         // tm_buf::PktBuf type on both channels): no copy.
                         forward_or_drop(&derp_tx2, DerpCmd::SendPacket {
@@ -634,15 +639,15 @@ async fn event_router_task(
                         // item 5) via `tcpip_input()`, which is safe to call
                         // from this (non-tcpip) task -- see
                         // tm_netstack::tailnet's module doc comment.
-                        info!("Runtime::join() - WgEvent::InboundDecrypted {} bytes from peer {:02x}{:02x}..", payload.len(), src_key[0], src_key[1]);
-                        unsafe {
+                        trace!("Runtime::join() - WgEvent::InboundDecrypted {} bytes from peer {:02x}{:02x}..", payload.len(), src_key[0], src_key[1]);
+                        if tm_wg::heapdiag::ENABLED { unsafe {
                             let pool = tm_buf::stats();
                             debug!("Runtime::join() - heap after inbound-decrypted (before inject_inbound): total_free={} largest_internal={} largest_default={} pktbuf_pool: free={} allocs={} frees={}",
                                 esp_idf_sys::esp_get_free_heap_size(),
                                 esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_INTERNAL),
                                 esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT),
                                 pool.free, pool.allocs, pool.frees);
-                        }
+                        } }
                         let w = tm_wg::heapdiag::trace_begin("router: before inject_inbound");
                         let inj = tailnet::inject_inbound(payload.as_slice());
                         tm_wg::heapdiag::trace_end(w, "router: after inject_inbound");

@@ -353,7 +353,9 @@ impl WgActor {
         // ALLOCATIONS.md). Filling a heap-resident RecvOut still keeps those
         // 6 KB off the stack, same as before.
         let mut out = self.take_scratch();
-        heap_probe_blocks("on_inbound: before recv_one_into");
+        if heapdiag::ENABLED {
+            heap_probe_blocks("on_inbound: before recv_one_into");
+        }
         self.endpoint().recv_one_into(payload, from, Instant::now(), &mut out);
         let w = heapdiag::trace_begin("on_inbound: before drain_recv");
         self.drain_recv(src_key, &out, events).await;
@@ -463,6 +465,10 @@ impl WgActor {
 /// `Pending` (i.e. actually yielded to the executor, letting every other
 /// task on this current-thread runtime run before the send completed).
 async fn send_diag(events: &async_channel::Sender<WgEvent>, ev: WgEvent, what: &str) {
+    if !heapdiag::ENABLED {
+        let _ = events.send(ev).await;
+        return;
+    }
     let full_before = events.is_full();
     let len_before = events.len();
     let mut pendings = 0u32;

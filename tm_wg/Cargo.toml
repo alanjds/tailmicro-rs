@@ -9,6 +9,8 @@ edition = "2024"
 # ALLOCATIONS.md Step 7: link heapdiag's trace windows against ESP-IDF's
 # standalone heap tracer (needs CONFIG_HEAP_TRACING_STANDALONE=y and
 # CONFIG_HEAP_TRACING_STACK_DEPTH=6 in the app sdkconfig). Off by default.
+# Also turns on the per-packet heap/channel log lines (heapdiag::ENABLED):
+# they cost ~1.5 KB of blocking console output per packet (Step 8).
 heap-trace = []
 
 [dependencies]

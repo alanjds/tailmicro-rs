@@ -449,7 +449,7 @@ impl DerpActor {
                         if n >= 32 {
                             let mut src = [0u8; 32];
                             src.copy_from_slice(&tls.frame()[..32]);
-                            tracing::info!(
+                            tracing::trace!(
                                 "DerpActor: RecvPacket {} bytes from {:02x}{:02x}..",
                                 n - 32,
                                 src[0],

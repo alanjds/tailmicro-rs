@@ -17,6 +17,15 @@
 //!   whole internal-heap block map (address-ordered `U<size>`/`F<size>`) so
 //!   the fragmentation at the moment of the crash is visible.
 
+/// Whether the per-packet diagnostics (trace windows, `send_diag`, the
+/// `heap-blocks` probes around `recv_one_into`, the router's pre-inject heap
+/// line) are compiled in. Off by default: at `CONFIG_LOG_DEFAULT_LEVEL_VERBOSE`
+/// on a 115200-baud UART console they emitted ~1.5 KB of log per data-plane
+/// packet, and the console is a blocking busy-wait, so they capped the whole
+/// data plane at ~5 packets/s (ALLOCATIONS.md Step 8). `install_alloc_failed_dump`
+/// stays on regardless: it costs nothing until a large allocation fails.
+pub const ENABLED: bool = cfg!(all(target_os = "espidf", feature = "heap-trace"));
+
 #[derive(Clone, Copy, Default)]
 pub struct Snap {
     pub total_free: usize,
@@ -108,6 +117,9 @@ pub struct Window {
 /// that opened it yielded to the executor and we are running inside its
 /// gap), log that and return a non-owning window.
 pub fn trace_begin(tag: &'static str) -> Window {
+    if !ENABLED {
+        return Window { tag, owns: false, before: Snap::default() };
+    }
     let before = snap(tag);
     #[cfg(all(target_os = "espidf", feature = "heap-trace"))]
     {
@@ -129,6 +141,9 @@ pub fn trace_begin(tag: &'static str) -> Window {
 /// Close a window: dump the still-live allocations made inside it if the
 /// window cost at least one block or 1 KB of `largest_free`.
 pub fn trace_end(w: Window, end_tag: &str) {
+    if !ENABLED {
+        return;
+    }
     #[cfg(all(target_os = "espidf", feature = "heap-trace"))]
     if w.owns {
         dev::stop();
@@ -150,6 +165,110 @@ pub fn trace_end(w: Window, end_tag: &str) {
     }
 }
 
+/// Print the internal heap's block map now (same format as the
+/// failed-allocation dump). Allocation-free; safe to call from any task.
+pub fn dump_heap_map(reason: &core::ffi::CStr) {
+    #[cfg(target_os = "espidf")]
+    unsafe {
+        esp_idf_sys::esp_rom_printf(
+            c"\nheapdiag: heap map (%s) (U=used F=free, address order):\n".as_ptr(),
+            reason.as_ptr(),
+        );
+        let mut n: u32 = 0;
+        esp_idf_sys::heap_caps_walk(esp_idf_sys::MALLOC_CAP_INTERNAL, Some(walk), (&raw mut n).cast());
+        esp_idf_sys::esp_rom_printf(c"\nheapdiag: end heap map (%u blocks)\n".as_ptr(), n);
+    }
+    #[cfg(not(target_os = "espidf"))]
+    let _ = reason;
+}
+
+/// Count the live lwIP pbuf blocks in the internal heap: `(count, bytes)`.
+/// Cheap enough for a per-connection probe, and shows whether send-queue
+/// segments are piling up without printing a whole map.
+pub fn count_pbufs() -> (u32, u32) {
+    #[cfg(target_os = "espidf")]
+    unsafe {
+        unsafe extern "C" fn count(
+            _h: esp_idf_sys::walker_heap_into_t,
+            b: esp_idf_sys::walker_block_info_t,
+            user: *mut core::ffi::c_void,
+        ) -> bool {
+            unsafe {
+                if b.used && b.size >= 64 && looks_like_pbuf(b.ptr as *const u8, b.size) {
+                    let acc = &mut *(user as *mut (u32, u32));
+                    acc.0 += 1;
+                    acc.1 += b.size as u32;
+                }
+            }
+            true
+        }
+        let mut acc: (u32, u32) = (0, 0);
+        esp_idf_sys::heap_caps_walk(esp_idf_sys::MALLOC_CAP_INTERNAL, Some(count), (&raw mut acc).cast());
+        acc
+    }
+    #[cfg(not(target_os = "espidf"))]
+    (0, 0)
+}
+
+#[cfg(target_os = "espidf")]
+unsafe extern "C" fn walk(
+    _h: esp_idf_sys::walker_heap_into_t,
+    b: esp_idf_sys::walker_block_info_t,
+    user: *mut core::ffi::c_void,
+) -> bool {
+    unsafe {
+        let n = &mut *(user as *mut u32);
+        if b.used && b.size >= 3000 {
+            esp_idf_sys::esp_rom_printf(c"U%u@%p ".as_ptr(), b.size as u32, b.ptr);
+        } else if b.used && b.size >= 64 && looks_like_pbuf(b.ptr as *const u8, b.size) {
+            // `P<size>:<type_internal hex>/<len>/<ref>`: an lwIP pbuf header
+            // at the start of the block (0x80 = PBUF_RAM, 0x82 = PBUF_POOL).
+            let p = b.ptr as *const u8;
+            let len = core::ptr::read_unaligned(p.add(10) as *const u16);
+            let ty = *p.add(12);
+            let rf = *p.add(14);
+            esp_idf_sys::esp_rom_printf(c"P%u:%x/%u/%u".as_ptr(), b.size as u32, ty as u32, len as u32, rf as u32);
+            // A sent TCP segment has its IPv4+TCP headers in front of the
+            // payload: print the ports so the owning socket can be told apart
+            // (tailnet HTTP :80 vs the DERP/control TLS sockets).
+            let pl = core::ptr::read_unaligned(p.add(4) as *const usize) as *const u8;
+            if len >= 40 && (pl as usize) + 40 <= p as usize + b.size && *pl >> 4 == 4 && *pl.add(9) == 6 {
+                let ihl = ((*pl & 0x0f) as usize) * 4;
+                if ihl >= 20 && (pl as usize) + ihl + 4 <= p as usize + b.size {
+                    let sp = u16::from_be_bytes([*pl.add(ihl), *pl.add(ihl + 1)]);
+                    let dp = u16::from_be_bytes([*pl.add(ihl + 2), *pl.add(ihl + 3)]);
+                    esp_idf_sys::esp_rom_printf(c"{%u>%u}".as_ptr(), sp as u32, dp as u32);
+                }
+            }
+            esp_idf_sys::esp_rom_printf(c" ".as_ptr());
+        } else if b.used {
+            esp_idf_sys::esp_rom_printf(c"U%u ".as_ptr(), b.size as u32);
+        } else {
+            esp_idf_sys::esp_rom_printf(c"[F%u@%p] ".as_ptr(), b.size as u32, b.ptr);
+        }
+        *n += 1;
+        if *n % 16 == 0 {
+            esp_idf_sys::esp_rom_printf(c"\n".as_ptr());
+        }
+    }
+    true
+}
+
+/// Heuristic: an lwIP `struct pbuf` (next, payload, tot_len, len,
+/// type_internal, flags, ref, if_idx) whose `payload` points inside the same
+/// heap block, with a plausible type and `len <= tot_len <= block size`.
+#[cfg(target_os = "espidf")]
+unsafe fn looks_like_pbuf(p: *const u8, size: usize) -> bool {
+    unsafe {
+        let payload = core::ptr::read_unaligned(p.add(4) as *const usize);
+        let tot_len = core::ptr::read_unaligned(p.add(8) as *const u16) as usize;
+        let len = core::ptr::read_unaligned(p.add(10) as *const u16) as usize;
+        let ty = *p.add(12);
+        let start = p as usize;
+        payload >= start + 16 && payload < start + size && (ty == 0x80 || ty == 0x82) && len <= tot_len && len <= size
+    }
+}
+
 /// Register a failed-allocation hook that prints the internal heap's block
 /// map. Uses only `esp_rom_printf` (no allocation) from inside the hook.
 pub fn install_alloc_failed_dump() {
@@ -162,7 +281,7 @@ pub fn install_alloc_failed_dump() {
             // the wifi task on every one of them was measured to livelock the
             // device (hundreds of back-to-back dumps), so only the large,
             // fatal-in-practice failures get the map.
-            if size < 4000 {
+            if size < 3000 {
                 return;
             }
             unsafe {
@@ -178,27 +297,6 @@ pub fn install_alloc_failed_dump() {
                 );
                 esp_idf_sys::esp_rom_printf(c"\nheapdiag: end heap map (%u blocks)\n".as_ptr(), n);
             }
-        }
-        unsafe extern "C" fn walk(
-            _h: esp_idf_sys::walker_heap_into_t,
-            b: esp_idf_sys::walker_block_info_t,
-            user: *mut core::ffi::c_void,
-        ) -> bool {
-            unsafe {
-                let n = &mut *(user as *mut u32);
-                if b.used && b.size >= 3000 {
-                    esp_idf_sys::esp_rom_printf(c"U%u@%p ".as_ptr(), b.size as u32, b.ptr);
-                } else if b.used {
-                    esp_idf_sys::esp_rom_printf(c"U%u ".as_ptr(), b.size as u32);
-                } else {
-                    esp_idf_sys::esp_rom_printf(c"[F%u@%p] ".as_ptr(), b.size as u32, b.ptr);
-                }
-                *n += 1;
-                if *n % 16 == 0 {
-                    esp_idf_sys::esp_rom_printf(c"\n".as_ptr());
-                }
-            }
-            true
         }
         esp_idf_sys::heap_caps_register_failed_alloc_callback(Some(on_fail));
         tracing::info!("heapdiag: alloc-failed heap-map dump installed");
