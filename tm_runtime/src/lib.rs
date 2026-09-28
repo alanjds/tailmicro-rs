@@ -316,6 +316,33 @@ fn build_icmp_echo_reply(req: &[u8], our_ip: [u8; 4]) -> Option<heapless::Vec<u8
     Some(reply)
 }
 
+/// Hand a data-plane packet to an actor without ever blocking the event
+/// router (ALLOCATIONS.md Step 7). The router is the only consumer of the
+/// actors' event channels, and those actors (`WgActor` in particular, see
+/// its `drain_recv`) block on sending *to* the router when their
+/// `CHAN_CAP = 2` event channel is full. If the router in turn awaited a
+/// full command channel of the same actor, both would wait on each other
+/// forever -- observed on real hardware as the whole data plane (DERP
+/// receive, WireGuard, the tailnet HTTP server) going silent while the
+/// control plane kept running. Packets are droppable (TCP retransmits, WG
+/// keepalives recur), so a full channel drops the packet instead; its
+/// `PktBuf` returns to the pool on drop.
+fn forward_or_drop<T>(tx: &async_channel::Sender<T>, msg: T, what: &str) {
+    match tx.try_send(msg) {
+        Ok(()) => {}
+        Err(async_channel::TrySendError::Full(_)) => {
+            let n = ROUTER_DROPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            warn!("Runtime::join() - {} channel full; dropped packet instead of blocking the router (drops so far: {})", what, n);
+        }
+        Err(async_channel::TrySendError::Closed(_)) => {
+            debug!("Runtime::join() - {} channel closed; packet dropped", what);
+        }
+    }
+}
+
+static ROUTER_DROPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+
 /// The event-router loop, extracted to a top-level `async fn`.
 ///
 /// This used to be an `async move { .. }` block declared as a local inside
@@ -342,6 +369,7 @@ async fn event_router_task(
     mut netif_out_tx: Option<tailnet::OutboundSender>,
 ) {
     info!("Runtime::join() - event_router task started");
+    tm_wg::heapdiag::install_alloc_failed_dump();
     // Rung-6a addressing state: our tailnet IPv4 and each peer's tailnet IPv4
     // keyed by node key, captured from MapUpdate. Used to synthesize the ICMP
     // echo request we drive through tm_wg after PeerHandshook so the peer
@@ -442,7 +470,16 @@ async fn event_router_task(
                                 tokio_freertos_yield().await;
                             }
                             for p in map.peers.iter() {
-                                let _ = disco_tx2.send(DiscoCmd::AllowPeer(p.disco_key)).await;
+                                // Step 1 (LAN-direct-path plan): AllowPeer now
+                                // carries both keys, so tm_disco can check a
+                                // UDP PING's claimed node key against the
+                                // netmap's real disco-key/node-key pairing
+                                // (DiscoSrc::Udp has no authenticated sender
+                                // identity the way a DERP frame does).
+                                let _ = disco_tx2.send(DiscoCmd::AllowPeer {
+                                    disco_key: p.disco_key,
+                                    node_key: p.node_key,
+                                }).await;
                                 #[cfg(target_os = "espidf")]
                                 tokio_freertos_yield().await;
                             }
@@ -514,23 +551,22 @@ async fn event_router_task(
                                 // the placeholder `[0; 4]` -- without it,
                                 // `DiscoActor` has no way to address a PONG
                                 // back to the peer over DERP (DERP routes by
-                                // node key, not IP). `src_ip`/`src_port` stay
-                                // zeroed: they're reserved for a future
-                                // direct-UDP disco path, unused today since
-                                // DERP is the only transport.
-                                let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
-                                    src_ip:   [0; 4],
-                                    src_port: 0,
-                                    src_node_key: *src_key.as_bytes(),
+                                // node key, not IP). Step 1 (LAN-direct-path
+                                // plan): `MaybeDisco` now carries a
+                                // `DiscoSrc` distinguishing DERP from direct
+                                // UDP; this router only ever sees DERP frames
+                                // today (Step 2 adds a UDP receive loop).
+                                forward_or_drop(&disco_tx2, DiscoCmd::MaybeDisco {
+                                    src: tm_disco::DiscoSrc::Derp { node_key: *src_key.as_bytes() },
                                     data: payload,
-                                }).await;
+                                }, "DiscoCmd::MaybeDisco");
                                 #[cfg(target_os = "espidf")]
                                 tokio_freertos_yield().await;
                             } else {
-                                let _ = wg_tx2.send(WgCmd::InboundPacket {
+                                forward_or_drop(&wg_tx2, WgCmd::InboundPacket {
                                     src_key: *src_key.as_bytes(),
                                     payload,
-                                }).await;
+                                }, "WgCmd::InboundPacket");
                                 #[cfg(target_os = "espidf")]
                                 tokio_freertos_yield().await;
                             }
@@ -584,10 +620,10 @@ async fn event_router_task(
                         info!("Runtime::join() - WgEvent::OutboundPacket {} bytes -> DERP peer {:02x}{:02x}..", payload.len(), dst_key[0], dst_key[1]);
                         // Forward tm_wg's buffer to DERP as-is (same
                         // tm_buf::PktBuf type on both channels): no copy.
-                        let _ = derp_tx2.send(DerpCmd::SendPacket {
+                        forward_or_drop(&derp_tx2, DerpCmd::SendPacket {
                             dst_key: NodePublicKey::from_bytes(dst_key),
                             payload,
-                        }).await;
+                        }, "DerpCmd::SendPacket");
                         #[cfg(target_os = "espidf")]
                         tokio_freertos_yield().await;
                     }
@@ -607,7 +643,10 @@ async fn event_router_task(
                                 esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT),
                                 pool.free, pool.allocs, pool.frees);
                         }
-                        match tailnet::inject_inbound(payload.as_slice()) {
+                        let w = tm_wg::heapdiag::trace_begin("router: before inject_inbound");
+                        let inj = tailnet::inject_inbound(payload.as_slice());
+                        tm_wg::heapdiag::trace_end(w, "router: after inject_inbound");
+                        match inj {
                             Ok(()) => {}
                             Err(tailnet::TailnetError::NotSupported) => {
                                 // Expected on host builds; nothing to inject into.
@@ -633,10 +672,10 @@ async fn event_router_task(
                                     dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3],
                                     echo.len(), key[0], key[1]);
                                 if let Some(buf) = tm_buf::PktBuf::from_slice(&echo) {
-                                    let _ = wg_tx2.send(WgCmd::SendData {
+                                    forward_or_drop(&wg_tx2, WgCmd::SendData {
                                         dst_key: key,
                                         payload: buf,
-                                    }).await;
+                                    }, "WgCmd::SendData");
                                     #[cfg(target_os = "espidf")]
                                     tokio_freertos_yield().await;
                                 }
@@ -667,15 +706,38 @@ async fn event_router_task(
                         // instead of the placeholder `[0; 4]`.
                         info!("Runtime::join() - DiscoEvent::SendPong -> DERP peer {:02x}{:02x}..", dst_node_key[0], dst_node_key[1]);
                         if let Some(buf) = tm_buf::PktBuf::from_slice(&payload) {
-                            let _ = derp_tx2.send(DerpCmd::SendPacket {
+                            forward_or_drop(&derp_tx2, DerpCmd::SendPacket {
                                 dst_key: NodePublicKey::from_bytes(dst_node_key),
                                 payload: buf,
-                            }).await;
+                            }, "DerpCmd::SendPacket");
                             #[cfg(target_os = "espidf")]
                             tokio_freertos_yield().await;
                         } else {
                             warn!("Runtime::join() - sealed PONG ({} bytes) did not fit tm_buf::PktBuf; dropped", payload.len());
                         }
+                    }
+                    Ok(DiscoEvent::SendPongUdp { dst, payload }) => {
+                        // Step 1 (LAN-direct-path plan): tm_disco can now
+                        // build a PONG addressed to a peer's real observed
+                        // UDP address. There is no UDP socket yet to send it
+                        // on (Step 2 adds the `tokio::net::UdpSocket`
+                        // receive/send loop this plugs into) -- this arm
+                        // exists so the new `DiscoEvent` variant has
+                        // somewhere to go and the router compiles against
+                        // tm_disco's full Step 1 API surface. Until Step 2,
+                        // any UDP-sourced disco is unreachable anyway (no
+                        // socket feeds `DiscoSrc::Udp` into `MaybeDisco`), so
+                        // this drop is inert in practice today.
+                        warn!("Runtime::join() - DiscoEvent::SendPongUdp -> {} ({} bytes) but no UDP socket yet (Step 2 of the LAN-direct-path plan); dropped", dst, payload.len());
+                    }
+                    Ok(DiscoEvent::DirectPathSeen { node_key, addr }) => {
+                        // Step 1: authenticated evidence that this peer has
+                        // a working direct UDP path. Step 4 of the plan
+                        // feeds this into `tm_wg::WgCmd::DirectPathSeen` to
+                        // actually switch WireGuard's send path; that
+                        // command doesn't exist yet, so this is log-only
+                        // plumbing for now.
+                        info!("Runtime::join() - DiscoEvent::DirectPathSeen peer {:02x}{:02x}.. at {} (Step 4 will feed this into tm_wg)", node_key[0], node_key[1], addr);
                     }
                     Ok(DiscoEvent::PingFrom(key)) => {
                         info!("Runtime::join() - DiscoEvent::PingFrom peer {:02x}{:02x}..", key[0], key[1]);
@@ -695,10 +757,10 @@ async fn event_router_task(
                 match pkt {
                     Ok(tailnet::OutboundPacket { dst_ip, data }) => {
                         if let Some((_, dst_key)) = ip_to_key.iter().find(|(ip, _)| *ip == dst_ip) {
-                            let _ = wg_tx2.send(WgCmd::SendData {
+                            forward_or_drop(&wg_tx2, WgCmd::SendData {
                                 dst_key: *dst_key,
                                 payload: data,
-                            }).await;
+                            }, "WgCmd::SendData");
                             #[cfg(target_os = "espidf")]
                             tokio_freertos_yield().await;
                         } else {
@@ -1087,18 +1149,16 @@ impl Runtime {
                                     if !payload.is_empty() && payload[0] == 0x6d {
                                         // DISCO magic prefix (simplified check).
                                         // Buffer forwarded as-is (tm_buf::PktBuf).
-                                        let _ = disco_tx2.send(DiscoCmd::MaybeDisco {
-                                            src_ip:   [0; 4],  // from DERP src
-                                            src_port: 0,
-                                            src_node_key: *src_key.as_bytes(),
+                                        forward_or_drop(&disco_tx2, DiscoCmd::MaybeDisco {
+                                            src: tm_disco::DiscoSrc::Derp { node_key: *src_key.as_bytes() },
                                             data: payload,
-                                        }).await;
+                                        }, "DiscoCmd::MaybeDisco");
                                     } else {
                                         // WireGuard packet, forwarded as-is.
-                                        let _ = wg_tx2.send(WgCmd::InboundPacket {
+                                        forward_or_drop(&wg_tx2, WgCmd::InboundPacket {
                                             src_key: *src_key.as_bytes(),
                                             payload,
-                                        }).await;
+                                        }, "WgCmd::InboundPacket");
                                     }
                                 }
                                 DerpEvent::Connected => {

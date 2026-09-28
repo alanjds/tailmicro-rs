@@ -646,3 +646,73 @@ scratchpad directory, not committed (they duplicate/extend
 `validate_lan_direct.py` for one-off experiments; if a DERP-aware Step 0
 re-run is wanted next, promoting one of them into `tools/wg_validator/`
 properly is the right move, not what was done here under time pressure).
+
+## Step 1 status (2026-09-28): done, host-tested, `tm_wg` unaffected
+
+Implemented in `tm_disco/src/lib.rs` (host-only, no device flashing):
+
+- `encode_derp_relay_src_ipport` generalized into `encode_src_ipport(SocketAddrV4,
+  &mut [u8])`; the DERP-relay form is now a thin wrapper around it
+  (`SocketAddrV4::new(127.3.3.40, region)`), so DERP-relayed PONGs keep
+  byte-identical wire output -- confirmed by the existing
+  `pong_wire_matches_pynacl_reference` test, still green.
+- `MaybeDisco { src_ip, src_port, src_node_key }` replaced with
+  `MaybeDisco { src: DiscoSrc, data }`, where
+  `DiscoSrc { Derp { node_key }, Udp(SocketAddrV4) }` distinguishes which
+  transport a disco datagram arrived on.
+- Over UDP, `process()` now returns (up to two) `DiscoEvent`s instead of
+  one: `SendPongUdp { dst, payload }` (with `src_ipport = dst`, the peer's
+  own observed address, matching real tailscaled's expectation) plus
+  `DirectPathSeen { node_key, addr }`.
+- `AllowPeer([u8; 32])` -> `AllowPeer { disco_key, node_key }`. A UDP PING's
+  claimed node key (plaintext body after `tx_id`: `tx_id(12) ||
+  node_key(32)`) is checked against this pairing; a mismatch drops the
+  packet silently (no PONG). DERP-sourced PINGs skip this check (DERP
+  already authenticates the sender's node key via TLS+relay auth).
+- Bug fix: the 100 ms PONG rate limit is now per `(peer, path)`
+  (`last_pong_derp`/`last_pong_udp` on `PeerRateLimit`) instead of per
+  peer, so tailscaled's back-to-back DERP+UDP probing no longer suppresses
+  the UDP PONG.
+- New cheap pre-decrypt rate limit per UDP source IP
+  (`UDP_DECRYPT_RATE_LIMIT`, 100 ms, `MAX_UDP_RATE_IPS = 8` FIFO-evicted
+  entries), gating the expensive X25519 DH before it ever runs, for UDP
+  disco datagrams only.
+
+Validation (Python-first, per this repo's habit): `tm_disco`'s
+`pong_seal_crosscheck::udp_pong_wire_matches_pynacl_reference` cross-checks
+`build_sealed_pong(..., PongSrc::Udp(192.168.15.139:41641), ...)`
+byte-for-byte against `tools/wg_validator/udp_pong_vector.txt`'s pynacl
+reference (unchanged from the prior round). New `udp_security` test module
+covers the node-key/disco-key mismatch rejection and the per-(peer,path)
+rate-limit fix end to end (self-sealed wire bytes via a test-local disco
+keypair, not the pynacl fixture, since that fixture's `sender_pub` has no
+matching private key available in Rust). `cargo test -p tm_disco`: 8/8
+green (2 new `pong_seal_crosscheck` + `udp_security` groups added to the
+existing `aead_crosscheck`/`framing` suites).
+
+`tm_runtime/src/lib.rs`'s single `AllowPeer` call site (netmap peer loop)
+and both `MaybeDisco` construction sites (the `espidf` event router and the
+host-only `Runtime::spawn` router) were updated to the new field names/
+`DiscoSrc::Derp` wrapping; `DiscoEvent::SendPongUdp` and `DirectPathSeen`
+got new match arms that log and drop (Step 2 wires them to a real UDP
+socket -- there isn't one yet, by design of this round's scope). This round
+ran concurrently with an unrelated heap-fragmentation investigation with
+live uncommitted changes in `tm_runtime`/`tm_wg` (a new `forward_or_drop`
+non-blocking-send helper, `tm_wg::heapdiag`); those were read via `git
+diff` first and edited around, not touched or reverted.
+
+**Gate status**: `cargo test -p tm_disco` is 8/8 green. `cargo check -p
+tm_wg` is clean (untouched by this round). `cargo check -p tm_runtime`
+could **not** be run here at all, on either the pre- or post-change tree:
+`tm_runtime`'s `esp-idf-sys`/`esp-idf-svc` deps are not `cfg`-gated to
+`target_os = "espidf"`, and `esp-idf-sys`'s build script refuses any
+non-espidf target outright (`Error: Unsupported target
+'x86_64-unknown-linux-gnu'`) with no `IDF_PATH`/esp toolchain installed in
+this sandbox -- confirmed pre-existing by reproducing the identical failure
+via `git stash`. This is the same limitation `tm_runtime`'s own test-module
+doc comment already documents. The `tm_runtime` edits were instead verified
+by careful manual diff review against `tm_disco`'s new API (field names,
+enum variants, `PeerInfo::{disco_key,node_key}`) and by confirming no other
+crate in the workspace references the old `MaybeDisco`/`AllowPeer` shapes
+(repo-wide grep). A real espidf toolchain (or a future `cfg`-gate fix) is
+needed to close this gap with an actual compile.
