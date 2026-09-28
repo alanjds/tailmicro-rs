@@ -974,6 +974,151 @@ that window is still unidentified. `tasmolike-rs/sdkconfig.defaults` and
 `src/server.rs` remain uncommitted there (per the standing rule); no
 `tailmicro-rs` code was changed this step, only this log entry.
 
+### Step 7 (2026-09-28): neither hypothesis — the crash is total heap budget (main-task stack + concurrent hyper connections), plus a router deadlock; mostly fixed (30/30 bursts), one residual 8 KiB failure under sustained load
+
+**Context**: Step 6 left two hypotheses for the `drain_recv` collapse:
+(1) `events.send(..).await` resumes the router *inline*, so the "after
+drain_recv" probe already sees `inject_inbound`'s effects; (2) lwIP TCP-RX
+pbuf churn on the tailnet netif, triggered by `inject_inbound`. This step
+tested both on hardware with better tools than block-count probes, and
+followed the data to the actual crash.
+
+**New instrumentation** (`tm_wg/src/heapdiag.rs`, temporary, like
+`heap_probe_blocks`):
+- `trace_begin`/`trace_end`: an ESP-IDF standalone heap trace
+  (`HEAP_TRACE_LEAKS`, 64 records, 6-deep frame-pointer backtraces) around
+  `drain_recv` and around the router's `inject_inbound` call. Prints every
+  allocation made inside the window, from *any* FreeRTOS task, that is still
+  live at its end. A window opened while another is open logs `NESTED` (the
+  proof that the outer one yielded). Behind the new `tm_wg` feature
+  `heap-trace` + `CONFIG_HEAP_TRACING_STANDALONE=y`/`_STACK_DEPTH=6` in the
+  app sdkconfig; off by default (the window then only diffs two snapshots).
+- `send_diag` in `drain_recv`: logs `chan_len_before`, `full_before`, and
+  how many times the send future returned `Pending`.
+- `install_alloc_failed_dump()` (called at router start): on any failed
+  allocation >= 4000 B, prints the whole internal heap as an address-ordered
+  `U<size>`/`[F<size>@addr]` map, from inside the failure itself.
+- `snap()` also prints the main task's stack high-water mark.
+
+**Hypothesis 1: false as stated.** `async_channel::Sender::send` never runs
+the receiver inline. Host test (tokio current-thread, `bounded(2)`, a
+receiver parked in `recv().await`): a send with room returns `Ready` on the
+first poll and the receiver has not run; only a send on a *full* channel
+returns `Pending`, and then the whole executor (router, hyper task,
+everything) runs before it completes. On hardware, 118 of 130 `drain_recv`
+sends had `pendings=0`; the rest were `full_before=true` with 1-5 yields,
+and in those yielded windows the router's `inject_inbound` window opened
+`NESTED` inside `drain_recv`'s. So the "collapse inside `drain_recv`" was
+just heap-wide work by other tasks during a yield (15 of 30 yielded windows
+lost `largest_free`, vs 6 of 68 non-yielded ones — the latter being the
+tcpip/WiFi threads, which preempt at any time regardless of `.await`).
+The heap trace of the biggest window (-5120 `largest_free`): two 1536 B
+`PktBuf::acquire` pool fallbacks, a 1532 B lwIP `pbuf_alloc` from
+`tcp_write` (tcpip thread), 16 B lwIP `sys_timeout`s. Nothing structural.
+
+**Hypothesis 2: small, not the cause.** `inject_inbound` itself costs one
+`PBUF_POOL` pbuf per packet (1532 B, since ESP-IDF's `PBUF_POOL` is
+heap-backed with a fixed buffer size — a 48 B TCP ACK costs 1.5 KB) plus
+~160 B of netconn/mbox on a new connection. Real, but at most ~2 KB, never
+the ~8-16 KB swings. (Follow-up: `PBUF_RAM` sized to the packet would shrink
+this; not done here.)
+
+**What actually fails, from the heap map at 11 crash points** (pre-fix
+build): `total_free` 15-28 KB but no free block >= 8192 (largest 6520-8132,
+plus an unusable 7748 B RTC-RAM block). The big used blocks are the same
+every time, and two stand out:
+- `U57344@0x3fca8bd0` = **the main task's stack** (address equals
+  `pxTaskGetStackStart`; `CONFIG_ESP_MAIN_TASK_STACK_SIZE=55296` in
+  `tasmolike-rs`, a heap allocation at boot). Its high-water mark never went
+  below **19680 B free** across boot, DERP TLS, WG handshakes with both
+  peers and HTTP traffic: ~35.6 KB used, ~19.6 KB of heap reserved for
+  nothing. The 55296 was sized when `RecvOut` (12 KB) lived on that stack;
+  Step 5 moved it (and `DispatchOut`/`WgEndpoint`) to `.bss`.
+- one or two `U8192` = hyper's per-connection buffers. Every h1 connection
+  allocates **two** 8 KiB blocks: `WriteBuf`'s headers
+  `Vec::with_capacity(INIT_BUFFER_SIZE)` at `serve_connection`, then the read
+  buffer's `reserve(8192)` on first read (`hyper-1.9.0/src/proto/h1/io.rs`
+  lines 71/522; `max_buf_size` caps growth, not these). The crash is the
+  second one.
+
+**Fix, step by step, each hardware-verified**:
+1. `CONFIG_ESP_MAIN_TASK_STACK_SIZE` 55296 -> 43008 (`tasmolike-rs`,
+   uncommitted). +12 KB heap; measured stack minimum afterwards 6088-7784 B
+   free. 30 requests at ~1/s: **30/30**, `largest_free` before
+   `serve_connection` >= 26624 (was 9728-18432). But 60 **back-to-back**
+   requests: 6/60, 6 aborts — heap maps now show *two* live `U8192` plus the
+   failing third: the previous connection is still draining (FIN over the
+   DERP tunnel) when the next is accepted, and each spawned connection wants
+   16 KB.
+2. One HTTP connection at a time (`tasmolike-rs/src/server.rs`, uncommitted):
+   a 1-permit `Semaphore` acquired before `accept`, released when the
+   connection task ends; `keep_alive(false)` so an idle client cannot hold
+   the slot; 15 s `timeout` around `serve_connection`. Next connection waits
+   in lwIP's backlog. (Tasmota's own web server is single-client too.)
+3. Surfaced by 2: the **data plane deadlocked** (no crash, no reboot; DERP,
+   WG and HTTP silent while the control plane kept polling). Cause: the
+   router `await`ed `wg_tx2.send(WgCmd::InboundPacket/SendData)` on a full
+   `CHAN_CAP = 2` channel while `WgActor` was blocked in `drain_recv` on a
+   full `WgEvent` channel whose only consumer is the router. Fixed in
+   `tm_runtime`: every packet-carrying router->actor send
+   (`WgCmd::InboundPacket`/`SendData`, `DerpCmd::SendPacket`,
+   `DiscoCmd::MaybeDisco`, both router copies) now goes through
+   `forward_or_drop` (`try_send`; drop + counted warn on `Full`). Packets are
+   droppable; the `PktBuf` returns to the pool. 10 drops in a 60-request
+   back-to-back run, all recovered by TCP. (These edits were swept into
+   commit `7073249` by a concurrent LAN-direct agent's commit; content as
+   described here.)
+4. Diagnostic bug found on the way: dumping the heap map on *every* failed
+   allocation livelocked the device when WiFi dynamic RX buffers (1700 B,
+   routine and recoverable) started failing — hundreds of 5 KB dumps at
+   115200 baud from the wifi task. Now only failures >= 4000 B dump.
+
+**Results** (real ESP32-C3, requests from bospill over DERP,
+`curl /cm?cmnd=Status`), with 1+2+3:
+```
+back-to-back:     58/60   (2 client timeouts, no reset)
+slow soak 6 min:  36/36   (1 req / 10 s)
+final burst:      30/30   back-to-back
+resets: 0   fatal alloc failures: 0   main stack min free: 6088 B
+```
+That run built against a side worktree (at `2f7b548` + these files) because
+the main checkout was briefly unbuildable mid-LAN-direct work. On the final
+build from this repo's main checkout (`7073249` + this commit, with 4, no
+heap tracing): a 30-request burst was 30/30 with 0 resets, but the full soak
+was **not** clean:
+```
+back-to-back:     54/60
+slow soak 6 min:  36/36
+final burst:      29/30
+resets: 1  (t ~ 342 s: "memory allocation of 8192 bytes failed")
+```
+Heap map at that failure: `total_free` 21736, two `U8192` already live (one
+connection's headers buffer + its read buffer), largest free block
+**8100 B** — 92 B short. Router drops so far: 1; no connection timeouts.
+So serializing connections removed the 3x8 KiB case, but a single
+connection's 2x8 KiB still sometimes can't find a contiguous 8 KiB.
+
+**Ruled out / confirmed**: hypothesis 1 (inline resume) ruled out by host
+test and on-device pending counts; the real mechanism is yield-on-full plus
+preemptive FreeRTOS threads. Hypothesis 2 real but ~1.5 KB/packet, not the
+cause. Confirmed: the crash was a heap *budget* problem (12-20 KB of idle
+main-task stack + 16 KB per concurrent hyper connection on a ~100 KB heap),
+not an unidentified allocation in `drain_recv`.
+
+**Honest bottom line**: much improved (from crashing within a few
+back-to-back requests to 1 reset in ~130 requests over ~10 min), but **not
+fixed**: the contiguous-8 KiB margin is still marginal under sustained load
+(largest free 8100 vs 8192 needed at the one failure). Also thin: ~6 KB of stack headroom (a deeper path not
+exercised here, e.g. a WG rekey coinciding with a DERP reconnect, could
+overflow; ESP-IDF catches overflow and resets rather than corrupting) and
+~20 KB heap before `serve_connection`. Two of the three fixes live in
+`tasmolike-rs` (`sdkconfig.defaults`, `src/server.rs`, `Cargo.toml` tokio
+`sync`/`time` features), uncommitted there per the standing rule. Next
+levers, in order of expected yield: shrink hyper's two 8 KiB per-connection
+buffers (or a smaller HTTP server for `/cm`), `PBUF_RAM` sized to the packet
+in `inject_inbound`, trim the main stack further (needs a worst-case
+stack measurement first); strip `heapdiag`/probes once this holds up.
+
 ## Design principle going forward
 
 Fixed-size, same-shape allocations that recur on a hot path should be

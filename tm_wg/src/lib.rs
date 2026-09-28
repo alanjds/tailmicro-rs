@@ -12,6 +12,7 @@
 //! transport endpoint as a Rust [`Endpoint`] enum (no 127.3.3.40 fake-IP hack).
 
 pub mod endpoint;
+pub mod heapdiag;
 // `pub` so the vendored types that appear in `endpoint`'s public signatures
 // (Packet, PeerId, PeerConfig, NodePublicKey, ...) are reachable. These are
 // vendored library types; exposing them is harmless.
@@ -354,9 +355,9 @@ impl WgActor {
         let mut out = self.take_scratch();
         heap_probe_blocks("on_inbound: before recv_one_into");
         self.endpoint().recv_one_into(payload, from, Instant::now(), &mut out);
-        heap_probe_blocks("on_inbound: after recv_one_into, before drain_recv");
+        let w = heapdiag::trace_begin("on_inbound: before drain_recv");
         self.drain_recv(src_key, &out, events).await;
-        heap_probe_blocks("on_inbound: after drain_recv");
+        heapdiag::trace_end(w, "on_inbound: after drain_recv");
         self.return_scratch(out);
     }
 
@@ -424,20 +425,16 @@ impl WgActor {
         // Iterate by reference: moving the ArrayVecs out would reintroduce the
         // multi-KB owning iterator on the stack that boxing `out` removed.
         for pkt in out.to_peer.iter() {
-            let _ = events
-                .send(WgEvent::OutboundPacket {
-                    dst_key,
-                    payload: pkt_to_buf(pkt),
-                })
-                .await;
+            send_diag(events, WgEvent::OutboundPacket {
+                dst_key,
+                payload: pkt_to_buf(pkt),
+            }, "OutboundPacket").await;
         }
         for pkt in out.decrypted.iter() {
-            let _ = events
-                .send(WgEvent::InboundDecrypted {
-                    src_key: dst_key,
-                    payload: pkt_to_buf(pkt),
-                })
-                .await;
+            send_diag(events, WgEvent::InboundDecrypted {
+                src_key: dst_key,
+                payload: pkt_to_buf(pkt),
+            }, "InboundDecrypted").await;
         }
         if out.handshook {
             let _ = events.send(WgEvent::PeerHandshook(dst_key)).await;
@@ -459,6 +456,29 @@ impl WgActor {
     pub fn priority_peer(&self) -> Option<[u8; 32]> {
         self.priority_peer
     }
+}
+
+/// TEMPORARY (ALLOCATIONS.md Step 7): `events.send(ev).await`, but logs
+/// whether the channel was full and how many times the send future returned
+/// `Pending` (i.e. actually yielded to the executor, letting every other
+/// task on this current-thread runtime run before the send completed).
+async fn send_diag(events: &async_channel::Sender<WgEvent>, ev: WgEvent, what: &str) {
+    let full_before = events.is_full();
+    let len_before = events.len();
+    let mut pendings = 0u32;
+    let mut fut = core::pin::pin!(events.send(ev));
+    let _ = core::future::poll_fn(|cx| match core::future::Future::poll(fut.as_mut(), cx) {
+        core::task::Poll::Pending => {
+            pendings += 1;
+            core::task::Poll::Pending
+        }
+        r => r,
+    })
+    .await;
+    tracing::info!(
+        "WgActor send_diag {}: chan_len_before={} full_before={} pendings={}",
+        what, len_before, full_before, pendings
+    );
 }
 
 /// Copy a WireGuard `Packet` (1500-byte capacity) into a pooled channel

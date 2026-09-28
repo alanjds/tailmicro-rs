@@ -5,6 +5,12 @@ version.workspace = true
 # rest of the workspace stays 2021. Mixed editions in one workspace are fine.
 edition = "2024"
 
+[features]
+# ALLOCATIONS.md Step 7: link heapdiag's trace windows against ESP-IDF's
+# standalone heap tracer (needs CONFIG_HEAP_TRACING_STANDALONE=y and
+# CONFIG_HEAP_TRACING_STACK_DEPTH=6 in the app sdkconfig). Off by default.
+heap-trace = []
+
 [dependencies]
 tm_keys.workspace    = true
 tm_buf.workspace = true
