@@ -94,6 +94,22 @@ pub enum Endpoint {
 /// leaves the LAN or changes address (docs/lan-direct-path-plan.md D3).
 pub const DIRECT_TRUST: Duration = Duration::from_millis(6500);
 
+/// How long WireGuard from a peer over DERP keeps our sends to it on DERP,
+/// whatever the direct path's trust says.
+///
+/// tailscaled sends WireGuard *only* to its best UDP address while it trusts
+/// it, and to both that address and DERP once the trust has lapsed
+/// (magicsock `addrForSendLocked`). So WireGuard over DERP from a peer means
+/// the peer does not currently trust the direct path, typically because our
+/// PONGs stopped reaching it. Its UDP copies keep arriving (and would keep
+/// refreshing our trust) even though our datagrams to it are being lost.
+/// Found on hardware in Step 6 (docs/lan-direct-path-plan.md): without this,
+/// a one-way break (peer receives nothing from us over UDP) black-holed every
+/// reply from the device for as long as the break lasted. The UDP copy of a
+/// pair usually lands first on a LAN, hence a hold-off rather than a one-shot
+/// clear. Equal to `DIRECT_TRUST` so it outlasts the peer's heartbeat gaps.
+pub const DERP_HOLDOFF: Duration = DIRECT_TRUST;
+
 /// A LAN path to a peer, proven by authenticated traffic from exactly
 /// `addr`. Sends use it only while `now < trust_until`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,6 +269,8 @@ struct Peer {
     derp: Endpoint,
     /// Optional LAN path, trust-windowed (D3).
     direct: Option<DirectPath>,
+    /// Sends stay on DERP until then; see `DERP_HOLDOFF`.
+    derp_holdoff_until: Option<Instant>,
     session: SessionState,
     handshake: Handshake,
     last_seen_timestamp: Option<crate::vendor::tai64n::TAI64N>,
@@ -269,6 +287,7 @@ impl Peer {
             config,
             derp,
             direct: None,
+            derp_holdoff_until: None,
             session: SessionState::None(Queue::new()),
             handshake: Handshake::None,
             last_seen_timestamp: None,
@@ -578,8 +597,15 @@ impl WgEndpoint {
     /// Where to send to `id` right now: `Some(addr)` for the direct path
     /// while it is trusted, `None` for DERP. One rule for handshakes,
     /// keepalives and data, so they never split across paths.
+    ///
+    /// DERP while a `DERP_HOLDOFF` is running, even if the direct path is
+    /// trusted: the peer itself is not using the direct path then.
     pub fn path_for(&self, id: PeerId, now: Instant) -> Option<SocketAddrV4> {
-        let d = self.peer_direct(id)?;
+        let p = &self.peers[self.peer_index(id)?];
+        if p.derp_holdoff_until.is_some_and(|h| now < h) {
+            return None;
+        }
+        let d = p.direct?;
         (now < d.trust_until).then_some(d.addr)
     }
 
@@ -707,6 +733,23 @@ impl WgEndpoint {
             return;
         };
 
+        // The DERP server vouches for the sender's node key (== its
+        // WireGuard static key), and the only effect is falling back to
+        // DERP, which always delivers. So this needs no decryption first,
+        // and a replayed duplicate counts too (see `DERP_HOLDOFF`).
+        if let Endpoint::Derp { node_key, .. } = &from {
+            let k = NodePublicKey::from_bytes(*node_key);
+            if let Some(idx) = self.peer_index_by_key(&k) {
+                let peer = &mut self.peers[idx];
+                if peer.direct.is_some_and(|d| now < d.trust_until)
+                    && !peer.derp_holdoff_until.is_some_and(|h| now < h)
+                {
+                    tracing::debug!("peer sends over DERP; holding our sends on DERP");
+                }
+                peer.derp_holdoff_until = Some(now + DERP_HOLDOFF);
+            }
+        }
+
         match msg {
             Message::HandshakeInitiation(_) => self.recv_init(raw, now, out),
             Message::HandshakeResponse(_) => self.recv_response(raw, &from, now, out),
@@ -731,9 +774,15 @@ impl WgEndpoint {
         let peer_id = self.peers[idx].id;
         out.peer = Some(peer_id);
 
-        // Replay: reject an initiation whose timestamp is older than the last.
+        // Replay: reject an initiation whose timestamp is not newer than the
+        // last one (WireGuard's rule; wireguard-go `!timestamp.After(last)`).
+        // Equal matters: tailscaled sends each packet over both UDP and DERP
+        // while its direct-path trust has lapsed, so the same initiation
+        // arrives twice. Answering the copy replaced the handshake the peer
+        // was completing with our first response, and its data then failed
+        // to decrypt until it retried (Step 6, docs/lan-direct-path-plan.md).
         if let Some(last) = self.peers[idx].last_seen_timestamp
-            && hs.timestamp < last
+            && hs.timestamp <= last
         {
             tracing::warn!("handshake replay detected");
             return;
@@ -743,8 +792,7 @@ impl WgEndpoint {
         let session_id = self.state.alloc_session(peer_id);
         let peer = &mut self.peers[idx];
         // No roaming on an initiation: it proves nothing about the sender's
-        // address (an initiation seen once can be re-sent from anywhere, and
-        // the replay check above lets an equal timestamp through). The path
+        // address (an initiation seen once can be re-sent from anywhere). The path
         // is adopted when the handshake completes, on the confirming
         // transport packet in recv_transport.
         let pkt = peer.handshake.respond(
@@ -1399,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn derp_sourced_packets_leave_the_direct_path_untouched() {
+    fn derp_sourced_packets_never_create_or_move_the_direct_path() {
         let mut p = pair();
         let t = Instant::now();
         let x = "192.168.15.70:41641";
@@ -1419,6 +1467,65 @@ mod tests {
         handshake(&mut q, &to_a, &to_b, t);
         assert_eq!(q.a.peer_direct(q.a_peer), None);
         assert_eq!(q.b.peer_direct(q.b_peer), None);
+    }
+
+    /// Send-both delivers the same initiation twice (UDP, then DERP). Only
+    /// the first gets a response, so the handshake the peer completes is the
+    /// one we still hold.
+    #[test]
+    fn duplicate_initiation_is_answered_once_and_the_handshake_completes() {
+        let mut p = pair();
+        let t = Instant::now();
+        let init = p.a.initiate(p.a_peer, t, now_unix()).unwrap();
+        let r1 = p.b.recv_one(init.as_slice(), udp("192.168.15.74:41641"), t);
+        assert_eq!(r1.to_peer.len(), 1);
+        let r2 = p.b.recv_one(init.as_slice(), b_derp(&p.a_kp), t);
+        assert_eq!(r2.to_peer.len(), 0, "the duplicate must not replace the pending handshake");
+        let conf = p.a.recv_one(r1.to_peer[0].as_slice(), a_derp(&p.b_kp), t);
+        assert!(conf.handshook);
+        let done = p.b.recv_one(conf.to_peer[0].as_slice(), b_derp(&p.a_kp), t);
+        assert_eq!(done.decrypted.len(), 1, "B decrypts A's confirmation");
+    }
+
+    /// The Step 6 fault: the peer stopped getting our UDP, so its trust
+    /// lapsed and it sends every packet over both UDP and DERP. The UDP copy
+    /// lands first and refreshes our trust; the DERP copy (a replay by then)
+    /// must still keep our sends on DERP for `DERP_HOLDOFF`.
+    #[test]
+    fn wireguard_over_derp_holds_sends_on_derp() {
+        let mut p = pair();
+        let t = Instant::now();
+        let x = "192.168.15.70:41641";
+        let to_b = b_derp(&p.a_kp);
+        handshake(&mut p, &udp(x), &to_b, t);
+        assert_eq!(p.a.path_for(p.a_peer, t), Some(v4(x)));
+
+        // Send-both: the same packet over UDP, then over DERP.
+        let t1 = t + Duration::from_secs(1);
+        let data = b_to_a_data(&mut p, t1);
+        assert_eq!(p.a.recv_one(data.as_slice(), udp(x), t1).decrypted.len(), 1);
+        assert_eq!(p.a.path_for(p.a_peer, t1), Some(v4(x)));
+        assert_eq!(p.a.recv_one(data.as_slice(), a_derp(&p.b_kp), t1).decrypted.len(), 0,
+                   "the DERP copy is a replay");
+        assert_eq!(p.a.path_for(p.a_peer, t1), None, "yet it holds sends on DERP");
+
+        // UDP alone during the hold-off does not lift it.
+        let t2 = t1 + Duration::from_secs(3);
+        let data = b_to_a_data(&mut p, t2);
+        assert_eq!(p.a.recv_one(data.as_slice(), udp(x), t2).decrypted.len(), 1);
+        assert_eq!(p.a.path_for(p.a_peer, t2), None);
+
+        // Once the peer has sent over UDP only for longer than the hold-off
+        // (it trusts the path again), sends go direct again.
+        let t3 = t1 + DERP_HOLDOFF + Duration::from_millis(1);
+        let data = b_to_a_data(&mut p, t3);
+        assert_eq!(p.a.recv_one(data.as_slice(), udp(x), t3).decrypted.len(), 1);
+        assert_eq!(p.a.path_for(p.a_peer, t3), Some(v4(x)));
+
+        // A DERP packet from another node does not hold this peer.
+        let stranger = NodeKeyPair::new();
+        let _ = p.a.recv_one(data.as_slice(), a_derp(&stranger), t3);
+        assert_eq!(p.a.path_for(p.a_peer, t3), Some(v4(x)));
     }
 
     #[test]

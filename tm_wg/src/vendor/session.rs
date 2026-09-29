@@ -288,7 +288,11 @@ impl ReceiveSession {
         // Replay check only AFTER a valid AEAD tag, so a forged counter can't
         // poison the window (RFC 6479).
         if !self.replay.accept(counter) {
-            tracing::warn!(counter, "replay / stale nonce rejected");
+            // debug, not warn: with the LAN direct path a tailscaled peer
+            // whose path trust lapsed sends every packet over both UDP and
+            // DERP, so a duplicate per packet is normal then, and a line per
+            // packet on the blocking UART throttles the data plane.
+            tracing::debug!(counter, "replay / stale nonce rejected");
             return false;
         }
         true
