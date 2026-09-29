@@ -1253,8 +1253,24 @@ Remaining, not heap:
   (LAN-direct plan) or a larger `TCP_WND`/initial cwnd would address;
 - router drops still occur under parallel load (at least 256 in the soak,
   with `CHAN_CAP`=2);
-- the temporary `heap_watch`/`heap-probe` instrumentation in tasmolike-rs
-  `server.rs` should come out once this is accepted.
+- the `heap_watch`/`heap-probe` instrumentation in tasmolike-rs
+  `server.rs` stays, per the decision below.
+
+**Decision (2026-09-29): the instrumentation stays permanently.** The user
+accepted Step 8 and chose to keep all of the following as a standing safety
+net, not a temporary aid to remove "once accepted":
+- tasmolike-rs `heap_watch` (a 250 ms largest-free sampler that dumps a
+  heap map below 10000 B);
+- `heap_probe_at_accept` (per-connection largest/total free, stack
+  high-water mark, live pbuf count);
+- this repo's `heapdiag` (the `ENABLED` gating, the failed-alloc map dump,
+  `dump_heap_map`, `count_pbufs`).
+
+It is cheap: one heap-info call every 250 ms, a heap walk per connection,
+and the per-packet parts are compiled out unless the `heap-trace` feature is
+on. It also catches regressions early. The heap floor is now a number in
+every log instead of something rediscovered after a crash. Later cleanups
+should not remove it without a new explicit decision.
 
 ## Design principle going forward
 
