@@ -144,6 +144,116 @@ fn spawn_wg(
     Box::pin(actor.run(rx, tx))
 }
 
+// ── LAN-direct UDP socket (docs/lan-direct-path-plan.md, Step 2) ─────────────
+//
+// Receive-only at this step: the socket is bound, datagrams are classified
+// and counted, and nothing is answered or forwarded. Nothing publishes our
+// LAN endpoint yet either, so no peer has a reason to send here; the path is
+// inert for real peers until Step 5 wires disco replies, WireGuard ingest and
+// endpoint publishing together (plan D4).
+
+/// The bound LAN socket. A static rather than a `Box`: it lives for the whole
+/// firmware lifetime, and Step 5's router (sends) and the receive task
+/// (receives) both need it, so a shared `&'static` avoids any heap.
+#[cfg(feature = "lan-direct")]
+static LAN_SOCK: std::sync::OnceLock<tm_netstack::UdpSocket> = std::sync::OnceLock::new();
+
+/// Counters for the receive loop; static so they cost no heap and stay
+/// readable from anywhere (e.g. a future status endpoint).
+#[cfg(feature = "lan-direct")]
+pub static LAN_UDP_STATS: tm_netstack::lan_udp::RxStats = tm_netstack::lan_udp::RxStats::new();
+
+/// One heap line at a one-time event (bind), in the same shape as the other
+/// `heap-blocks` probes, at info level so it survives the app's per-target
+/// Info cap. Never called per packet.
+#[cfg(feature = "lan-direct")]
+#[inline(never)]
+fn log_heap_blocks(tag: &str) {
+    #[cfg(target_os = "espidf")]
+    unsafe {
+        let mut info: esp_idf_sys::multi_heap_info_t = core::mem::zeroed();
+        esp_idf_sys::heap_caps_get_info(&mut info, esp_idf_sys::MALLOC_CAP_INTERNAL);
+        info!(
+            "lan-direct heap-blocks [{}]: total_free={} largest_free={} free_blocks={} allocated_blocks={}",
+            tag, info.total_free_bytes, info.largest_free_block, info.free_blocks, info.allocated_blocks,
+        );
+    }
+    #[cfg(not(target_os = "espidf"))]
+    let _ = tag;
+}
+
+/// Bind the LAN UDP socket. Called from `Runtime::build` before any actor
+/// runs, so its lwIP socket/netconn/pcb allocations happen before the DERP
+/// TLS handshake fragments the heap (plan, "RAM/lwIP budget"). Any failure
+/// is a warning and a DERP-only run, never an error (D5).
+#[cfg(feature = "lan-direct")]
+#[inline(never)]
+fn bind_lan_udp() -> Option<&'static tm_netstack::UdpSocket> {
+    log_heap_blocks("before UDP bind");
+    match tm_netstack::lan_udp::bind_lan() {
+        Ok((sock, fallback)) => {
+            let port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+            let sock = LAN_SOCK.get_or_init(|| sock);
+            info!(
+                "lan-direct: UDP socket bound on 0.0.0.0:{}{}; receive-only, endpoint not published",
+                port,
+                if fallback { " (41641 was taken)" } else { "" },
+            );
+            log_heap_blocks("after UDP bind");
+            Some(sock)
+        }
+        Err(e) => {
+            warn!("lan-direct: UDP bind failed ({:?}); running DERP-only", e);
+            None
+        }
+    }
+}
+
+#[cfg(feature = "lan-direct")]
+#[inline(never)]
+fn spawn_udp(sock: &'static tm_netstack::UdpSocket) -> BoxActorFut {
+    Box::pin(udp_rx_task(sock))
+}
+
+/// The receive task. Logs the first datagram of each accepted class once
+/// (the on-device proof that tokio UDP receives at all) and everything else
+/// at `trace!`, plus `rx_loop`'s coarse periodic counter line, so a LAN
+/// flood cannot turn into UART output (ALLOCATIONS.md Step 8, Fix 3).
+#[cfg(feature = "lan-direct")]
+async fn udp_rx_task(sock: &'static tm_netstack::UdpSocket) {
+    use tm_netstack::lan_udp::{rx_buf_static, rx_loop, RxClass};
+    let buf = rx_buf_static();
+    let mut first_disco = true;
+    let mut first_wg = true;
+    let err = rx_loop(sock, &mut buf[..], &LAN_UDP_STATS, |class, src, data| match class {
+        RxClass::Disco => {
+            if first_disco {
+                first_disco = false;
+                info!(
+                    "lan-direct: first UDP disco datagram from {} ({} B, sender disco key {:02x}{:02x}..); not answered at this step",
+                    src, data.len(), data[6], data[7],
+                );
+            } else {
+                trace!("lan-direct: UDP disco {} B from {}", data.len(), src);
+            }
+        }
+        RxClass::WireGuard => {
+            if first_wg {
+                first_wg = false;
+                info!(
+                    "lan-direct: first UDP WireGuard datagram from {} (type {}, {} B); not processed at this step",
+                    src, data[0], data.len(),
+                );
+            } else {
+                trace!("lan-direct: UDP WireGuard type {} {} B from {}", data[0], data.len(), src);
+            }
+        }
+        RxClass::Junk | RxClass::Tailnet => {}
+    })
+    .await;
+    warn!("lan-direct: UDP receive loop stopped ({:?}); direct path off, DERP unaffected", err);
+}
+
 /// Log a received `ControlEvent::Error`. `#[inline(never)]` so its `Debug`
 /// format temporary is not reserved inside `event_router_task`'s frame
 /// alongside every other branch's temporaries (debug build: no stack-slot
@@ -980,6 +1090,13 @@ impl Runtime {
         // this frame -- this is what keeps `join` under the 32 KB main-task
         // stack.
         tracing::debug!("Runtime::join() - preparing actor tasks");
+        // LAN-direct (Step 2): bind before the control actor exists, hence
+        // before the DERP TLS handshake it eventually triggers.
+        #[cfg(feature = "lan-direct")]
+        let udp_task: BoxActorFut = match bind_lan_udp() {
+            Some(sock) => spawn_udp(sock),
+            None => Box::pin(async {}),
+        };
         config.control.connect_timeout = config.connect_timeout;
         let control_task = spawn_control(config.control, config.node_state, ctrl_rx, ctrl_ev_tx);
         log_heap("after ControlActor spawn");
@@ -1008,12 +1125,22 @@ impl Runtime {
         // caller's own generator state -- same off-frame-boxing discipline
         // as every `spawn_*` helper above.
         let driver: Driver = Box::pin(async move {
+            #[cfg(not(feature = "lan-direct"))]
             tokio::join!(
                 control_task,
                 derp_task,
                 disco_task,
                 wg_task,
                 event_router,
+            );
+            #[cfg(feature = "lan-direct")]
+            tokio::join!(
+                control_task,
+                derp_task,
+                disco_task,
+                wg_task,
+                event_router,
+                udp_task,
             );
             tracing::debug!("Runtime - all actor tasks completed");
         });

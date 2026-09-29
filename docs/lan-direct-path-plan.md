@@ -716,3 +716,124 @@ enum variants, `PeerInfo::{disco_key,node_key}`) and by confirming no other
 crate in the workspace references the old `MaybeDisco`/`AllowPeer` shapes
 (repo-wide grep). A real espidf toolchain (or a future `cfg`-gate fix) is
 needed to close this gap with an actual compile.
+
+## Step 2 status (2026-09-29): done, host-tested and verified on the ESP32-C3
+
+Implemented:
+
+- `tm_netstack`: `UdpSocket` is now a real `tokio::net::UdpSocket` on both
+  targets (`bind`/`bind_sync`, `local_addr`, `send_to`, `writable`,
+  `try_send_to`, `recv_from`). `NetError` gained `WouldBlock` and a
+  `From<std::io::Error>`. The demux and receive loop live in the new
+  `tm_netstack::lan_udp`, not in `tm_runtime`, because `tm_runtime` cannot
+  be built on the host (its `esp-idf-sys` dependency is unconditional, see
+  the Step 1 status). It covers `classify()` (a `100.64.0.0/10` source wins
+  over any payload; disco magic plus at least 80 B; WireGuard type 1..=4
+  with an exact or minimum length and zero reserved bytes; everything else
+  is junk), `RxStats` atomics, `bind_lan()` (41641, then port 0),
+  a once-only static receive buffer of `PKT_CAP` bytes, and `rx_loop()`.
+  `rx_loop` logs `udp rx: disco= wg= junk= tailnet= err= (heap ...)` at most
+  every 10 s and only when a counter changed, so a flood cannot saturate the
+  UART (the Step 8 lesson). It backs off 50 ms after a receive error and
+  gives up after 16 consecutive errors.
+- `tm_runtime`, behind the new `lan-direct` feature (off by default; also
+  re-exported as the root crate's `lan-direct`): the socket is bound in
+  `Runtime::build` before `spawn_control`, so before both the control and
+  the DERP TLS handshakes. Heap-block probes run before and after the bind.
+  A boxed `udp_rx_task` runs the loop. Only the first disco and the first
+  WireGuard datagram are logged at info level; the rest go to trace. With
+  the feature off, `tm_runtime` compiles to what it was before.
+- `tools/wg_validator/gen_udp_demux_vectors.py` writes a pynacl-built disco
+  PING (124 B, fixed nonce) and a `wg_spec.build_initiation` message (148 B)
+  as hex vectors. `tools/wg_validator/udp_probe.py` (`probe` mode, and
+  `burst N [SIZE] [PPS]` mode) is the on-device LAN probe.
+
+Deviations from the plan text, stated plainly:
+
+- Disco datagrams are **counted by framing, not decrypted**. The receive
+  task has no disco private key at this step, and decrypting would spend an
+  X25519 DH on each unsolicited LAN datagram. That work belongs to Step 5,
+  where the datagram goes to `tm_disco`, which already has the per-IP
+  pre-decrypt rate limit from Step 1.
+- A `100.64.x.x`-sourced datagram cannot be produced over loopback, so the
+  tailnet-source drop is covered by the `classify` unit tests
+  (`classify_tailnet_source_wins_over_payload`), not by the loopback
+  end-to-end test.
+- `CONFIG_LWIP_UDP_RECVMBOX_SIZE=3` is impossible: its Kconfig range is
+  6..64, and ESP-IDF silently clamped it to 6, which the generated
+  `sdkconfig` confirmed. The wrapper stays at the default of 6. Measured
+  below, 6 is fine. If it ever needs tightening, `CONFIG_LWIP_SO_RCVBUF`
+  plus `SO_RCVBUF` is the lever, not the mbox size.
+- For Step 5, note that tokio's `try_send_to` returns `WouldBlock` until
+  the reactor has seen the socket writable once. The loopback test hit
+  this. The send path must `await writable()` once after bind (or poll
+  `send_to` once), or the first PONGs and WireGuard replies are silently
+  counted as drops.
+
+**`MAX_UDP_PCB` bump: not needed.** The wrapper's
+`CONFIG_LWIP_MAX_UDP_PCB=4` is not a real Kconfig symbol, so ESP-IDF ignores
+it. The real symbol is `CONFIG_LWIP_MAX_UDP_PCBS`, which is effectively 16.
+The same misspelling pattern affects the wrapper's `NUM_TCP_PCB` (real:
+`LWIP_MAX_ACTIVE_TCP`, 16), `MAX_LISTENING_PCB` (real:
+`LWIP_MAX_LISTENING_TCP`, 16) and `MAX_RAW_PCB` (real: `LWIP_MAX_RAW_PCBS`,
+16). Those lines have never had any effect; that is worth a separate cleanup
+in the wrapper. The bind on the device succeeded on 41641 on every boot.
+
+Host validation: `cargo test -p tm_netstack` passes 5/5:
+`classify_real_vectors`, `classify_tailnet_source_wins_over_payload`,
+`classify_junk`, `try_send_to_never_blocks_and_reports_the_bound_port`, and
+`rx_loop_demuxes_over_loopback`. The last one sends the real PING, the real
+init, junk, an oversize datagram and a second PING, and asserts disco=2
+wg=1 junk=2.
+
+Device validation (ESP32-C3, wrapper built with `tm_runtime/lan-direct`,
+endpoint not published, LAN IP 192.168.15.74). This is also the first real
+espidf compile of `tm_runtime` since the Step 1 router edits, which closes
+the gap that section left open.
+
+- Bind: `lan-direct: UDP socket bound on 0.0.0.0:41641`, before the control
+  Noise handshake. It cost 448-456 B of heap and 7 allocations, and the
+  largest free block did not change (94208 before and after). This was
+  identical across 3 boots.
+- `udp_probe.py probe` (1 PING, 1 WG init, 1 junk): the device logged the
+  first disco datagram (124 B, from 192.168.15.70) and the first WireGuard
+  datagram (type 1, 148 B), then `udp rx: disco=1 wg=1 junk=1 tailnet=0
+  err=0`, an exact match.
+- Bursts of 1000 datagrams of 1400 B each, with the tailnet up (DERP
+  connected, both peers handshook):
+  - unpaced (about 93k pps from the host): 6 arrived, and the rest were
+    dropped before the socket, by the WiFi or lwIP layers;
+  - 200 pps: 964/1000 counted;
+  - 1000 pps: 525/1000 counted.
+
+  Across all bursts: zero `ALLOC FAILED`, zero resets, zero receive errors,
+  and the loop never stopped. The `heap-watch` minimum of largest-free
+  during the 1000 pps burst was 22528 B, with 36344 B total free. That is
+  1 KB below the 23552 B the same boot reached during its DERP TLS
+  handshake. It recovered to 27648 B right after. The `udp rx` heap sample
+  after each burst was back at its baseline (27648 largest, about 43.4 KB
+  total). So the recvmbox/WiFi-RX transient is real but small, and bounded
+  by the mbox of 6.
+- Tailnet HTTP (`curl http://<tailnet-ip>/cm?cmnd=Status` over DERP)
+  returned 200 before, between and after the bursts.
+
+A/B heap cost, lan-direct OFF against ON, same tree, clean boots with no
+probe traffic, two boots each. The numbers were reproducible within about
+50 B.
+
+| Checkpoint | OFF | ON | Delta |
+|---|---|---|---|
+| Heap after loading keys | 115248-115268 | 113600 | -1.65 KB (the static RX buffer in `.bss` shrinks the heap region) |
+| Heap after device connect | 62208 | 59388-59412 | -2.8 KB |
+| DERP `before tls.open`, total free | 48048-48188 | 45092-45144 | -3.0 KB |
+| DERP `before tls.open`, largest free | 36864 | 34816 | -2 KB |
+
+So "no heap regression in the DERP TLS numbers" is **not strictly met**.
+There is a steady cost of about 3 KB total and 2 KB of largest block going
+into the DERP handshake. That is close to the plan's 2-2.5 KB estimate,
+and the handshake completed on every boot. The first ON boot, which had
+probe traffic arriving during bring-up, showed a worse snapshot (41600 total
+and 30720 largest before `tls.open`), which did not reproduce on clean
+boots. Step 5 adds to this budget (the `DirectPath` state, the send path),
+so it should be flashed with the heap probes on and compared against these
+numbers.

@@ -94,6 +94,10 @@ edition.workspace = true
 license.workspace = true
 description = "Tailscale client optimised for ESP32-C3 (400KB SRAM, no PSRAM)"
 
+[features]
+# Pass-through for tm_runtime's LAN-only direct UDP path (off by default).
+lan-direct = ["tm_runtime/lan-direct"]
+
 [dependencies]
 tm_runtime.workspace   = true
 tm_keys.workspace      = true

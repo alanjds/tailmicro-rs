@@ -3,6 +3,13 @@ name = "tm_runtime"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# LAN-only direct UDP path (docs/lan-direct-path-plan.md, D5). Off by default:
+# with it off there is no UDP socket, no receive task, and nothing about the
+# control-plane publish or the data plane changes. Enable from the app's
+# Cargo.toml (`tm_runtime = { ..., features = ["lan-direct"] }`).
+lan-direct = []
+
 [dependencies]
 tm_control.workspace = true
 tm_derp.workspace    = true

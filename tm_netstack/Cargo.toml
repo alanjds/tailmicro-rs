@@ -15,10 +15,13 @@ bindings_header = "include/lwip_tcpip_extra.h"
 
 [dependencies]
 tm_buf.workspace = true
-tokio = { workspace = true, features = ["net", "io-util"] }
+tokio = { workspace = true, features = ["net", "io-util", "time", "macros"] }
 heapless = { workspace = true }
 async-channel = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time", "macros", "rt"] }
 
 [target.'cfg(target_os = "espidf")'.dependencies]
 esp-idf-sys = { workspace = true }
