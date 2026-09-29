@@ -984,3 +984,258 @@ forwarding `DirectPathSeen`, routing `via` to the socket, flipping
   `tm_wg` (`Via::Udp`). The `tm_buf` pool is 4 buffers, so the copy out of
   the static RX buffer should use `PktBuf::from_slice`, and a WireGuard
   flood must be dropped with `forward_or_drop` rather than awaited.
+
+## Step 5 status (2026-09-29): done, landed as one D4 commit plus two follow-ups
+
+Commits on `wg-dispatch-scratch` (not pushed):
+
+- `4aeb646` `tm_wg`: DERP hold-off and a strict initiation replay check.
+  Both were found on hardware in Step 6. They only matter once a direct
+  path exists.
+- `44c5a83` Step 5 proper (D4). UDP PONG, UDP WireGuard ingest, `via`
+  routing and `PUBLISH_LAN_ENDPOINT = true` land together.
+- `c7afc96` disco PINGs may take the second-to-last pool buffer (Step 6
+  soak finding).
+
+What Step 5 wires (all in `event_router_task`; the host-only
+`Runtime::spawn` router stays DERP-only):
+
+- `udp_rx_task` primes the socket with `writable().await` before its first
+  receive. It then copies each accepted datagram with
+  `PktBuf::from_slice` and hands it on with `forward_or_drop`:
+  - disco goes to `DiscoCmd::MaybeDisco { src: DiscoSrc::Udp }`;
+  - WireGuard goes to `WgCmd::InboundPacket { via: Via::Udp }`.
+- Pool floor. There is no fresh heap allocation per datagram.
+  - A WireGuard datagram is dropped, and counted as `pool_drop`, when
+    fewer than 2 of the 4 pool buffers are free.
+  - A disco datagram is dropped only when none is free. It is also
+    counted separately as `pool_drop (disco N)`.
+  - So a LAN flood can neither force the ~1.5 KB heap fallback nor starve
+    DERP.
+- `OutboundPacket { via: Some(addr) }` calls `try_send_to`. On any error
+  the same buffer goes to `DerpCmd::SendPacket`. The hardware runs had
+  `fallback=0` throughout.
+- `SendPongUdp` goes out on the socket. `via: None` goes to DERP as before.
+- `tm_control` publishes `LAN_IP:41641` in the Step 7.6 re-publish. It
+  only has an effect when the feature is on and the bind succeeded.
+- Counters: a periodic `udp rx:` line reports `tx: wg/fallback/pong/
+  pong_err` and `pool_drop`. Path changes log once per change, as
+  `OutboundPacket via udp <addr>` or `via DERP again`, never per packet.
+
+**Deviation from D3(a), deliberate.** `DiscoEvent::DirectPathSeen` (a
+received PING) is logged but not forwarded to `WgCmd::DirectPathSeen`
+(`DISCO_PING_SETS_SEND_PATH = false`).
+
+- A PING is one-way evidence: it proves the peer can reach us, not that we
+  can reach it. tailscaled keeps pinging our endpoint about every 3 s while
+  it has traffic.
+- With (a) on (build B below), a blocked return path left the device
+  sending into it for the whole outage.
+- The send path is now adopted only from authenticated WireGuard received
+  over UDP (D3(b)). That is also how tailscaled itself behaves: it adopts
+  a path only on a PONG to its own PING.
+
+**Two `tm_wg` fixes that D3 did not anticipate** (commit `4aeb646`).
+Both come from one tailscaled behaviour: once its bestAddr trust lapses,
+it sends every WireGuard packet over BOTH UDP and DERP
+(`addrForSendLocked`).
+
+- *DERP hold-off* (`DERP_HOLDOFF = DIRECT_TRUST = 6.5 s`).
+  - The problem: in send-both mode, UDP copies kept arriving and kept
+    refreshing our direct trust while our own UDP transmits were being
+    lost (build C: black hole).
+  - The fix: any WireGuard message from a peer arriving over DERP now
+    holds our sends to that peer on DERP for 6.5 s. It needs no decrypt,
+    and replays count. A DERP arrival means the peer itself no longer
+    trusts the direct path.
+- *Strict initiation replay check.* `recv_init` now rejects
+  `timestamp <= last`, as wireguard-go does with
+  `!timestamp.After(last)`. Before this it rejected only `<`.
+  - The problem: under send-both, each initiation arrives twice. Both
+    copies were answered, and the second answer replaced the pending
+    handshake. That forced a re-handshake, seen as a 16-45 s curl outage
+    in build D.
+  - The regression test is
+    `duplicate_initiation_is_answered_once_and_the_handshake_completes`.
+    It fails on the old `<`.
+- The per-packet "replay / stale nonce rejected" log moved from `warn` to
+  `debug`. Send-both makes it fire once per duplicate, and UART output
+  throttled the data plane.
+
+**Test-only feature `lan-direct-fault-test`.**
+
+- It makes the device silently drop its own direct UDP transmits for 60 s
+  of every 300 s, counted from the first direct send, while still
+  receiving.
+- From the peer's side this is the same as `iptables -I INPUT -p udp
+  --sport 41641 -j DROP` on the peer. This host has no `sudo`, so that
+  rule could not be used here.
+- Never enable it in a shipped build.
+
+Host tests: tm_wg 34/34, tm_control 15/15, tm_netstack 5/5, tm_disco 8/8.
+`tm_runtime` cannot be built for the host in this checkout
+(`esp-idf-sys`), so it was verified by the wrapper firmware build with the
+feature on and off.
+
+## Step 6 status (2026-09-29): all five criteria exercised on the ESP32-C3; 4 only partly
+
+The rig:
+
+- Device: ESP32-C3 (`esp32c3`, 192.168.15.74) running the wrapper firmware
+  with `tm_runtime/lan-direct` enabled for the test builds only. The
+  wrapper's `Cargo.toml` was restored afterwards.
+- Real tailscaled peers on the same WiFi:
+  - `bospill`, 192.168.15.70, node `b781..`: the host all measurements
+    were taken from.
+  - `lenovopill`, 192.168.15.139, node `0e63..`.
+  - the phone `alanjds-s25`, 192.168.15.158, node `959c..`, which joined
+    the WiFi late in the session.
+- Observer: once per iteration (about every 2 s), bospill recorded
+  `tailscale status` for esp32c3 plus `curl --max-time 3
+  /cm?cmnd=status+2`.
+- A rootless extra tailscaled peer, used as a fault harness, was
+  considered and not used. Registering new nodes was out of bounds. Fault
+  injection is device-side instead (see Step 5).
+
+Builds, in order:
+
+| build | what changed | result |
+|---|---|---|
+| A | Step 5 as planned (D3(a) on) | criterion 1 passes |
+| B | fault test, D3(a) on | black hole for each whole 60 s block, curl 0/14 both times |
+| C | D3(a) off | still black-holed (peer send-both keeps UDP arriving); one block recovered at 37 s, the next never |
+| D | + DERP hold-off | device back on DERP in 4.7 s / 5.2 s, but 16-45 s curl outages from double-answered initiations |
+| E | + strict init replay | fallback works; see criterion 2 |
+| F | final code minus `c7afc96`, no fault | 13 min with curl, then 4.5 h idle |
+| G | final code (`c7afc96`), no fault | 47 min soak, 3 LAN peers with traffic |
+| H | feature OFF (DERP-only) | same-load baseline for G |
+
+**1. Direct path from a real peer: PASS, from all three LAN peers.**
+
+- bospill (build A):
+  - The endpoint was published about 20 s after boot. bospill PINGed over
+    UDP, got a PONG, and moved its WireGuard to UDP about 2 s later.
+  - `tailscale status` showed `active; direct 192.168.15.74:41641`.
+  - `tailscale ping esp32c3` returned `pong ... via 192.168.15.74:41641
+    in 201ms`. `--icmp` answered in 234 ms. `--tsmp` did not answer, as
+    expected: TSMP was never implemented (wg-dataplane-notes).
+  - curl returned 200 three times out of three.
+  - Serial showed `OutboundPacket via udp 192.168.15.70:41641`.
+  - Builds F and G confirmed it again (ping via 192.168.15.74:41641 in
+    292-430 ms, `direct` in status).
+- lenovopill: when it had curl traffic, the device sent to
+  192.168.15.139:41641. bospill's status also showed lenovopill direct at
+  that LAN address. A disco-only `tailscale ping` loop from lenovopill did
+  not move the device's send path, as designed, because only
+  authenticated WireGuard does.
+- Phone:
+  - Earlier in the session it was on cellular: `tailscale ping` went via
+    a carrier IPv6 address. That was the "before" field report, where the
+    phone on the same WiFi still went via DERP.
+  - Once it was on the WiFi and generating traffic, the device adopted
+    192.168.15.158:45230 and logged `OutboundPacket via udp
+    192.168.15.158:45230`.
+  - The user confirmed on the phone that the Tailscale app shows esp32c3
+    with its direct IP, not DERP, and that HTTP and ping work from it.
+
+**2. Fallback when the direct path breaks: PASS, with DERP-quality service
+during the outage.** Build E, two 60 s blocks:
+
+- The device stopped sending direct 4.5 s and 1.5 s after the block
+  started (hold-off triggered by the peer's DERP copies). The peer showed
+  `relay "sao"` within about 3-8 s.
+- The device went back to direct 7.2 s after each block was lifted.
+- curl over the relay:
+  - Block 1: 7 of 20 failed. 2 failed in the switch-over itself. 2
+    failed around a routine 120 s rekey that completed over DERP (the
+    duplicate initiation was rejected, as intended). 3 were isolated
+    3 s timeouts.
+  - Block 2: 1 of 22 failed.
+  - Outside the blocks: 6 of 256 failed.
+  - Relay median latency was 1.6 s, against 1.0 s direct.
+- There was no black hole and no re-handshake storm. Compare builds B-D,
+  where each block was a near-total outage.
+
+**3. Remote peer unaffected: PASS.** While the phone was on cellular, it
+handshook with the device over DERP on every boot and kept working. An
+off-LAN peer has no route to 192.168.15.74, so it never gets a UDP PONG
+and stays on DERP.
+
+**4. Device IP change: re-publish shown, the IP change itself NOT
+tested.** The endpoint is recomputed from the control socket's local
+address on every control (re)connect, in the Step 7.6 re-publish. Two
+natural control reconnects (build C at 335 s, build F at 4 h 28 min)
+each logged `publishing LAN endpoint 192.168.15.74:41641` again. Peer
+PINGs and PONGs resumed afterwards. Forcing a DHCP change needs router
+access this session did not have. The expected path is that lwIP aborts
+TCP connections on an address change, control reconnects, and the new IP
+is published. That path is reasoned, not observed.
+
+**5. Soak: PASS on heap. Throughput under heavy multi-client load is
+limited by the device, not by this feature.**
+
+Build F: 4.5 h, the first 13 min with bospill curl, then idle apart from
+peer keepalives.
+
+| window | largest_free (median) | total_free (median) |
+|---|---|---|
+| each 30 min slice to 4 h | 28672 | 42656 |
+
+- The heap was flat for 4 h.
+- After the control reconnect at 4 h 28 min, largest_free settled at
+  20480 (a transient low of 15872 during the Noise handshake). That is
+  the control path, not UDP.
+- DERP stayed up and there were no resets.
+
+Build G: 47 min. bospill curl ran throughout. From about 15 min on,
+lenovopill also ran curl every 5 s and the phone ran ping every 2 s plus
+HTTP every 5 s.
+
+- Heap: each 10 min slice had a largest_free median of 24576 (minimum
+  21504) and a total_free median of about 38.5K. The heap-watch floor was
+  17408, set once at 14 min. There was no downward trend, no ALLOC
+  FAILED, and no reset.
+- Counters at 47 min:
+  - rx: disco 2678, wg 6967.
+  - pool_drop 925, of which disco 78.
+  - tx: wg 5622, pong 2599, fallback 0, pong_err 0.
+- WireGuard pool drops were about 13% under three concurrent clients.
+  TCP recovers them, but they cost latency.
+- Spontaneous direct-to-DERP flaps for bospill:
+  - Build F (before `c7afc96`): 3 in 13 min. Each lined up with a 10 s
+    window where PINGs arrived and no PONG left, while `pool_drop`
+    climbed.
+  - Build G: 2 in 47 min, and those under three times the load.
+- lenovopill and the phone logged more `via DERP again` lines. Their
+  5-second request cadence lets the 6.5 s trust window lapse between
+  requests. That is the designed behaviour.
+
+Same-load comparison, bospill curl with a 3 s timeout while all three
+peers' loops ran:
+
+| build | path | curl failed | 200 median / p90 |
+|---|---|---|---|
+| G, lan-direct | direct | 322 / 638 (50%) | 1.55 s / 2.59 s |
+| H, feature off | relay "sao" | 113 / 167 (68%) | 1.89 s / 2.94 s |
+
+The high failure rate in both is the device's HTTP server being saturated
+by three clients, not the path. With bospill alone (G's first 15 min,
+F), failures were about 1-2%. lan-direct did better than DERP-only under
+the same load. Build H's heap was comparable: largest_free median 25600,
+total_free median 42616.
+
+**Bottom line.**
+
+- The direct path works with real tailscaled peers (desktop, laptop and
+  Android).
+- Fallback is bounded by the 6.5 s trust window, and DERP remains the
+  floor.
+- Heap is flat over 4.5 h.
+- DERP-only behaviour is unchanged with the feature off.
+
+Remaining caveats before calling it shipped:
+
+- The IP-change case (criterion 4) is only reasoned.
+- WireGuard `pool_drop` is about 13% under heavy concurrent load. It
+  could be tuned by revisiting the 2-buffer floor or `POOL_N`.
+- A few extra 3 s curl timeouts happen during a real path break.
