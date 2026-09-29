@@ -658,7 +658,7 @@ impl LatState {
             let (iters, yield_us, yield_max) = tm_buf::lat::take_router_stats();
             info!(
                 "lat router: {} iters in {} ms, blocked in vTaskDelay {} ms ({}%), max yield {} ms",
-                iters, dt / 1000, yield_us / 1000, yield_us * 100 / dt as u64, yield_max / 1000,
+                iters, dt / 1000, yield_us / 1000, yield_us as u64 * 100 / dt as u64, yield_max / 1000,
             );
         }
     }

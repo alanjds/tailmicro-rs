@@ -60,7 +60,7 @@ const N: usize = Hop::UdpTxPong as usize + 1;
 #[cfg(feature = "latency-trace")]
 mod imp {
     use super::N;
-    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::OnceLock;
     use std::time::Instant;
 
@@ -70,9 +70,10 @@ mod imp {
     static BASE: OnceLock<Instant> = OnceLock::new();
 
     /// Router loop accounting: iterations, and total / max microseconds the
-    /// executor spent blocked in the FreeRTOS yield.
+    /// executor spent blocked in the FreeRTOS yield. No 64-bit atomics on
+    /// riscv32imc; a 10 s window of microseconds fits in 32 bits.
     pub static ROUTER_ITERS: AtomicU32 = AtomicU32::new(0);
-    pub static YIELD_US: AtomicU64 = AtomicU64::new(0);
+    pub static YIELD_US: AtomicU32 = AtomicU32::new(0); // < 72 min per window
     pub static YIELD_MAX_US: AtomicU32 = AtomicU32::new(0);
 
     pub fn now_us() -> u32 {
@@ -114,7 +115,7 @@ pub fn note_yield(us: u32) {
     #[cfg(feature = "latency-trace")]
     {
         use std::sync::atomic::Ordering::Relaxed;
-        imp::YIELD_US.fetch_add(us as u64, Relaxed);
+        imp::YIELD_US.fetch_add(us, Relaxed);
         imp::YIELD_MAX_US.fetch_max(us, Relaxed);
     }
     #[cfg(not(feature = "latency-trace"))]
@@ -130,7 +131,7 @@ pub fn note_router_iter() {
 
 /// Take (and reset) the router counters: (iterations, total yield µs, max
 /// single yield µs).
-pub fn take_router_stats() -> (u32, u64, u32) {
+pub fn take_router_stats() -> (u32, u32, u32) {
     #[cfg(feature = "latency-trace")]
     {
         use std::sync::atomic::Ordering::Relaxed;
