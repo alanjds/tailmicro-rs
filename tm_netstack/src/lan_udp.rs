@@ -119,6 +119,16 @@ pub struct RxStats {
     pub junk: AtomicU32,
     pub tailnet: AtomicU32,
     pub errors: AtomicU32,
+    /// Accepted datagrams dropped before reaching an actor because the
+    /// shared packet pool was (nearly) empty; see `tm_runtime`'s UDP task.
+    pub pool_drops: AtomicU32,
+    /// WireGuard datagrams sent directly over this socket (Step 5).
+    pub tx_wg: AtomicU32,
+    /// WireGuard datagrams whose direct send failed and went to DERP instead.
+    pub tx_fallback: AtomicU32,
+    /// Disco PONGs sent over this socket, and ones whose send failed.
+    pub tx_pong: AtomicU32,
+    pub tx_pong_err: AtomicU32,
 }
 
 /// A plain copy of [`RxStats`] at one moment.
@@ -129,6 +139,11 @@ pub struct RxSnapshot {
     pub junk: u32,
     pub tailnet: u32,
     pub errors: u32,
+    pub pool_drops: u32,
+    pub tx_wg: u32,
+    pub tx_fallback: u32,
+    pub tx_pong: u32,
+    pub tx_pong_err: u32,
 }
 
 impl RxStats {
@@ -139,6 +154,11 @@ impl RxStats {
             junk: AtomicU32::new(0),
             tailnet: AtomicU32::new(0),
             errors: AtomicU32::new(0),
+            pool_drops: AtomicU32::new(0),
+            tx_wg: AtomicU32::new(0),
+            tx_fallback: AtomicU32::new(0),
+            tx_pong: AtomicU32::new(0),
+            tx_pong_err: AtomicU32::new(0),
         }
     }
 
@@ -149,6 +169,11 @@ impl RxStats {
             junk: self.junk.load(Ordering::Relaxed),
             tailnet: self.tailnet.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
+            pool_drops: self.pool_drops.load(Ordering::Relaxed),
+            tx_wg: self.tx_wg.load(Ordering::Relaxed),
+            tx_fallback: self.tx_fallback.load(Ordering::Relaxed),
+            tx_pong: self.tx_pong.load(Ordering::Relaxed),
+            tx_pong_err: self.tx_pong_err.load(Ordering::Relaxed),
         }
     }
 
@@ -259,8 +284,9 @@ fn log_summary(s: RxSnapshot) {
     #[cfg(not(target_os = "espidf"))]
     let (largest, total) = (0usize, 0usize);
     log::info!(
-        "udp rx: disco={} wg={} junk={} tailnet={} err={} (heap largest_free={} total_free={})",
-        s.disco, s.wireguard, s.junk, s.tailnet, s.errors, largest, total,
+        "udp rx: disco={} wg={} junk={} tailnet={} err={} pool_drop={} | tx: wg={} fallback={} pong={} pong_err={} (heap largest_free={} total_free={})",
+        s.disco, s.wireguard, s.junk, s.tailnet, s.errors, s.pool_drops,
+        s.tx_wg, s.tx_fallback, s.tx_pong, s.tx_pong_err, largest, total,
     );
 }
 
@@ -362,7 +388,7 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_millis(300), run).await;
 
         let s = stats.snapshot();
-        assert_eq!(s, RxSnapshot { disco: 2, wireguard: 1, junk: 2, tailnet: 0, errors: 0 });
+        assert_eq!(s, RxSnapshot { disco: 2, wireguard: 1, junk: 2, ..Default::default() });
         let seen = seen.borrow();
         assert_eq!(
             *seen,

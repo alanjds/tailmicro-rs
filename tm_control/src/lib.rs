@@ -270,11 +270,13 @@ pub fn select_home_region<const P: usize, const R: usize>(
 /// recipe in tools/wg_validator/validate_live_tailnet.py.
 pub const DERP_MAGIC_IP: &str = "127.3.3.40";
 
-/// Off until Step 5 of docs/lan-direct-path-plan.md (D4): once published,
+/// On since Step 5 of docs/lan-direct-path-plan.md (D4): once published,
 /// peers start sending disco PINGs and WireGuard to the LAN endpoint, so it
-/// must only go out together with the UDP PONG and UDP WireGuard ingest.
-/// While off, publish #2 is byte-identical to the DERP-only body.
-const PUBLISH_LAN_ENDPOINT: bool = false;
+/// went out in the same change as the UDP PONG and UDP WireGuard ingest.
+/// It only has an effect when `Config::lan_udp_port` is `Some`, which
+/// `tm_runtime` sets only with its `lan-direct` feature on and the socket
+/// bound; otherwise publish #2 is byte-identical to the DERP-only body.
+const PUBLISH_LAN_ENDPOINT: bool = true;
 
 /// Plan D1: the LAN endpoint is the IPv4 address the control TCP socket is
 /// bound to (the OS already picked the LAN-facing interface to reach the
@@ -1247,10 +1249,15 @@ mod tests {
         assert_eq!(new.as_slice(), old.as_slice());
     }
 
-    /// Step 5 flips this deliberately; until then nothing may leak out.
+    /// Step 5 turned this on together with UDP PONG and UDP WireGuard
+    /// ingest (D4). Publishing still needs a bound port: with none (feature
+    /// off, or bind failed) the endpoint cannot leak into the body.
     #[test]
-    fn lan_endpoint_publishing_is_still_off() {
-        assert!(!PUBLISH_LAN_ENDPOINT);
+    fn lan_endpoint_published_only_with_a_bound_port() {
+        assert!(PUBLISH_LAN_ENDPOINT);
+        let no_port: Option<u16> = None;
+        let ep = no_port.and_then(|p| lan_endpoint("192.168.15.20:50000".parse().unwrap(), p));
+        assert_eq!(ep, None);
     }
 
     #[test]

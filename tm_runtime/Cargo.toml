@@ -9,6 +9,11 @@ edition.workspace = true
 # control-plane publish or the data plane changes. Enable from the app's
 # Cargo.toml (`tm_runtime = { ..., features = ["lan-direct"] }`).
 lan-direct = []
+# TEST ONLY (docs/lan-direct-path-plan.md, Step 6.2): periodically drop every
+# datagram the device sends over the LAN socket, as a peer-side
+# `iptables -I INPUT -p udp --sport 41641 -j DROP` would, while still
+# receiving. Never enable in a shipped build.
+lan-direct-fault-test = ["lan-direct"]
 
 [dependencies]
 tm_control.workspace = true

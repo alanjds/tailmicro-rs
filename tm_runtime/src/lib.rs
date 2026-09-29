@@ -144,24 +144,50 @@ fn spawn_wg(
     Box::pin(actor.run(rx, tx))
 }
 
-// ── LAN-direct UDP socket (docs/lan-direct-path-plan.md, Step 2) ─────────────
+// ── LAN-direct UDP socket (docs/lan-direct-path-plan.md, Steps 2 and 5) ─────
 //
-// Receive-only at this step: the socket is bound, datagrams are classified
-// and counted, and nothing is answered or forwarded. Nothing publishes our
-// LAN endpoint yet either, so no peer has a reason to send here; the path is
-// inert for real peers until Step 5 wires disco replies, WireGuard ingest and
-// endpoint publishing together (plan D4).
+// Step 5 wires the whole path at once, as plan D4 requires: UDP disco goes to
+// tm_disco (which answers PINGs with UDP PONGs), UDP WireGuard goes to tm_wg,
+// tm_wg's `via: Some(addr)` sends leave through this socket (DERP on any
+// error), and tm_control publishes our LAN endpoint. Answering PONGs without
+// ingesting UDP WireGuard would black-hole every LAN peer that switches over,
+// so none of these may exist without the others.
 
 /// The bound LAN socket. A static rather than a `Box`: it lives for the whole
-/// firmware lifetime, and Step 5's router (sends) and the receive task
-/// (receives) both need it, so a shared `&'static` avoids any heap.
+/// firmware lifetime, and the router (sends) and the receive task (receives)
+/// both need it, so a shared `&'static` avoids any heap.
 #[cfg(feature = "lan-direct")]
 static LAN_SOCK: std::sync::OnceLock<tm_netstack::UdpSocket> = std::sync::OnceLock::new();
 
-/// Counters for the receive loop; static so they cost no heap and stay
-/// readable from anywhere (e.g. a future status endpoint).
+/// Counters for the receive loop and the router's direct sends; static so
+/// they cost no heap and stay readable from anywhere (e.g. a status endpoint).
 #[cfg(feature = "lan-direct")]
 pub static LAN_UDP_STATS: tm_netstack::lan_udp::RxStats = tm_netstack::lan_udp::RxStats::new();
+
+/// Whether an authenticated UDP disco PING (tm_disco's `DirectPathSeen`) is
+/// allowed to point tm_wg's *sends* at the PING's source address. Off.
+///
+/// Plan D3(a) said yes. But a PING proves only that the peer reaches us, not
+/// that we reach the peer; tailscaled itself (and MicroLink,
+/// ml_wg_mgr.c `process_disco_pong`) adopts a path only on a PONG to its own
+/// PING. Measured on hardware in Step 6: with this on, a one-way break (the
+/// peer receives nothing we send over UDP) kept the device sending into the
+/// break for the whole fault, because the peer re-probes our endpoint every
+/// ~3 s while it has traffic. See the plan's Step 5/6 status.
+///
+/// tm_wg instead adopts a direct path from authenticated WireGuard received
+/// over UDP (D3(b)), and holds sends on DERP while the peer is itself
+/// sending over DERP (`tm_wg::endpoint::DERP_HOLDOFF`).
+#[cfg(feature = "lan-direct")]
+const DISCO_PING_SETS_SEND_PATH: bool = false;
+
+/// Minimum free `tm_buf` pool buffers for the UDP task to take one. The pool
+/// is shared with DERP receive and the tailnet netif (4 buffers), and
+/// `PktBuf::acquire` falls back to a ~1.5 KB heap allocation when it is
+/// empty. Any LAN host can send to this socket, so it must neither cause
+/// that heap churn nor take the last buffer from the DERP path.
+#[cfg(feature = "lan-direct")]
+const UDP_MIN_FREE_PKTBUFS: usize = 2;
 
 /// One heap line at a one-time event (bind), in the same shape as the other
 /// `heap-blocks` probes, at info level so it survives the app's per-target
@@ -185,7 +211,8 @@ fn log_heap_blocks(tag: &str) {
 /// Bind the LAN UDP socket. Called from `Runtime::build` before any actor
 /// runs, so its lwIP socket/netconn/pcb allocations happen before the DERP
 /// TLS handshake fragments the heap (plan, "RAM/lwIP budget"). Any failure
-/// is a warning and a DERP-only run, never an error (D5).
+/// is a warning and a DERP-only run, never an error (D5); the endpoint is
+/// then not published either, since control only gets a port on success.
 #[cfg(feature = "lan-direct")]
 #[inline(never)]
 fn bind_lan_udp() -> Option<&'static tm_netstack::UdpSocket> {
@@ -195,7 +222,7 @@ fn bind_lan_udp() -> Option<&'static tm_netstack::UdpSocket> {
             let port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
             let sock = LAN_SOCK.get_or_init(|| sock);
             info!(
-                "lan-direct: UDP socket bound on 0.0.0.0:{}{}; receive-only, endpoint not published",
+                "lan-direct: UDP socket bound on 0.0.0.0:{}{}",
                 port,
                 if fallback { " (41641 was taken)" } else { "" },
             );
@@ -211,17 +238,47 @@ fn bind_lan_udp() -> Option<&'static tm_netstack::UdpSocket> {
 
 #[cfg(feature = "lan-direct")]
 #[inline(never)]
-fn spawn_udp(sock: &'static tm_netstack::UdpSocket) -> BoxActorFut {
-    Box::pin(udp_rx_task(sock))
+fn spawn_udp(
+    sock: &'static tm_netstack::UdpSocket,
+    disco_tx: async_channel::Sender<DiscoCmd>,
+    wg_tx: async_channel::Sender<WgCmd>,
+) -> BoxActorFut {
+    Box::pin(udp_rx_task(sock, disco_tx, wg_tx))
 }
 
-/// The receive task. Logs the first datagram of each accepted class once
-/// (the on-device proof that tokio UDP receives at all) and everything else
-/// at `trace!`, plus `rx_loop`'s coarse periodic counter line, so a LAN
+/// Copy one accepted datagram out of the static receive buffer into a pooled
+/// `PktBuf`, or `None` (counted) when the pool is too low; see
+/// `UDP_MIN_FREE_PKTBUFS`.
+#[cfg(feature = "lan-direct")]
+fn udp_pktbuf(data: &[u8]) -> Option<tm_buf::PktBuf> {
+    if tm_buf::stats().free < UDP_MIN_FREE_PKTBUFS {
+        LAN_UDP_STATS.pool_drops.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    tm_buf::PktBuf::from_slice(data)
+}
+
+/// The receive task: disco datagrams go to tm_disco as `DiscoSrc::Udp`,
+/// WireGuard datagrams to tm_wg as `Via::Udp`. Never awaits an actor
+/// (`forward_or_drop`), so a LAN flood costs dropped datagrams, not a stalled
+/// runtime. The first datagram of each class is logged once at info level,
+/// the rest at `trace!`, plus `rx_loop`'s coarse periodic counter line, so a
 /// flood cannot turn into UART output (ALLOCATIONS.md Step 8, Fix 3).
 #[cfg(feature = "lan-direct")]
-async fn udp_rx_task(sock: &'static tm_netstack::UdpSocket) {
+async fn udp_rx_task(
+    sock: &'static tm_netstack::UdpSocket,
+    disco_tx: async_channel::Sender<DiscoCmd>,
+    wg_tx: async_channel::Sender<WgCmd>,
+) {
     use tm_netstack::lan_udp::{rx_buf_static, rx_loop, RxClass};
+    // Prime the reactor's writable readiness before any PONG can be due.
+    // tokio's `try_send_to` reports `WouldBlock` until the reactor has seen
+    // the socket writable once, which would silently drop the first PONGs
+    // (Step 2 status).
+    if let Err(e) = sock.writable().await {
+        warn!("lan-direct: UDP socket never became writable ({:?}); direct path off, DERP unaffected", e);
+        return;
+    }
     let buf = rx_buf_static();
     let mut first_disco = true;
     let mut first_wg = true;
@@ -229,29 +286,145 @@ async fn udp_rx_task(sock: &'static tm_netstack::UdpSocket) {
         RxClass::Disco => {
             if first_disco {
                 first_disco = false;
-                info!(
-                    "lan-direct: first UDP disco datagram from {} ({} B, sender disco key {:02x}{:02x}..); not answered at this step",
-                    src, data.len(), data[6], data[7],
-                );
+                info!("lan-direct: first UDP disco datagram from {} ({} B)", src, data.len());
             } else {
                 trace!("lan-direct: UDP disco {} B from {}", data.len(), src);
+            }
+            if let Some(buf) = udp_pktbuf(data) {
+                forward_or_drop(&disco_tx, DiscoCmd::MaybeDisco {
+                    src: tm_disco::DiscoSrc::Udp(src),
+                    data: buf,
+                }, "DiscoCmd::MaybeDisco (udp)");
             }
         }
         RxClass::WireGuard => {
             if first_wg {
                 first_wg = false;
-                info!(
-                    "lan-direct: first UDP WireGuard datagram from {} (type {}, {} B); not processed at this step",
-                    src, data[0], data.len(),
-                );
+                info!("lan-direct: first UDP WireGuard datagram from {} (type {}, {} B)", src, data[0], data.len());
             } else {
                 trace!("lan-direct: UDP WireGuard type {} {} B from {}", data[0], data.len(), src);
+            }
+            if let Some(buf) = udp_pktbuf(data) {
+                forward_or_drop(&wg_tx, WgCmd::InboundPacket {
+                    via: tm_wg::Via::Udp(src),
+                    payload: buf,
+                }, "WgCmd::InboundPacket (udp)");
             }
         }
         RxClass::Junk | RxClass::Tailnet => {}
     })
     .await;
     warn!("lan-direct: UDP receive loop stopped ({:?}); direct path off, DERP unaffected", err);
+}
+
+/// Step 6.2 fault injection (`lan-direct-fault-test`, test builds only).
+/// Returns true while the device's direct transmits must vanish: seconds
+/// since the first direct send, modulo `CYCLE`, in `[BLOCK_FROM, BLOCK_TO)`. The send is reported as a
+/// success, exactly like loss on the wire, so nothing on the device falls
+/// back on its own; only the protocol's trust windows can recover.
+#[cfg(feature = "lan-direct-fault-test")]
+fn fault_tx_blocked() -> bool {
+    const CYCLE: u64 = 300;
+    const BLOCK_FROM: u64 = 150;
+    const BLOCK_TO: u64 = 210;
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LAST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    let t = START.get_or_init(std::time::Instant::now).elapsed().as_secs() % CYCLE;
+    let blocked = (BLOCK_FROM..BLOCK_TO).contains(&t);
+    if LAST.swap(blocked, core::sync::atomic::Ordering::Relaxed) != blocked {
+        warn!("lan-direct FAULT TEST: direct UDP transmits now {}", if blocked { "DROPPED" } else { "restored" });
+    }
+    blocked
+}
+#[cfg(all(feature = "lan-direct", not(feature = "lan-direct-fault-test")))]
+#[inline(always)]
+fn fault_tx_blocked() -> bool {
+    false
+}
+
+/// Send one WireGuard datagram straight to `addr`. `Err` hands the buffer
+/// back so the caller can send the very same bytes over DERP instead (plan
+/// Step 5: a transient `ENOMEM`/`WouldBlock` costs latency, not a packet).
+#[cfg(feature = "lan-direct")]
+fn send_wg_direct(addr: std::net::SocketAddrV4, payload: tm_buf::PktBuf) -> Result<(), tm_buf::PktBuf> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let Some(sock) = LAN_SOCK.get() else {
+        LAN_UDP_STATS.tx_fallback.fetch_add(1, Relaxed);
+        return Err(payload);
+    };
+    let r = if fault_tx_blocked() { Ok(()) } else { sock.try_send_to(std::net::SocketAddr::V4(addr), payload.as_slice()) };
+    match r {
+        Ok(()) => {
+            LAN_UDP_STATS.tx_wg.fetch_add(1, Relaxed);
+            Ok(())
+        }
+        Err(e) => {
+            let n = LAN_UDP_STATS.tx_fallback.fetch_add(1, Relaxed) + 1;
+            if n.is_power_of_two() {
+                warn!("lan-direct: direct send to {} failed ({:?}); sent via DERP (fallbacks so far: {})", addr, e, n);
+            }
+            Err(payload)
+        }
+    }
+}
+
+/// Send a sealed PONG back to the peer's observed UDP address. A failure is
+/// only counted: the peer simply does not trust the path yet and keeps using
+/// DERP, which is always safe.
+#[cfg(feature = "lan-direct")]
+#[inline(never)]
+fn send_pong_direct(dst: std::net::SocketAddrV4, payload: &[u8]) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let r = match LAN_SOCK.get() {
+        Some(_) if fault_tx_blocked() => Ok(()),
+        Some(sock) => sock.try_send_to(std::net::SocketAddr::V4(dst), payload),
+        None => Err(tm_netstack::NetError::WouldBlock),
+    };
+    match r {
+        Ok(()) => {
+            if LAN_UDP_STATS.tx_pong.fetch_add(1, Relaxed) == 0 {
+                info!("lan-direct: first UDP PONG sent to {}", dst);
+            }
+        }
+        Err(e) => {
+            let n = LAN_UDP_STATS.tx_pong_err.fetch_add(1, Relaxed) + 1;
+            if n.is_power_of_two() {
+                warn!("lan-direct: UDP PONG to {} failed ({:?}) (failures so far: {})", dst, e, n);
+            }
+        }
+    }
+}
+
+/// Log a peer's send path only when it changes (DERP to direct, direct to
+/// DERP, or a new direct address). This is the evidence for Step 6's
+/// "OutboundPacket via udp" and for the fallback timing, without a line per
+/// packet. `#[inline(never)]` keeps its temporaries off the router frame.
+#[cfg(feature = "lan-direct")]
+#[inline(never)]
+fn log_path_change(
+    last: &mut heapless::Vec<([u8; 32], Option<std::net::SocketAddrV4>), 8>,
+    dst_key: &[u8; 32],
+    via: Option<std::net::SocketAddrV4>,
+) {
+    let slot = match last.iter_mut().find(|(k, _)| k == dst_key) {
+        Some((_, v)) => v,
+        None => {
+            // A peer's first packet: DERP is the silent default.
+            if last.is_full() {
+                last.remove(0);
+            }
+            let _ = last.push((*dst_key, None));
+            &mut last.last_mut().unwrap().1
+        }
+    };
+    if *slot == via {
+        return;
+    }
+    *slot = via;
+    match via {
+        Some(a) => info!("lan-direct: OutboundPacket via udp {} for peer {:02x}{:02x}..", a, dst_key[0], dst_key[1]),
+        None => info!("lan-direct: OutboundPacket via DERP again for peer {:02x}{:02x}.. (direct trust lapsed, or the peer is sending over DERP)", dst_key[0], dst_key[1]),
+    }
 }
 
 /// Log a received `ControlEvent::Error`. `#[inline(never)]` so its `Debug`
@@ -508,6 +681,9 @@ async fn event_router_task(
     // to the actor's redial logic regresses -- see DerpEvent::Disconnected
     // below.
     let mut last_derp_target: Option<(heapless::String<64>, u16)> = None;
+    // Last send path logged per peer; see `log_path_change`.
+    #[cfg(feature = "lan-direct")]
+    let mut last_via: heapless::Vec<([u8; 32], Option<std::net::SocketAddrV4>), 8> = heapless::Vec::new();
     loop {
         #[cfg(target_os = "espidf")]
         tokio_freertos_yield().await;
@@ -724,26 +900,35 @@ async fn event_router_task(
             // ── WireGuard data-plane events (previously dropped) ──────
             evt = wg_ev_rx.recv() => {
                 match evt {
-                    // `via` is always None until Step 5 of the LAN-direct
-                    // plan: nothing can prove a direct path yet (no UDP
-                    // WireGuard ingest, DirectPathSeen not forwarded), so
-                    // everything still goes to DERP. Step 5 sends
-                    // `Some(addr)` to the LAN socket with DERP as fallback.
-                    Ok(WgEvent::OutboundPacket { dst_key, payload, via: _ }) => {
-                        // The outbound WireGuard path: handshake
-                        // initiations, keepalives and transport data
-                        // leave tm_wg here and are handed to DERP for
-                        // relay to the peer. (DERP transport is a stub
-                        // today -- see docs/wg-dataplane-notes.md -- so
-                        // these are dropped by the DerpActor for now;
-                        // the wiring is correct and observable.)
-                        trace!("Runtime::join() - WgEvent::OutboundPacket {} bytes -> DERP peer {:02x}{:02x}..", payload.len(), dst_key[0], dst_key[1]);
-                        // Forward tm_wg's buffer to DERP as-is (same
-                        // tm_buf::PktBuf type on both channels): no copy.
-                        forward_or_drop(&derp_tx2, DerpCmd::SendPacket {
-                            dst_key: NodePublicKey::from_bytes(dst_key),
-                            payload,
-                        }, "DerpCmd::SendPacket");
+                    // `via` is tm_wg's trusted direct path for this peer
+                    // (`WgEndpoint::path_for`), or None for DERP.
+                    Ok(WgEvent::OutboundPacket { dst_key, payload, via }) => {
+                        // Handshakes, keepalives and transport data leave
+                        // tm_wg here. With lan-direct, a trusted direct path
+                        // goes out the LAN socket and any send error puts the
+                        // same buffer on DERP instead; everything else goes
+                        // to DERP exactly as before.
+                        #[cfg(feature = "lan-direct")]
+                        log_path_change(&mut last_via, &dst_key, via);
+                        #[cfg(feature = "lan-direct")]
+                        let payload = match via {
+                            Some(addr) => match send_wg_direct(addr, payload) {
+                                Ok(()) => None,
+                                Err(p) => Some(p),
+                            },
+                            None => Some(payload),
+                        };
+                        #[cfg(not(feature = "lan-direct"))]
+                        let payload = { let _ = via; Some(payload) };
+                        if let Some(payload) = payload {
+                            trace!("Runtime::join() - WgEvent::OutboundPacket {} bytes -> DERP peer {:02x}{:02x}..", payload.len(), dst_key[0], dst_key[1]);
+                            // Forward tm_wg's buffer to DERP as-is (same
+                            // tm_buf::PktBuf type on both channels): no copy.
+                            forward_or_drop(&derp_tx2, DerpCmd::SendPacket {
+                                dst_key: NodePublicKey::from_bytes(dst_key),
+                                payload,
+                            }, "DerpCmd::SendPacket");
+                        }
                         #[cfg(target_os = "espidf")]
                         tokio_freertos_yield().await;
                     }
@@ -837,27 +1022,25 @@ async fn event_router_task(
                         }
                     }
                     Ok(DiscoEvent::SendPongUdp { dst, payload }) => {
-                        // Step 1 (LAN-direct-path plan): tm_disco can now
-                        // build a PONG addressed to a peer's real observed
-                        // UDP address. There is no UDP socket yet to send it
-                        // on (Step 2 adds the `tokio::net::UdpSocket`
-                        // receive/send loop this plugs into) -- this arm
-                        // exists so the new `DiscoEvent` variant has
-                        // somewhere to go and the router compiles against
-                        // tm_disco's full Step 1 API surface. Until Step 2,
-                        // any UDP-sourced disco is unreachable anyway (no
-                        // socket feeds `DiscoSrc::Udp` into `MaybeDisco`), so
-                        // this drop is inert in practice today.
-                        warn!("Runtime::join() - DiscoEvent::SendPongUdp -> {} ({} bytes) but no UDP socket yet (Step 2 of the LAN-direct-path plan); dropped", dst, payload.len());
+                        // tm_disco authenticated a UDP PING (disco key on the
+                        // netmap allowlist, node key matching its pairing) and
+                        // sealed a PONG for the address it came from. Reply
+                        // from the same socket, which is what lets the peer
+                        // trust this path (plan D2).
+                        #[cfg(feature = "lan-direct")]
+                        send_pong_direct(dst, &payload);
+                        #[cfg(not(feature = "lan-direct"))]
+                        { let _ = (dst, payload); }
                     }
                     Ok(DiscoEvent::DirectPathSeen { node_key, addr }) => {
-                        // Authenticated evidence that this peer has a working
-                        // direct UDP path. `tm_wg::WgCmd::DirectPathSeen`
-                        // exists now (Step 4), but forwarding it would switch
-                        // WireGuard's sends to a path whose replies cannot be
-                        // ingested yet (plan D4), so it is only logged until
-                        // Step 5 wires UDP ingest at the same time.
-                        info!("Runtime::join() - DiscoEvent::DirectPathSeen peer {:02x}{:02x}.. at {} (not forwarded to tm_wg until Step 5)", node_key[0], node_key[1], addr);
+                        // See `DISCO_PING_SETS_SEND_PATH` for why this is
+                        // switchable. tm_wg also adopts the path on its own
+                        // from authenticated UDP WireGuard.
+                        #[cfg(feature = "lan-direct")]
+                        if DISCO_PING_SETS_SEND_PATH {
+                            forward_or_drop(&wg_tx2, WgCmd::DirectPathSeen { node_key, addr }, "WgCmd::DirectPathSeen");
+                        }
+                        trace!("Runtime::join() - DiscoEvent::DirectPathSeen peer {:02x}{:02x}.. at {}", node_key[0], node_key[1], addr);
                     }
                     Ok(DiscoEvent::PingFrom(key)) => {
                         info!("Runtime::join() - DiscoEvent::PingFrom peer {:02x}{:02x}..", key[0], key[1]);
@@ -1103,7 +1286,7 @@ impl Runtime {
                 // Control derives the LAN endpoint from the actual bound
                 // port, which is not 41641 if bind_lan fell back to port 0.
                 config.control.lan_udp_port = sock.local_addr().ok().map(|a| a.port());
-                spawn_udp(sock)
+                spawn_udp(sock, disco_tx.clone(), wg_tx.clone())
             }
             None => Box::pin(async {}),
         };
