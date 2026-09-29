@@ -122,6 +122,9 @@ pub struct RxStats {
     /// Accepted datagrams dropped before reaching an actor because the
     /// shared packet pool was (nearly) empty; see `tm_runtime`'s UDP task.
     pub pool_drops: AtomicU32,
+    /// The disco subset of `pool_drops`. Kept apart because a dropped PING
+    /// means a missing PONG, which makes the peer distrust the direct path.
+    pub pool_drops_disco: AtomicU32,
     /// WireGuard datagrams sent directly over this socket (Step 5).
     pub tx_wg: AtomicU32,
     /// WireGuard datagrams whose direct send failed and went to DERP instead.
@@ -140,6 +143,7 @@ pub struct RxSnapshot {
     pub tailnet: u32,
     pub errors: u32,
     pub pool_drops: u32,
+    pub pool_drops_disco: u32,
     pub tx_wg: u32,
     pub tx_fallback: u32,
     pub tx_pong: u32,
@@ -155,6 +159,7 @@ impl RxStats {
             tailnet: AtomicU32::new(0),
             errors: AtomicU32::new(0),
             pool_drops: AtomicU32::new(0),
+            pool_drops_disco: AtomicU32::new(0),
             tx_wg: AtomicU32::new(0),
             tx_fallback: AtomicU32::new(0),
             tx_pong: AtomicU32::new(0),
@@ -170,6 +175,7 @@ impl RxStats {
             tailnet: self.tailnet.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
             pool_drops: self.pool_drops.load(Ordering::Relaxed),
+            pool_drops_disco: self.pool_drops_disco.load(Ordering::Relaxed),
             tx_wg: self.tx_wg.load(Ordering::Relaxed),
             tx_fallback: self.tx_fallback.load(Ordering::Relaxed),
             tx_pong: self.tx_pong.load(Ordering::Relaxed),
@@ -284,8 +290,8 @@ fn log_summary(s: RxSnapshot) {
     #[cfg(not(target_os = "espidf"))]
     let (largest, total) = (0usize, 0usize);
     log::info!(
-        "udp rx: disco={} wg={} junk={} tailnet={} err={} pool_drop={} | tx: wg={} fallback={} pong={} pong_err={} (heap largest_free={} total_free={})",
-        s.disco, s.wireguard, s.junk, s.tailnet, s.errors, s.pool_drops,
+        "udp rx: disco={} wg={} junk={} tailnet={} err={} pool_drop={} (disco {}) | tx: wg={} fallback={} pong={} pong_err={} (heap largest_free={} total_free={})",
+        s.disco, s.wireguard, s.junk, s.tailnet, s.errors, s.pool_drops, s.pool_drops_disco,
         s.tx_wg, s.tx_fallback, s.tx_pong, s.tx_pong_err, largest, total,
     );
 }

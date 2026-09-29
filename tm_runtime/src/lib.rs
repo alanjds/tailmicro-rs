@@ -189,6 +189,15 @@ const DISCO_PING_SETS_SEND_PATH: bool = false;
 #[cfg(feature = "lan-direct")]
 const UDP_MIN_FREE_PKTBUFS: usize = 2;
 
+/// Disco gets the second-to-last buffer too. A PING arrives every ~3 s per
+/// peer, but each one that is dropped is a missing PONG, and tailscaled
+/// stops trusting the direct path after 6.5 s without one: it then sends
+/// over both paths, our DERP hold-off engages, and the path flaps. On
+/// hardware (Step 6 soak) every flap coincided with PINGs lost to the
+/// 2-buffer floor under curl load. The last buffer stays reserved.
+#[cfg(feature = "lan-direct")]
+const UDP_DISCO_MIN_FREE_PKTBUFS: usize = 1;
+
 /// One heap line at a one-time event (bind), in the same shape as the other
 /// `heap-blocks` probes, at info level so it survives the app's per-target
 /// Info cap. Never called per packet.
@@ -248,11 +257,16 @@ fn spawn_udp(
 
 /// Copy one accepted datagram out of the static receive buffer into a pooled
 /// `PktBuf`, or `None` (counted) when the pool is too low; see
-/// `UDP_MIN_FREE_PKTBUFS`.
+/// `UDP_MIN_FREE_PKTBUFS` / `UDP_DISCO_MIN_FREE_PKTBUFS`.
 #[cfg(feature = "lan-direct")]
-fn udp_pktbuf(data: &[u8]) -> Option<tm_buf::PktBuf> {
-    if tm_buf::stats().free < UDP_MIN_FREE_PKTBUFS {
-        LAN_UDP_STATS.pool_drops.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+fn udp_pktbuf(data: &[u8], disco: bool) -> Option<tm_buf::PktBuf> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let min_free = if disco { UDP_DISCO_MIN_FREE_PKTBUFS } else { UDP_MIN_FREE_PKTBUFS };
+    if tm_buf::stats().free < min_free {
+        LAN_UDP_STATS.pool_drops.fetch_add(1, Relaxed);
+        if disco {
+            LAN_UDP_STATS.pool_drops_disco.fetch_add(1, Relaxed);
+        }
         return None;
     }
     tm_buf::PktBuf::from_slice(data)
@@ -290,7 +304,7 @@ async fn udp_rx_task(
             } else {
                 trace!("lan-direct: UDP disco {} B from {}", data.len(), src);
             }
-            if let Some(buf) = udp_pktbuf(data) {
+            if let Some(buf) = udp_pktbuf(data, true) {
                 forward_or_drop(&disco_tx, DiscoCmd::MaybeDisco {
                     src: tm_disco::DiscoSrc::Udp(src),
                     data: buf,
@@ -304,7 +318,7 @@ async fn udp_rx_task(
             } else {
                 trace!("lan-direct: UDP WireGuard type {} {} B from {}", data[0], data.len(), src);
             }
-            if let Some(buf) = udp_pktbuf(data) {
+            if let Some(buf) = udp_pktbuf(data, false) {
                 forward_or_drop(&wg_tx, WgCmd::InboundPacket {
                     via: tm_wg::Via::Udp(src),
                     payload: buf,
