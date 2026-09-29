@@ -53,6 +53,8 @@
 //! packet-carrying crate (including `tm_netstack`, which depends on no other
 //! `tm_*` crate) can use it.
 
+pub mod lat;
+
 use core::fmt;
 use core::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};

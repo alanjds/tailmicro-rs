@@ -309,8 +309,16 @@ impl DiscoActor {
         loop {
             match cmds.recv().await {
                 Ok(DiscoCmd::MaybeDisco { src, data }) => {
+                    let udp = matches!(src, DiscoSrc::Udp(_));
+                    if udp {
+                        tm_buf::lat::stamp(tm_buf::lat::Hop::DiscoIn);
+                    }
                     for evt in self.process(&src, &data) {
+                        let pong = udp && matches!(evt, DiscoEvent::SendPongUdp { .. });
                         let _ = events.send(evt).await;
+                        if pong {
+                            tm_buf::lat::stamp(tm_buf::lat::Hop::DiscoOut);
+                        }
                     }
                 }
                 Ok(DiscoCmd::AllowPeer { disco_key, node_key }) => {

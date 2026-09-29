@@ -14,6 +14,9 @@ lan-direct = []
 # `iptables -I INPUT -p udp --sport 41641 -j DROP` would, while still
 # receiving. Never enable in a shipped build.
 lan-direct-fault-test = ["lan-direct"]
+# DIAGNOSTIC ONLY (ALLOCATIONS.md Step 9): per-hop latency stamps for the
+# LAN round trip, one serial line per ping plus a 10 s router summary.
+latency-trace = ["tm_buf/latency-trace"]
 
 [dependencies]
 tm_control.workspace = true

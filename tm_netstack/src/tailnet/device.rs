@@ -229,6 +229,9 @@ unsafe extern "C" fn tailnet_output_cb(
     }
     let mut dst_ip = [0u8; 4];
     dst_ip.copy_from_slice(&buf[16..20]);
+    if tm_buf::lat::ENABLED && tm_buf::lat::is_icmp_echo(&buf, 0) {
+        tm_buf::lat::stamp(tm_buf::lat::Hop::NetifOut);
+    }
     if let Some(tx) = OUTBOUND_TX.get() {
         // try_send: synchronous, non-blocking, thread-safe without an
         // executor (async_channel's queue is a plain concurrent structure).

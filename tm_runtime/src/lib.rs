@@ -38,7 +38,9 @@ use async_channel;
 /// Calls `vTaskDelay(50)` to yield the CPU and service the watchdog timer.
 #[cfg(target_os = "espidf")]
 pub async fn tokio_freertos_yield() {
+    let t0 = tm_buf::lat::now_us();
     unsafe { esp_idf_sys::vTaskDelay(50) };
+    tm_buf::lat::note_yield(tm_buf::lat::now_us().wrapping_sub(t0));
     tokio::task::yield_now().await;
 }
 
@@ -298,6 +300,7 @@ async fn udp_rx_task(
     let mut first_wg = true;
     let err = rx_loop(sock, &mut buf[..], &LAN_UDP_STATS, |class, src, data| match class {
         RxClass::Disco => {
+            tm_buf::lat::stamp(tm_buf::lat::Hop::UdpRxDisco);
             if first_disco {
                 first_disco = false;
                 info!("lan-direct: first UDP disco datagram from {} ({} B)", src, data.len());
@@ -312,6 +315,9 @@ async fn udp_rx_task(
             }
         }
         RxClass::WireGuard => {
+            if data[0] == 4 {
+                tm_buf::lat::stamp(tm_buf::lat::Hop::UdpRxWg);
+            }
             if first_wg {
                 first_wg = false;
                 info!("lan-direct: first UDP WireGuard datagram from {} (type {}, {} B)", src, data[0], data.len());
@@ -613,6 +619,75 @@ fn build_icmp_echo_reply(req: &[u8], our_ip: [u8; 4]) -> Option<heapless::Vec<u8
     Some(reply)
 }
 
+/// Router-side state of the `latency-trace` diagnostic (ALLOCATIONS.md
+/// Step 9). Prints one line per ping, after the reply has been sent, and a
+/// router summary every 10 s. Rate-limited so it cannot saturate the UART
+/// (Step 8, Fix 3).
+#[cfg(feature = "latency-trace")]
+struct LatState {
+    icmp_reply_pending: bool,
+    last_line_us: u32,
+    last_summary_us: u32,
+}
+
+#[cfg(feature = "latency-trace")]
+impl LatState {
+    fn new() -> Self {
+        let now = tm_buf::lat::now_us();
+        Self { icmp_reply_pending: false, last_line_us: now, last_summary_us: now }
+    }
+
+    /// True for the first `OutboundPacket` bigger than a keepalive after an
+    /// ICMP echo reply left the netif: that is the encrypted reply.
+    fn take_icmp_reply(&mut self, len: usize) -> bool {
+        if self.icmp_reply_pending && len > 32 {
+            self.icmp_reply_pending = false;
+            tm_buf::lat::stamp(tm_buf::lat::Hop::RouterOutbound);
+            return true;
+        }
+        false
+    }
+
+    #[inline(never)]
+    fn on_iter(&mut self) {
+        tm_buf::lat::note_router_iter();
+        let now = tm_buf::lat::now_us();
+        let dt = now.wrapping_sub(self.last_summary_us);
+        if dt >= 10_000_000 {
+            self.last_summary_us = now;
+            let (iters, yield_us, yield_max) = tm_buf::lat::take_router_stats();
+            info!(
+                "lat router: {} iters in {} ms, blocked in vTaskDelay {} ms ({}%), max yield {} ms",
+                iters, dt / 1000, yield_us / 1000, yield_us * 100 / dt as u64, yield_max / 1000,
+            );
+        }
+    }
+
+    #[inline(never)]
+    fn report(&mut self, what: &str, hops: &[tm_buf::lat::Hop], direct: bool) {
+        let now = tm_buf::lat::now_us();
+        if now.wrapping_sub(self.last_line_us) < 300_000 {
+            return;
+        }
+        self.last_line_us = now;
+        match tm_buf::lat::chain(hops) {
+            Some(d) => {
+                // Milliseconds with one decimal: total, then each hop delta.
+                let mut line: heapless::String<160> = heapless::String::new();
+                for (i, us) in d.iter().enumerate() {
+                    use core::fmt::Write;
+                    let _ = write!(line, "{}{}.{}", if i == 1 { " |" } else { " " }, us / 1000, (us % 1000) / 100);
+                }
+                info!("lat {} {}:{}", what, if direct { "udp" } else { "derp" }, line.as_str());
+            }
+            None => info!("lat {} {}: chain incomplete or mixed", what, if direct { "udp" } else { "derp" }),
+        }
+        for h in hops {
+            tm_buf::lat::clear(*h);
+        }
+    }
+}
+
 /// Hand a data-plane packet to an actor without ever blocking the event
 /// router (ALLOCATIONS.md Step 7). The router is the only consumer of the
 /// actors' event channels, and those actors (`WgActor` in particular, see
@@ -698,9 +773,13 @@ async fn event_router_task(
     // Last send path logged per peer; see `log_path_change`.
     #[cfg(feature = "lan-direct")]
     let mut last_via: heapless::Vec<([u8; 32], Option<std::net::SocketAddrV4>), 8> = heapless::Vec::new();
+    #[cfg(feature = "latency-trace")]
+    let mut lat = LatState::new();
     loop {
         #[cfg(target_os = "espidf")]
         tokio_freertos_yield().await;
+        #[cfg(feature = "latency-trace")]
+        lat.on_iter();
         tokio::select! {
             evt = ctrl_ev_rx.recv() => {
                 match evt {
@@ -917,6 +996,8 @@ async fn event_router_task(
                     // `via` is tm_wg's trusted direct path for this peer
                     // (`WgEndpoint::path_for`), or None for DERP.
                     Ok(WgEvent::OutboundPacket { dst_key, payload, via }) => {
+                        #[cfg(feature = "latency-trace")]
+                        let icmp_reply = lat.take_icmp_reply(payload.len());
                         // Handshakes, keepalives and transport data leave
                         // tm_wg here. With lan-direct, a trusted direct path
                         // goes out the LAN socket and any send error puts the
@@ -932,6 +1013,11 @@ async fn event_router_task(
                             },
                             None => Some(payload),
                         };
+                        #[cfg(feature = "latency-trace")]
+                        if icmp_reply {
+                            tm_buf::lat::stamp(tm_buf::lat::Hop::UdpTxWg);
+                            lat.report("icmp", &tm_buf::lat::ICMP_CHAIN, via.is_some());
+                        }
                         #[cfg(not(feature = "lan-direct"))]
                         let payload = { let _ = via; Some(payload) };
                         if let Some(payload) = payload {
@@ -962,9 +1048,16 @@ async fn event_router_task(
                                 esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_DEFAULT),
                                 pool.free, pool.allocs, pool.frees);
                         } }
+                        let echo_req = tm_buf::lat::ENABLED && tm_buf::lat::is_icmp_echo(payload.as_slice(), 8);
+                        if echo_req {
+                            tm_buf::lat::stamp(tm_buf::lat::Hop::RouterInbound);
+                        }
                         let w = tm_wg::heapdiag::trace_begin("router: before inject_inbound");
                         let inj = tailnet::inject_inbound(payload.as_slice());
                         tm_wg::heapdiag::trace_end(w, "router: after inject_inbound");
+                        if echo_req {
+                            tm_buf::lat::stamp(tm_buf::lat::Hop::Injected);
+                        }
                         match inj {
                             Ok(()) => {}
                             Err(tailnet::TailnetError::NotSupported) => {
@@ -1041,8 +1134,14 @@ async fn event_router_task(
                         // sealed a PONG for the address it came from. Reply
                         // from the same socket, which is what lets the peer
                         // trust this path (plan D2).
+                        tm_buf::lat::stamp(tm_buf::lat::Hop::RouterPong);
                         #[cfg(feature = "lan-direct")]
                         send_pong_direct(dst, &payload);
+                        #[cfg(feature = "latency-trace")]
+                        {
+                            tm_buf::lat::stamp(tm_buf::lat::Hop::UdpTxPong);
+                            lat.report("disco", &tm_buf::lat::DISCO_CHAIN, true);
+                        }
                         #[cfg(not(feature = "lan-direct"))]
                         { let _ = (dst, payload); }
                     }
@@ -1073,6 +1172,11 @@ async fn event_router_task(
             pkt = netif_out_rx.recv() => {
                 match pkt {
                     Ok(tailnet::OutboundPacket { dst_ip, data }) => {
+                        #[cfg(feature = "latency-trace")]
+                        if tm_buf::lat::is_icmp_echo(data.as_slice(), 0) {
+                            tm_buf::lat::stamp(tm_buf::lat::Hop::RouterNetif);
+                            lat.icmp_reply_pending = true;
+                        }
                         if let Some((_, dst_key)) = ip_to_key.iter().find(|(ip, _)| *ip == dst_ip) {
                             forward_or_drop(&wg_tx2, WgCmd::SendData {
                                 dst_key: *dst_key,

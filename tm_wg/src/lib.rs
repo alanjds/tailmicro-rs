@@ -379,6 +379,9 @@ impl WgActor {
         // fragmenting the heap (see `recv_scratch` doc comment and
         // ALLOCATIONS.md). Filling a heap-resident RecvOut still keeps those
         // 6 KB off the stack, same as before.
+        if matches!(via, Via::Udp(_)) && payload.first() == Some(&4) {
+            tm_buf::lat::stamp(tm_buf::lat::Hop::WgIn);
+        }
         let mut out = self.take_scratch();
         if heapdiag::ENABLED {
             heap_probe_blocks("on_inbound: before recv_one_into");
@@ -411,10 +414,17 @@ impl WgActor {
         // Same reuse discipline as on_inbound: the persistent scratch buffer
         // keeps its ~6 KB of inline packet buffers off the stack without
         // re-allocating on every send.
+        let echo_reply = tm_buf::lat::ENABLED && tm_buf::lat::is_icmp_echo(payload, 0);
+        if echo_reply {
+            tm_buf::lat::stamp(tm_buf::lat::Hop::WgSendIn);
+        }
         let mut out = self.take_scratch();
         let sent = self
             .endpoint()
             .send_data(&dst_key, payload, Instant::now(), &mut out);
+        if echo_reply {
+            tm_buf::lat::stamp(tm_buf::lat::Hop::WgEncrypted);
+        }
         if !sent {
             tracing::debug!("send_data queued (no active session yet) or dropped");
         }
@@ -472,9 +482,13 @@ impl WgActor {
             }, "OutboundPacket").await;
         }
         for pkt in out.decrypted.iter() {
+            let payload = pkt_to_buf(pkt);
+            if tm_buf::lat::ENABLED && tm_buf::lat::is_icmp_echo(payload.as_slice(), 8) {
+                tm_buf::lat::stamp(tm_buf::lat::Hop::WgDecrypted);
+            }
             send_diag(events, WgEvent::InboundDecrypted {
                 src_key: dst_key,
-                payload: pkt_to_buf(pkt),
+                payload,
             }, "InboundDecrypted").await;
         }
         if out.handshook {
