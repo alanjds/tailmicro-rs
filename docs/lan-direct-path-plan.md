@@ -817,9 +817,8 @@ the gap that section left open.
 - Tailnet HTTP (`curl http://<tailnet-ip>/cm?cmnd=Status` over DERP)
   returned 200 before, between and after the bursts.
 
-A/B heap cost, lan-direct OFF against ON, same tree, clean boots with no
-probe traffic, two boots each. The numbers were reproducible within about
-50 B.
+A/B heap cost, lan-direct OFF against ON. The first pass (two clean boots
+of each build at the Step 2 commit) looked like this:
 
 | Checkpoint | OFF | ON | Delta |
 |---|---|---|---|
@@ -828,15 +827,23 @@ probe traffic, two boots each. The numbers were reproducible within about
 | DERP `before tls.open`, total free | 48048-48188 | 45092-45144 | -3.0 KB |
 | DERP `before tls.open`, largest free | 36864 | 34816 | -2 KB |
 
-So "no heap regression in the DERP TLS numbers" is **not strictly met**.
-There is a steady cost of about 3 KB total and 2 KB of largest block going
-into the DERP handshake. That is close to the plan's 2-2.5 KB estimate,
-and the handshake completed on every boot. The first ON boot, which had
-probe traffic arriving during bring-up, showed a worse snapshot (41600 total
-and 30720 largest before `tls.open`), which did not reproduce on clean
-boots. Step 5 adds to this budget (the `DirectPath` state, the send path),
-so it should be flashed with the heap probes on and compared against these
-numbers.
+**Correction, from more boots during Step 4:** two samples per build were
+not enough. The later checkpoints vary by about 2.5-3 KB from boot to boot
+of the *same* firmware. At the Step 4 tree with lan-direct OFF, two boots
+gave 59312 and 61804 after device connect, and 44448/34816 and 47804/36864
+before `tls.open`. Two lan-direct ON boots at the same tree gave 58876 and
+58844, and 40996/30720 and 44780/34816. Both builds land in the 30720-36864
+largest-block range across boots. The first-pass "-3 KB" was mostly this
+noise. What is firm and reproducible is:
+
+- 1.6 KB of `.bss` for the RX buffer and stats, visible in `heap_init`'s
+  region length and in "Heap after loading keys" on every boot;
+- 448-456 B of heap for the socket, measured directly around the bind on
+  every boot.
+
+That is the plan's 2-2.5 KB estimate. The DERP TLS handshake and both peer
+handshakes completed on every boot of every build. To tell a real Step 5
+regression from this noise, compare several boots per build, not one.
 
 ## Step 3 status (2026-09-29): done, host-tested, computed-and-logged on the ESP32-C3
 
@@ -880,3 +887,100 @@ On the device (lan-direct build): `lan-direct: LAN endpoint
 DERP-only re-publish. Both peers handshook and tailnet HTTP returned 200. A
 LAN peer's `tailscale status` for the device shows no `Addrs` and relay
 `sao`, which confirms nothing was advertised.
+
+## Step 4 status (2026-09-29): done, host-tested, compiled and booted on the ESP32-C3 (inert)
+
+Implemented in `tm_wg`:
+
+- `Peer.endpoint` is split into `derp: Endpoint` (always present, never
+  torn down) and `direct: Option<DirectPath { addr: SocketAddrV4,
+  trust_until: Instant }>`. `DIRECT_TRUST` is 6.5 s. `add_peer` takes the
+  DERP endpoint. `peer_endpoint` still returns it, and `endpoint_for` is
+  unchanged.
+- `WgEndpoint::path_for(id, now) -> Option<SocketAddrV4>` returns the
+  direct address while `now < trust_until`, and `None` (DERP) otherwise.
+  `drain_recv` and `emit_to_peer` both use it, so handshakes, keepalives
+  and data follow one rule. In `drain_recv` it is evaluated after
+  `recv_one_into`, so the reply to a packet that just proved a UDP path
+  goes back over that path.
+- `maybe_roam(peer, from, now)` sets or refreshes `direct` only for a UDP
+  IPv4 source. DERP never touches it, and IPv6 is ignored. It runs only
+  after authentication:
+  - a transport packet that decrypted (including the replay window);
+  - the transport packet that confirms a responder handshake;
+  - (new) a handshake response that `finish()` accepted.
+- **Deviation, deliberate:** a handshake *initiation* no longer roams. The
+  old code did roam on an initiation. An initiation is not proof of the
+  source address: it can be re-sent from anywhere, and the existing replay
+  check (`hs.timestamp < last`) lets an equal timestamp through. The path
+  is adopted one packet later, when the handshake completes. In practice
+  tailscaled establishes trust by disco first, via `DirectPathSeen`, so
+  this costs nothing.
+- `WgCmd::InboundPacket { via: Via, payload }` with `Via { Derp { src_key },
+  Udp(SocketAddrV4) }`. `on_inbound` passes the real transport as `from`.
+  Over UDP there is no fallback key: if the packet names no known peer,
+  nothing is emitted.
+- `WgCmd::DirectPathSeen { node_key, addr }` becomes
+  `WgEndpoint::direct_path_seen`, which does nothing for an unknown peer.
+  It does not force the lazy endpoint into existence.
+- `WgEvent::OutboundPacket` gained `via: Option<SocketAddrV4>`.
+
+`tm_runtime`: both `InboundPacket` construction sites send
+`Via::Derp { src_key }`. The router ignores `OutboundPacket.via`, and
+everything still goes to DERP. `DiscoEvent::DirectPathSeen` is still only
+logged and is **not** forwarded to `tm_wg`, on purpose. Forwarding it now
+would switch sends to a path whose replies cannot be ingested yet (D4).
+Step 5 does both at once.
+
+Validation, `cargo test -p tm_wg`, 32/32 green. New tests:
+
+- `udp_path_is_adopted_from_authenticated_packets_and_used_for_replies`:
+  an init over UDP sets nothing. A response over `Udp(xb)` sets A's path,
+  so A's confirmation is routed to `xb`. The confirmation over `Udp(xa)`
+  sets B's path. Data keeps the path warm, and 10 s of silence lets it
+  lapse.
+- `forged_or_undecryptable_udp_never_changes_the_path`: from `y`, none of
+  these moves the path from `x`:
+  - a genuine packet replayed;
+  - a packet with the right receiver id and corrupted ciphertext;
+  - a re-sent initiation;
+  - non-WireGuard junk.
+- `trust_expires_after_6_5_s_and_sends_revert_to_derp`: the path is set at
+  +6.4 s and gone at +6.6 s, and the DERP route is still present.
+- `authenticated_packet_from_a_new_address_moves_the_path`: `x` to `z`, with
+  trust refreshed to `t1 + 6.5 s`.
+- `derp_sourced_packets_leave_the_direct_path_untouched`: DERP data is
+  accepted but neither moves nor refreshes `direct`. A DERP-only handshake
+  never creates one.
+- `direct_path_seen_sets_and_refreshes_trust` (including an unknown peer)
+  and `ipv6_udp_source_is_ignored`.
+- `tests::replies_to_udp_inbound_are_tagged_with_the_udp_path` runs a real
+  `WgActor`. It checks, on actual `WgEvent`s:
+  - the proactive initiation from `ApplyMap` is `via: None`;
+  - after a handshake response arrives as `Via::Udp(x)`, the confirmation
+    is `OutboundPacket { via: Some(x) }`, and the independent `WgEndpoint`
+    peer accepts it;
+  - a junk UDP datagram emits nothing.
+- The existing `retry_frees_stale_session_and_ignores_late_response`,
+  `full_handshake...`, `send_data...` and `wgendpoint_fits_fragmented_heap`
+  tests still pass.
+
+Size: `WgEndpoint` went from 5968 B to 6224 B (+32 B per peer, `Peer` is
+now 736 B on the host). That is within the 8 KB guard, and it is `.bss`,
+not heap.
+
+Device: the wrapper builds with and without `lan-direct`. Both builds were
+flashed and booted. DERP connected, both peers handshook, and tailnet HTTP
+returned 200. No resets and no `ALLOC FAILED`. Heap numbers are in the
+Step 2 correction above. Step 4 changes nothing on the air, as intended.
+
+**Not done, by instruction:** Step 5 (UDP PONG, UDP WireGuard ingest,
+forwarding `DirectPathSeen`, routing `via` to the socket, flipping
+`PUBLISH_LAN_ENDPOINT`). Notes for whoever does it:
+
+- Prime the socket (`writable().await` once after bind) before relying on
+  `try_send_to`; see Step 2.
+- The UDP rx task needs a path into `tm_disco` (`DiscoSrc::Udp`) and into
+  `tm_wg` (`Via::Udp`). The `tm_buf` pool is 4 buffers, so the copy out of
+  the static RX buffer should use `PktBuf::from_slice`, and a WireGuard
+  flood must be dropped with `forward_or_drop` rather than awaited.

@@ -41,3 +41,7 @@ zerocopy         = { version = "0.8", features = ["derive"] }
 # builds/tests.
 [target.'cfg(target_os = "espidf")'.dependencies]
 esp-idf-sys = { workspace = true }
+
+[dev-dependencies]
+# The actor-level test drives WgActor::run on a current-thread runtime.
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }

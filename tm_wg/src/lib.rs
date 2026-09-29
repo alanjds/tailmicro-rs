@@ -20,12 +20,13 @@ pub mod vendor;
 
 use tm_control::{MapState, PeerInfo};
 
-pub use endpoint::{Endpoint, MAX_PEERS, WgEndpoint};
+pub use endpoint::{DIRECT_TRUST, DirectPath, Endpoint, MAX_PEERS, WgEndpoint};
 use endpoint::{DispatchOut, RecvOut};
 use vendor::config::{PeerConfig, PeerId, Psk};
 use vendor::keys::{NodeKeyPair, NodePrivateKey, NodePublicKey};
 use vendor::packet::Packet;
 
+use std::net::SocketAddrV4;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Actor tick period. Mirrors MicroLink's `wireguardif_periodic()` ~400ms
@@ -66,13 +67,20 @@ pub enum WgCmd {
     /// balloons the caller's stack frame. See the tailmicro-rs commit fixing
     /// the ESP32-C3 stack overflow at `Runtime::join()`'s `tokio::join!` entry.
     ApplyMap(Box<MapState<MAX_PEERS, 4>>),
-    /// Route an incoming WireGuard packet received from DERP.
+    /// Route an incoming WireGuard packet, tagged with how it arrived.
     ///
     /// `payload` is the shared channel packet buffer (`tm_buf`): the event
     /// router forwards the very buffer `tm_derp` filled, without copying.
     InboundPacket {
-        src_key: [u8; 32],
+        via: Via,
         payload: tm_buf::PktBuf,
+    },
+    /// tm_disco opened a UDP disco PING from `addr` under `node_key`'s
+    /// allowlisted disco key: authenticated evidence that `addr` reaches the
+    /// peer, so it sets or refreshes the direct path (plan D3).
+    DirectPathSeen {
+        node_key: [u8; 32],
+        addr: SocketAddrV4,
     },
     /// Encrypt and send an outbound transport (app-data) IP packet to a peer.
     ///
@@ -88,10 +96,12 @@ pub enum WgCmd {
 }
 
 pub enum WgEvent {
-    /// An outbound WireGuard packet to send via DERP.
+    /// An outbound WireGuard packet. `via` is the trusted direct path to use
+    /// (`WgEndpoint::path_for`), or `None` for DERP to `dst_key`.
     OutboundPacket {
         dst_key: [u8; 32],
         payload: tm_buf::PktBuf,
+        via: Option<SocketAddrV4>,
     },
     /// A decrypted inbound payload, destined for the local netstack.
     InboundDecrypted {
@@ -100,6 +110,16 @@ pub enum WgEvent {
     },
     /// A WireGuard handshake completed with the given peer node key.
     PeerHandshook([u8; 32]),
+}
+
+/// The transport an inbound WireGuard packet arrived on. Over DERP the relay
+/// vouches for the sender's node key; over UDP there is only the source
+/// address, and the peer is identified from the packet itself (static key or
+/// session id).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Via {
+    Derp { src_key: [u8; 32] },
+    Udp(SocketAddrV4),
 }
 
 // ── WgActor ───────────────────────────────────────────────────────────────────
@@ -232,8 +252,15 @@ impl WgActor {
                         // by value (~90 KB total) and building it on the 32 KB
                         // main-task stack faults. See docs/wg-dataplane-notes.md.
                         Ok(WgCmd::ApplyMap(map)) => Box::pin(self.apply_map(&map, &events)).await,
-                        Ok(WgCmd::InboundPacket { src_key, payload }) => {
-                            Box::pin(self.on_inbound(src_key, &payload, &events)).await;
+                        Ok(WgCmd::InboundPacket { via, payload }) => {
+                            Box::pin(self.on_inbound(via, &payload, &events)).await;
+                        }
+                        Ok(WgCmd::DirectPathSeen { node_key, addr }) => {
+                            // No endpoint yet means no peers to attach it to;
+                            // do not force the lazy endpoint for it.
+                            if let Some(ep) = self.endpoint.as_deref_mut() {
+                                ep.direct_path_seen(&node_key, addr, Instant::now());
+                            }
                         }
                         Ok(WgCmd::SendData { dst_key, payload }) => {
                             Box::pin(self.on_send_data(dst_key, &payload, &events)).await;
@@ -329,7 +356,7 @@ impl WgActor {
 
     async fn on_inbound(
         &mut self,
-        src_key: [u8; 32],
+        via: Via,
         payload: &[u8],
         events: &async_channel::Sender<WgEvent>,
     ) {
@@ -342,9 +369,9 @@ impl WgActor {
         }
         // Primary disco demux happens at the runtime edge; recv_one also
         // sniffs the WireGuard type byte defensively.
-        let from = Endpoint::Derp {
-            region_id: 0,
-            node_key: src_key,
+        let (from, src_key) = match via {
+            Via::Derp { src_key } => (Endpoint::Derp { region_id: 0, node_key: src_key }, Some(src_key)),
+            Via::Udp(addr) => (Endpoint::Udp(addr.into()), None),
         };
         // Reuse the persistent RecvOut scratch buffer (~6 KB of inline packet
         // buffers) instead of `Box::new`-ing a fresh one per packet: that
@@ -391,7 +418,7 @@ impl WgActor {
         if !sent {
             tracing::debug!("send_data queued (no active session yet) or dropped");
         }
-        self.drain_recv(dst_key, &out, events).await;
+        self.drain_recv(Some(dst_key), &out, events).await;
         self.return_scratch(out);
     }
 
@@ -417,12 +444,23 @@ impl WgActor {
         self.return_dispatch_scratch(outbound);
     }
 
-    async fn drain_recv(&self, src_key: [u8; 32], out: &RecvOut, events: &async_channel::Sender<WgEvent>) {
-        let dst_key = out
+    /// `fallback_key` is used only when the packet named no known peer.
+    /// Over UDP there is none, and nothing can be attributed, so nothing is
+    /// emitted.
+    async fn drain_recv(&self, fallback_key: Option<[u8; 32]>, out: &RecvOut, events: &async_channel::Sender<WgEvent>) {
+        let ep = self.endpoint.as_deref();
+        let Some(dst_key) = out
             .peer
-            .and_then(|id| self.endpoint.as_deref().and_then(|ep| ep.peer_key(id)))
+            .and_then(|id| ep.and_then(|ep| ep.peer_key(id)))
             .map(|k| k.to_bytes())
-            .unwrap_or(src_key);
+            .or(fallback_key)
+        else {
+            return;
+        };
+        // Computed after recv_one_into, so a packet that just proved a UDP
+        // path gets its reply (handshake response, confirmation) sent back
+        // the same way.
+        let via = out.peer.zip(ep).and_then(|(id, ep)| ep.path_for(id, Instant::now()));
 
         // Iterate by reference: moving the ArrayVecs out would reintroduce the
         // multi-KB owning iterator on the stack that boxing `out` removed.
@@ -430,6 +468,7 @@ impl WgActor {
             send_diag(events, WgEvent::OutboundPacket {
                 dst_key,
                 payload: pkt_to_buf(pkt),
+                via,
             }, "OutboundPacket").await;
         }
         for pkt in out.decrypted.iter() {
@@ -444,11 +483,13 @@ impl WgActor {
     }
 
     async fn emit_to_peer(&self, id: PeerId, pkt: Packet, events: &async_channel::Sender<WgEvent>) {
-        if let Some(key) = self.endpoint.as_deref().and_then(|ep| ep.peer_key(id)) {
+        let Some(ep) = self.endpoint.as_deref() else { return };
+        if let Some(key) = ep.peer_key(id) {
             let _ = events
                 .send(WgEvent::OutboundPacket {
                     dst_key: key.to_bytes(),
                     payload: pkt_to_buf(&pkt),
+                    via: ep.path_for(id, Instant::now()),
                 })
                 .await;
         }
@@ -506,4 +547,101 @@ fn now_unix() -> Option<u64> {
         .ok()
         .map(|d| d.as_secs())
         .filter(|&s| s > 1_700_000_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tm_control::TailnetIp;
+
+    async fn next_event(ev: &async_channel::Receiver<WgEvent>) -> WgEvent {
+        tokio::time::timeout(Duration::from_secs(2), ev.recv())
+            .await
+            .expect("WgActor emitted nothing")
+            .unwrap()
+    }
+
+    /// Plan Step 4, at the event level: a handshake response that arrives
+    /// over UDP from `x` makes the actor send its confirmation back to `x`
+    /// (`OutboundPacket.via == Some(x)`), while the initiation it sent before
+    /// any path was proven goes to DERP (`via == None`). A UDP datagram that
+    /// names no peer emits nothing. This is the only test in the crate that
+    /// runs a WgActor, because its endpoint lives in once-only static storage.
+    #[tokio::test(flavor = "current_thread")]
+    async fn replies_to_udp_inbound_are_tagged_with_the_udp_path() {
+        let a_priv = [0x11u8; 32];
+        let a_kp = NodeKeyPair::from_private(NodePrivateKey(a_priv));
+        let b_kp = NodeKeyPair::new();
+        let b_key = b_kp.public.to_bytes();
+        let mut b = WgEndpoint::new(b_kp);
+        b.add_peer(
+            PeerConfig { key: a_kp.public, psk: Psk::zero() },
+            Endpoint::Derp { region_id: 1, node_key: a_kp.public.to_bytes() },
+        )
+        .unwrap();
+
+        let (cmd_tx, cmd_rx) = async_channel::bounded(8);
+        let (ev_tx, ev_rx) = async_channel::bounded(8);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let actor = tokio::task::spawn_local(WgActor::new(a_priv, None).run(cmd_rx, ev_tx));
+
+                let mut map: MapState<MAX_PEERS, 4> = MapState {
+                    our_ip: TailnetIp([100, 64, 0, 1]),
+                    peers: Default::default(),
+                    derp_regions: Default::default(),
+                };
+                map.peers.push(PeerInfo {
+                    node_key: b_key,
+                    disco_key: [0; 32],
+                    tailnet_ip: TailnetIp([100, 64, 0, 2]),
+                    prefix_len: 32,
+                    hostname: heapless::String::new(),
+                    derp_region: 1,
+                    is_online: true,
+                });
+                cmd_tx.send(WgCmd::ApplyMap(Box::new(map))).await.unwrap();
+
+                let WgEvent::OutboundPacket { dst_key, payload: init, via } = next_event(&ev_rx).await else {
+                    panic!("expected the proactive initiation");
+                };
+                assert_eq!((dst_key, via), (b_key, None), "no path proven yet -> DERP");
+
+                let now = Instant::now();
+                let resp = b.recv_one(&init, Endpoint::Derp { region_id: 1, node_key: a_kp.public.to_bytes() }, now);
+                drop(init);
+                let x: SocketAddrV4 = "192.168.15.70:41641".parse().unwrap();
+                cmd_tx
+                    .send(WgCmd::InboundPacket {
+                        via: Via::Udp(x),
+                        payload: tm_buf::PktBuf::from_slice(resp.to_peer[0].as_slice()).unwrap(),
+                    })
+                    .await
+                    .unwrap();
+
+                let WgEvent::OutboundPacket { dst_key, payload: conf, via } = next_event(&ev_rx).await else {
+                    panic!("expected the session confirmation");
+                };
+                assert_eq!((dst_key, via), (b_key, Some(x)), "reply goes back over the proven UDP path");
+                let done = b.recv_one(&conf, Endpoint::Udp(std::net::SocketAddr::V4("192.168.15.74:41641".parse().unwrap())), now);
+                assert_eq!(done.decrypted.len(), 1, "B accepts the confirmation");
+                drop(conf);
+                assert!(matches!(next_event(&ev_rx).await, WgEvent::PeerHandshook(k) if k == b_key));
+
+                // Junk over UDP has no peer to attribute anything to.
+                let y: SocketAddrV4 = "192.168.15.66:41641".parse().unwrap();
+                cmd_tx
+                    .send(WgCmd::InboundPacket {
+                        via: Via::Udp(y),
+                        payload: tm_buf::PktBuf::from_slice(&[4, 0, 0, 0, 9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap(),
+                    })
+                    .await
+                    .unwrap();
+                cmd_tx.send(WgCmd::Shutdown).await.unwrap();
+                actor.await.unwrap();
+                assert!(ev_rx.try_recv().is_err(), "nothing emitted for an unattributable UDP datagram");
+            })
+            .await;
+    }
 }

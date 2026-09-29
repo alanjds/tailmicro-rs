@@ -15,7 +15,7 @@
 //!   * transport endpoint modelled as a Rust `enum Endpoint` (no 127.3.3.40
 //!     fake-IP hack); authenticated-only endpoint roaming, skipped for DERP.
 
-use core::net::SocketAddr;
+use core::net::{SocketAddr, SocketAddrV4};
 use core::time::Duration;
 use std::time::Instant;
 
@@ -87,10 +87,19 @@ pub enum Endpoint {
     Derp { region_id: u16, node_key: [u8; 32] },
 }
 
-impl Endpoint {
-    fn is_derp(&self) -> bool {
-        matches!(self, Endpoint::Derp { .. })
-    }
+/// How long a direct UDP path stays usable after the last authenticated
+/// evidence from it. Matches tailscaled's `trustUDPAddrDuration`: an active
+/// tailscaled peer heartbeats its best path about every 3 s, so trust stays
+/// warm while the path works and lapses on its own when the peer goes idle,
+/// leaves the LAN or changes address (docs/lan-direct-path-plan.md D3).
+pub const DIRECT_TRUST: Duration = Duration::from_millis(6500);
+
+/// A LAN path to a peer, proven by authenticated traffic from exactly
+/// `addr`. Sends use it only while `now < trust_until`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectPath {
+    pub addr: SocketAddrV4,
+    pub trust_until: Instant,
 }
 
 type Queue = ArrayVec<Packet, QUEUE_DEPTH>;
@@ -239,7 +248,11 @@ impl SessionState {
 struct Peer {
     id: PeerId,
     config: PeerConfig,
-    endpoint: Endpoint,
+    /// Always the DERP route. It is never torn down, because it is where
+    /// sends go whenever the direct path is absent or untrusted.
+    derp: Endpoint,
+    /// Optional LAN path, trust-windowed (D3).
+    direct: Option<DirectPath>,
     session: SessionState,
     handshake: Handshake,
     last_seen_timestamp: Option<crate::vendor::tai64n::TAI64N>,
@@ -249,12 +262,13 @@ struct Peer {
 }
 
 impl Peer {
-    fn new(id: PeerId, config: PeerConfig, endpoint: Endpoint) -> Self {
+    fn new(id: PeerId, config: PeerConfig, derp: Endpoint) -> Self {
         let cookie_sender = MACSender::new(&config.key);
         Self {
             id,
             config,
-            endpoint,
+            derp,
+            direct: None,
             session: SessionState::None(Queue::new()),
             handshake: Handshake::None,
             last_seen_timestamp: None,
@@ -521,15 +535,15 @@ impl WgEndpoint {
         self.peers.iter().position(|p| p.config.key == *key)
     }
 
-    /// Add a peer. Returns its id, or None if the table is full or the key is
-    /// already present.
-    pub fn add_peer(&mut self, cfg: PeerConfig, endpoint: Endpoint) -> Option<PeerId> {
+    /// Add a peer reachable over `derp` (its fallback route). Returns its id,
+    /// or None if the table is full or the key is already present.
+    pub fn add_peer(&mut self, cfg: PeerConfig, derp: Endpoint) -> Option<PeerId> {
         if self.peer_index_by_key(&cfg.key).is_some() || self.peers.is_full() {
             return None;
         }
         self.state.next_peer_id += 1;
         let id = PeerId(self.state.next_peer_id);
-        self.peers.push(Peer::new(id, cfg, endpoint));
+        self.peers.push(Peer::new(id, cfg, derp));
         Some(id)
     }
 
@@ -551,8 +565,35 @@ impl WgEndpoint {
         self.peer_index(id).map(|i| self.peers[i].config.key)
     }
 
+    /// The peer's DERP (fallback) route.
     pub fn peer_endpoint(&self, id: PeerId) -> Option<Endpoint> {
-        self.peer_index(id).map(|i| self.peers[i].endpoint.clone())
+        self.peer_index(id).map(|i| self.peers[i].derp.clone())
+    }
+
+    /// The peer's direct path record, trusted or not.
+    pub fn peer_direct(&self, id: PeerId) -> Option<DirectPath> {
+        self.peer_index(id).and_then(|i| self.peers[i].direct)
+    }
+
+    /// Where to send to `id` right now: `Some(addr)` for the direct path
+    /// while it is trusted, `None` for DERP. One rule for handshakes,
+    /// keepalives and data, so they never split across paths.
+    pub fn path_for(&self, id: PeerId, now: Instant) -> Option<SocketAddrV4> {
+        let d = self.peer_direct(id)?;
+        (now < d.trust_until).then_some(d.addr)
+    }
+
+    /// A disco PING from `addr` opened under this peer's allowlisted disco
+    /// key (tm_disco checked the node-key pairing), which is authenticated
+    /// evidence that `addr` reaches the peer. Returns false for an unknown
+    /// peer.
+    pub fn direct_path_seen(&mut self, node_key: &[u8; 32], addr: SocketAddrV4, now: Instant) -> bool {
+        let k = NodePublicKey::from_bytes(*node_key);
+        let Some(idx) = self.peer_index_by_key(&k) else {
+            return false;
+        };
+        trust_direct(&mut self.peers[idx], addr, now);
+        true
     }
 
     pub fn peer_id_by_key(&self, key: &[u8; 32]) -> Option<PeerId> {
@@ -667,14 +708,14 @@ impl WgEndpoint {
         };
 
         match msg {
-            Message::HandshakeInitiation(_) => self.recv_init(raw, &from, now, out),
-            Message::HandshakeResponse(_) => self.recv_response(raw, now, out),
+            Message::HandshakeInitiation(_) => self.recv_init(raw, now, out),
+            Message::HandshakeResponse(_) => self.recv_response(raw, &from, now, out),
             Message::CookieReply(_) => self.recv_cookie(raw, out),
             Message::TransportDataHeader(_) => self.recv_transport(raw, &from, now, out),
         }
     }
 
-    fn recv_init(&mut self, raw: &[u8], from: &Endpoint, now: Instant, out: &mut RecvOut) {
+    fn recv_init(&mut self, raw: &[u8], now: Instant, out: &mut RecvOut) {
         let Ok(init) = HandshakeInitiation::try_ref_from_bytes(raw) else {
             return;
         };
@@ -701,8 +742,11 @@ impl WgEndpoint {
 
         let session_id = self.state.alloc_session(peer_id);
         let peer = &mut self.peers[idx];
-        // Roaming: adopt sender address only for authenticated, non-DERP src.
-        maybe_roam(peer, from);
+        // No roaming on an initiation: it proves nothing about the sender's
+        // address (an initiation seen once can be re-sent from anywhere, and
+        // the replay check above lets an equal timestamp through). The path
+        // is adopted when the handshake completes, on the confirming
+        // transport packet in recv_transport.
         let pkt = peer.handshake.respond(
             session_id,
             hs,
@@ -713,7 +757,7 @@ impl WgEndpoint {
         let _ = out.to_peer.try_push(pkt);
     }
 
-    fn recv_response(&mut self, raw: &[u8], now: Instant, out: &mut RecvOut) {
+    fn recv_response(&mut self, raw: &[u8], from: &Endpoint, now: Instant, out: &mut RecvOut) {
         let Ok(resp) = HandshakeResponse::try_ref_from_bytes(raw) else {
             return;
         };
@@ -737,6 +781,8 @@ impl WgEndpoint {
         };
         self.peers[idx].handshake_timeout = None;
         out.handshook = true;
+        // `finish` authenticated the response, so its source is proven.
+        maybe_roam(&mut self.peers[idx], from, now);
 
         let freed = self.peers[idx].session.activate(session, &mut out.to_peer);
         for sid in freed {
@@ -799,7 +845,7 @@ impl WgEndpoint {
                 .unwrap()
                 .decrypt_one(&mut pkt);
             if ok {
-                maybe_roam(&mut self.peers[idx], from);
+                maybe_roam(&mut self.peers[idx], from, now);
                 self.peers[idx].schedule_keepalive(now);
                 let _ = out.decrypted.try_push(pkt);
             }
@@ -811,7 +857,7 @@ impl WgEndpoint {
             .handshake
             .confirm(session_id, vec![Packet::from_wire(raw)]);
         if let Some((session, decrypted)) = confirmed {
-            maybe_roam(&mut self.peers[idx], from);
+            maybe_roam(&mut self.peers[idx], from, now);
             self.peers[idx].schedule_keepalive(now);
             for p in decrypted {
                 let _ = out.decrypted.try_push(p);
@@ -903,19 +949,22 @@ impl WgEndpoint {
     }
 }
 
-/// Adopt a peer's source address from an authenticated (post-decrypt) packet.
-/// Explicitly skipped for DERP-sourced packets and non-UDP endpoints.
-fn maybe_roam(peer: &mut Peer, from: &Endpoint) {
-    if from.is_derp() {
-        return; // never roam based on DERP-relayed source
+/// Called only after a packet from `from` authenticated (decrypted, or
+/// completed a handshake). UDP evidence sets or refreshes the direct path,
+/// adopting a new address if the peer moved (D3). DERP-relayed packets say
+/// nothing about any LAN address, so they never touch it. IPv6 is ignored:
+/// the device's UDP socket is v4-only.
+fn maybe_roam(peer: &mut Peer, from: &Endpoint, now: Instant) {
+    if let Endpoint::Udp(SocketAddr::V4(addr)) = from {
+        trust_direct(peer, *addr, now);
     }
-    if let Endpoint::Udp(new_addr) = from
-        && peer.endpoint != *from
-        && !peer.endpoint.is_derp()
-    {
-        tracing::debug!(?new_addr, "peer roamed to new udp endpoint");
-        peer.endpoint = Endpoint::Udp(*new_addr);
+}
+
+fn trust_direct(peer: &mut Peer, addr: SocketAddrV4, now: Instant) {
+    if peer.direct.map(|d| d.addr) != Some(addr) {
+        tracing::debug!(%addr, "peer direct path set");
     }
+    peer.direct = Some(DirectPath { addr, trust_until: now + DIRECT_TRUST });
 }
 
 /// A small, cheap jitter source in `[0, HANDSHAKE_JITTER_MS)`.
@@ -1196,5 +1245,201 @@ mod tests {
                 }
             )
             .is_none(), "table should be full at MAX_PEERS");
+    }
+
+    // ── Step 4 of docs/lan-direct-path-plan.md: dual-path peers ──
+
+    fn udp(s: &str) -> Endpoint {
+        Endpoint::Udp(s.parse().unwrap())
+    }
+    fn v4(s: &str) -> SocketAddrV4 {
+        s.parse().unwrap()
+    }
+
+    struct Pair {
+        a: WgEndpoint,
+        b: WgEndpoint,
+        a_kp: NodeKeyPair,
+        b_kp: NodeKeyPair,
+        /// B as seen from A, and A as seen from B.
+        a_peer: PeerId,
+        b_peer: PeerId,
+    }
+
+    fn pair() -> Pair {
+        let a_kp = NodeKeyPair::new();
+        let b_kp = NodeKeyPair::new();
+        let mut a = WgEndpoint::new(a_kp);
+        let mut b = WgEndpoint::new(b_kp);
+        let a_peer = a.add_peer(PeerConfig { key: b_kp.public, psk: Psk::zero() }, a_derp(&b_kp)).unwrap();
+        let b_peer = b.add_peer(PeerConfig { key: a_kp.public, psk: Psk::zero() }, b_derp(&a_kp)).unwrap();
+        Pair { a, b, a_kp, b_kp, a_peer, b_peer }
+    }
+
+    /// A initiates. Every packet B sends reaches A over `to_a`, and every
+    /// packet A sends reaches B over `to_b`. Returns once both sessions are
+    /// active.
+    fn handshake(p: &mut Pair, to_a: &Endpoint, to_b: &Endpoint, now: Instant) {
+        let init = p.a.initiate(p.a_peer, now, now_unix()).unwrap();
+        let resp = p.b.recv_one(init.as_slice(), to_b.clone(), now);
+        assert_eq!(resp.to_peer.len(), 1);
+        let conf = p.a.recv_one(resp.to_peer[0].as_slice(), to_a.clone(), now);
+        assert!(conf.handshook);
+        let done = p.b.recv_one(conf.to_peer[0].as_slice(), to_b.clone(), now);
+        assert_eq!(done.decrypted.len(), 1, "B confirms the session");
+    }
+
+    /// One app-data packet from B to A, as wire bytes.
+    fn b_to_a_data(p: &mut Pair, now: Instant) -> Packet {
+        let mut out = RecvOut::default();
+        assert!(p.b.send_data(&p.a_kp.public.to_bytes(), &[0x45, 0, 0, 20], now, &mut out));
+        out.to_peer[0].clone()
+    }
+
+    #[test]
+    fn udp_path_is_adopted_from_authenticated_packets_and_used_for_replies() {
+        let mut p = pair();
+        let t = Instant::now();
+        // A's address as B sees it, and B's as A sees it.
+        let (xa, xb) = ("192.168.15.74:41641", "192.168.15.70:41641");
+
+        let init = p.a.initiate(p.a_peer, t, now_unix()).unwrap();
+        let resp = p.b.recv_one(init.as_slice(), udp(xa), t);
+        assert_eq!(p.b.path_for(p.b_peer, t), None,
+                   "an initiation alone proves nothing about the sender's address");
+
+        let conf = p.a.recv_one(resp.to_peer[0].as_slice(), udp(xb), t);
+        assert!(conf.handshook);
+        assert_eq!(p.a.path_for(p.a_peer, t), Some(v4(xb)),
+                   "an authenticated response over UDP sets the direct path, \
+                    so A's confirmation goes back over it");
+
+        let done = p.b.recv_one(conf.to_peer[0].as_slice(), udp(xa), t);
+        assert_eq!(done.decrypted.len(), 1);
+        assert_eq!(p.b.path_for(p.b_peer, t), Some(v4(xa)),
+                   "the confirming transport packet completes the handshake and proves A's address");
+
+        // Data from the same address keeps it trusted; silence lets it lapse.
+        let later = t + KEEPALIVE_TIMEOUT + Duration::from_millis(1);
+        let data = b_to_a_data(&mut p, t);
+        let r = p.a.recv_one(data.as_slice(), udp(xb), t);
+        assert_eq!(r.decrypted.len(), 1);
+        assert_eq!(r.peer, Some(p.a_peer));
+        assert_eq!(p.a.path_for(p.a_peer, t + Duration::from_secs(6)), Some(v4(xb)));
+        assert_eq!(p.a.path_for(p.a_peer, later), None, "no traffic for 10 s -> trust has lapsed");
+    }
+
+    #[test]
+    fn forged_or_undecryptable_udp_never_changes_the_path() {
+        let mut p = pair();
+        let t = Instant::now();
+        let (x, y) = ("192.168.15.70:41641", "192.168.15.66:41641");
+        let to_b = b_derp(&p.a_kp);
+        handshake(&mut p, &udp(x), &to_b, t);
+        assert_eq!(p.a.path_for(p.a_peer, t), Some(v4(x)));
+        let before = p.a.peer_direct(p.a_peer);
+
+        let t1 = t + Duration::from_secs(1);
+        // A genuine packet, delivered from x, then replayed from y: the replay
+        // window rejects the second copy, so y gains nothing.
+        let data = b_to_a_data(&mut p, t1);
+        assert_eq!(p.a.recv_one(data.as_slice(), udp(x), t1).decrypted.len(), 1);
+        let after_x = p.a.peer_direct(p.a_peer);
+        assert_eq!(p.a.recv_one(data.as_slice(), udp(y), t1).decrypted.len(), 0);
+        assert_eq!(p.a.peer_direct(p.a_peer), after_x, "replayed packet from y");
+
+        // Same header (right receiver id), corrupted ciphertext.
+        let mut forged = b_to_a_data(&mut p, t1).as_slice().to_vec();
+        let last = forged.len() - 1;
+        forged[last] ^= 0xff;
+        assert_eq!(p.a.recv_one(&forged, udp(y), t1).decrypted.len(), 0);
+        assert_eq!(p.a.peer_direct(p.a_peer), after_x, "undecryptable packet from y");
+
+        // A captured initiation re-sent from y.
+        let init = p.b.initiate(p.b_peer, t1, now_unix()).unwrap();
+        let _ = p.a.recv_one(init.as_slice(), udp(y), t1);
+        assert_eq!(p.a.peer_direct(p.a_peer), after_x, "initiation from y");
+
+        // Junk that is not WireGuard at all.
+        let _ = p.a.recv_one(&[4, 0, 0, 0, 1, 2, 3], udp(y), t1);
+        let _ = p.a.recv_one(&[9; 64], udp(y), t1);
+        assert_eq!(p.a.peer_direct(p.a_peer), after_x, "junk from y");
+
+        assert_eq!(before.map(|d| d.addr), Some(v4(x)));
+        assert_eq!(after_x.map(|d| d.addr), Some(v4(x)));
+    }
+
+    #[test]
+    fn trust_expires_after_6_5_s_and_sends_revert_to_derp() {
+        let mut p = pair();
+        let t = Instant::now();
+        let to_b = b_derp(&p.a_kp);
+        handshake(&mut p, &udp("192.168.15.70:41641"), &to_b, t);
+        assert_eq!(DIRECT_TRUST, Duration::from_millis(6500));
+        assert!(p.a.path_for(p.a_peer, t + Duration::from_millis(6400)).is_some());
+        assert_eq!(p.a.path_for(p.a_peer, t + Duration::from_millis(6600)), None);
+        assert_eq!(p.a.peer_endpoint(p.a_peer), Some(a_derp(&p.b_kp)),
+                   "the DERP route is still there to fall back to");
+    }
+
+    #[test]
+    fn authenticated_packet_from_a_new_address_moves_the_path() {
+        let mut p = pair();
+        let t = Instant::now();
+        let (x, z) = ("192.168.15.70:41641", "192.168.15.99:41641");
+        let to_b = b_derp(&p.a_kp);
+        handshake(&mut p, &udp(x), &to_b, t);
+        assert_eq!(p.a.path_for(p.a_peer, t), Some(v4(x)));
+
+        let t1 = t + Duration::from_secs(2);
+        let data = b_to_a_data(&mut p, t1);
+        assert_eq!(p.a.recv_one(data.as_slice(), udp(z), t1).decrypted.len(), 1);
+        assert_eq!(p.a.path_for(p.a_peer, t1), Some(v4(z)));
+        assert_eq!(p.a.peer_direct(p.a_peer).unwrap().trust_until, t1 + DIRECT_TRUST);
+    }
+
+    #[test]
+    fn derp_sourced_packets_leave_the_direct_path_untouched() {
+        let mut p = pair();
+        let t = Instant::now();
+        let x = "192.168.15.70:41641";
+        let to_b = b_derp(&p.a_kp);
+        handshake(&mut p, &udp(x), &to_b, t);
+        let before = p.a.peer_direct(p.a_peer);
+
+        let t1 = t + Duration::from_secs(3);
+        let data = b_to_a_data(&mut p, t1);
+        assert_eq!(p.a.recv_one(data.as_slice(), a_derp(&p.b_kp), t1).decrypted.len(), 1,
+                   "DERP inbound is always accepted");
+        assert_eq!(p.a.peer_direct(p.a_peer), before, "neither moved nor refreshed by DERP");
+
+        // And with no direct path at all, DERP never creates one.
+        let mut q = pair();
+        let (to_a, to_b) = (a_derp(&q.b_kp), b_derp(&q.a_kp));
+        handshake(&mut q, &to_a, &to_b, t);
+        assert_eq!(q.a.peer_direct(q.a_peer), None);
+        assert_eq!(q.b.peer_direct(q.b_peer), None);
+    }
+
+    #[test]
+    fn direct_path_seen_sets_and_refreshes_trust() {
+        let mut p = pair();
+        let t = Instant::now();
+        let b_key = p.b_kp.public.to_bytes();
+        assert!(p.a.direct_path_seen(&b_key, v4("192.168.15.70:41641"), t));
+        assert_eq!(p.a.path_for(p.a_peer, t), Some(v4("192.168.15.70:41641")));
+        let t1 = t + Duration::from_secs(5);
+        assert!(p.a.direct_path_seen(&b_key, v4("192.168.15.70:41641"), t1));
+        assert!(p.a.path_for(p.a_peer, t + Duration::from_secs(10)).is_some(), "refreshed at t1");
+        assert!(!p.a.direct_path_seen(&[7u8; 32], v4("192.168.15.1:1"), t), "unknown peer");
+    }
+
+    #[test]
+    fn ipv6_udp_source_is_ignored() {
+        let mut p = pair();
+        let t = Instant::now();
+        let to_b = b_derp(&p.a_kp);
+        handshake(&mut p, &udp("[fd00::1]:41641"), &to_b, t);
+        assert_eq!(p.a.peer_direct(p.a_peer), None);
     }
 }

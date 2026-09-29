@@ -679,7 +679,7 @@ async fn event_router_task(
                                 tokio_freertos_yield().await;
                             } else {
                                 forward_or_drop(&wg_tx2, WgCmd::InboundPacket {
-                                    src_key: *src_key.as_bytes(),
+                                    via: tm_wg::Via::Derp { src_key: *src_key.as_bytes() },
                                     payload,
                                 }, "WgCmd::InboundPacket");
                                 #[cfg(target_os = "espidf")]
@@ -724,7 +724,12 @@ async fn event_router_task(
             // ── WireGuard data-plane events (previously dropped) ──────
             evt = wg_ev_rx.recv() => {
                 match evt {
-                    Ok(WgEvent::OutboundPacket { dst_key, payload }) => {
+                    // `via` is always None until Step 5 of the LAN-direct
+                    // plan: nothing can prove a direct path yet (no UDP
+                    // WireGuard ingest, DirectPathSeen not forwarded), so
+                    // everything still goes to DERP. Step 5 sends
+                    // `Some(addr)` to the LAN socket with DERP as fallback.
+                    Ok(WgEvent::OutboundPacket { dst_key, payload, via: _ }) => {
                         // The outbound WireGuard path: handshake
                         // initiations, keepalives and transport data
                         // leave tm_wg here and are handed to DERP for
@@ -846,13 +851,13 @@ async fn event_router_task(
                         warn!("Runtime::join() - DiscoEvent::SendPongUdp -> {} ({} bytes) but no UDP socket yet (Step 2 of the LAN-direct-path plan); dropped", dst, payload.len());
                     }
                     Ok(DiscoEvent::DirectPathSeen { node_key, addr }) => {
-                        // Step 1: authenticated evidence that this peer has
-                        // a working direct UDP path. Step 4 of the plan
-                        // feeds this into `tm_wg::WgCmd::DirectPathSeen` to
-                        // actually switch WireGuard's send path; that
-                        // command doesn't exist yet, so this is log-only
-                        // plumbing for now.
-                        info!("Runtime::join() - DiscoEvent::DirectPathSeen peer {:02x}{:02x}.. at {} (Step 4 will feed this into tm_wg)", node_key[0], node_key[1], addr);
+                        // Authenticated evidence that this peer has a working
+                        // direct UDP path. `tm_wg::WgCmd::DirectPathSeen`
+                        // exists now (Step 4), but forwarding it would switch
+                        // WireGuard's sends to a path whose replies cannot be
+                        // ingested yet (plan D4), so it is only logged until
+                        // Step 5 wires UDP ingest at the same time.
+                        info!("Runtime::join() - DiscoEvent::DirectPathSeen peer {:02x}{:02x}.. at {} (not forwarded to tm_wg until Step 5)", node_key[0], node_key[1], addr);
                     }
                     Ok(DiscoEvent::PingFrom(key)) => {
                         info!("Runtime::join() - DiscoEvent::PingFrom peer {:02x}{:02x}..", key[0], key[1]);
@@ -1293,7 +1298,7 @@ impl Runtime {
                                     } else {
                                         // WireGuard packet, forwarded as-is.
                                         forward_or_drop(&wg_tx2, WgCmd::InboundPacket {
-                                            src_key: *src_key.as_bytes(),
+                                            via: tm_wg::Via::Derp { src_key: *src_key.as_bytes() },
                                             payload,
                                         }, "WgCmd::InboundPacket");
                                     }
