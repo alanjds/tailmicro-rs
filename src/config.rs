@@ -94,6 +94,9 @@ impl Config {
             control_port: self.control_port,
             control_pin:  self.control_pin,
             connect_timeout: self.connect_timeout,
+            // Filled in by tm_runtime once (and if) its lan-direct UDP
+            // socket is bound; the app config has no say in it.
+            lan_udp_port: None,
         }
     }
 }

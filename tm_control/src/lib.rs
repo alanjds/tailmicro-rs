@@ -154,6 +154,12 @@ pub struct Config {
     /// (drain-and-discard, see `stream_map_response`) so the ephemeral node
     /// stays online. See docs/wg-dataplane-notes.md "Bring-up timeout".
     pub connect_timeout: Option<core::time::Duration>,
+    /// Port of the runtime's bound LAN UDP socket (`lan-direct` feature),
+    /// or `None` when there is none. With `Some`, bring-up derives the LAN
+    /// endpoint `<control-socket local IPv4>:<port>` (plan D1). It is only
+    /// advertised once `PUBLISH_LAN_ENDPOINT` is on (Step 5, D4), because
+    /// peers must not be pointed at a socket that cannot answer yet.
+    pub lan_udp_port: Option<u16>,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -263,6 +269,66 @@ pub fn select_home_region<const P: usize, const R: usize>(
 /// Hostinfo.NetInfo.PreferredDERP -- both together, matching the confirmed
 /// recipe in tools/wg_validator/validate_live_tailnet.py.
 pub const DERP_MAGIC_IP: &str = "127.3.3.40";
+
+/// Off until Step 5 of docs/lan-direct-path-plan.md (D4): once published,
+/// peers start sending disco PINGs and WireGuard to the LAN endpoint, so it
+/// must only go out together with the UDP PONG and UDP WireGuard ingest.
+/// While off, publish #2 is byte-identical to the DERP-only body.
+const PUBLISH_LAN_ENDPOINT: bool = false;
+
+/// Plan D1: the LAN endpoint is the IPv4 address the control TCP socket is
+/// bound to (the OS already picked the LAN-facing interface to reach the
+/// internet), plus our UDP port. Rejected: IPv6 (the device's UDP socket is
+/// v4-only), unspecified, loopback, and the tailnet range 100.64.0.0/10,
+/// which would mean control went through our own tunnel and advertising it
+/// would invite WireGuard-in-WireGuard.
+pub fn lan_endpoint(local: std::net::SocketAddr, port: u16) -> Option<std::net::SocketAddrV4> {
+    let std::net::SocketAddr::V4(v4) = local else { return None };
+    let ip = *v4.ip();
+    let o = ip.octets();
+    let tailnet = o[0] == 100 && (o[1] & 0xC0) == 64;
+    if ip.is_unspecified() || ip.is_loopback() || tailnet || port == 0 {
+        return None;
+    }
+    Some(std::net::SocketAddrV4::new(ip, port))
+}
+
+/// Body of publish #2 (home-region re-publish). Factored out so the host
+/// tests can pin it against ts_control.py's write_map and against the
+/// DERP-only body. `lan_ep` goes first: tailscaled tries endpoints in
+/// order, and the DERP magic entry is the fallback.
+fn publish2_body(node_key_hex: &str, disco_key_hex: &str, region: u16,
+                 lan_ep: Option<std::net::SocketAddrV4>)
+    -> Result<heapless::Vec<u8, REQUEST_BODY_CAP>, JsonError>
+{
+    use core::fmt::Write as _;
+    let mut home: heapless::String<24> = heapless::String::new();
+    let _ = write!(home, "{}:{}", DERP_MAGIC_IP, region);
+    let mut lan: heapless::String<24> = heapless::String::new();
+    let derp_only;
+    let both;
+    let endpoints: &[&str] = match lan_ep {
+        Some(ep) => {
+            let _ = write!(lan, "{}", ep);
+            both = [lan.as_str(), home.as_str()];
+            &both
+        }
+        None => {
+            derp_only = [home.as_str()];
+            &derp_only
+        }
+    };
+    to_json_buf(&MapRequest {
+        version: CAPABILITY_VERSION, compress: "", keep_alive: false,
+        node_key: node_key_hex, endpoints, stream: false,
+        disco_key: Some(disco_key_hex),
+        hostinfo: Some(HostInfo {
+            os: "embedded", hostname: "esp32c3",
+            net_info: Some(NetInfo { preferred_derp: region }),
+        }),
+        omit_peers: false,
+    })
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -590,19 +656,20 @@ impl ControlActor {
         // caches go stale (e.g. after we reboot on a now-stable tailnet IP).
         if let Some(region) = home_region {
             let disco_key_hex = self.node_state.disco_key.public().to_hex();
-            let home_endpoint = format!("{}:{}", DERP_MAGIC_IP, region);
-            let endpoints = [home_endpoint.as_str()];
-            info!("Tailscale Step 7.6: re-publishing with PreferredDERP={} endpoint={}", region, home_endpoint);
-            let republish_body = to_json_buf(&MapRequest {
-                version: CAPABILITY_VERSION, compress: "", keep_alive: false,
-                node_key: node_key_hex.as_str(), endpoints: &endpoints, stream: false,
-                disco_key: Some(disco_key_hex.as_str()),
-                hostinfo: Some(HostInfo {
-                    os: "embedded", hostname: "esp32c3",
-                    net_info: Some(NetInfo { preferred_derp: region }),
-                }),
-                omit_peers: false,
-            }).map_err(ControlError::Json)?;
+            let lan_ep = self.config.lan_udp_port.and_then(|port| {
+                let ep = main_conn.local_addr().ok().and_then(|la| lan_endpoint(la, port));
+                match ep {
+                    Some(ep) if PUBLISH_LAN_ENDPOINT => info!("lan-direct: publishing LAN endpoint {}", ep),
+                    Some(ep) => info!("lan-direct: LAN endpoint {} computed, not published yet", ep),
+                    None => tracing::warn!("lan-direct: control socket has no usable LAN IPv4; DERP-only"),
+                }
+                ep
+            });
+            let published_lan = if PUBLISH_LAN_ENDPOINT { lan_ep } else { None };
+            info!("Tailscale Step 7.6: re-publishing with PreferredDERP={} endpoint={}:{}", region, DERP_MAGIC_IP, region);
+            let republish_body = publish2_body(
+                node_key_hex.as_str(), disco_key_hex.as_str(), region, published_lan,
+            ).map_err(ControlError::Json)?;
             let republish_req = build_h2_post("/machine/map", host, MAP_REPUBLISH_STREAM_ID, &republish_body);
             noise.write_all(&mut main_conn, &republish_req).await?;
             // Drain + parse the response (re-emits the authoritative netmap,
@@ -1092,6 +1159,7 @@ mod tests {
             control_port: addr.port(),
             control_pin: [0u8; 32],
             connect_timeout: Some(Duration::from_millis(50)),
+            lan_udp_port: None,
         };
 
         match run_once(config).await {
@@ -1119,6 +1187,7 @@ mod tests {
             control_port: addr.port(),
             control_pin: [0u8; 32],
             connect_timeout: None,
+            lan_udp_port: None,
         };
 
         match run_once(config).await {
@@ -1128,5 +1197,74 @@ mod tests {
             ControlEvent::Error(_) => {} // any other connect error is expected
             _ => panic!("expected ControlEvent::Error"),
         }
+    }
+
+    // ── Step 3 of docs/lan-direct-path-plan.md: LAN endpoint, unpublished ──
+
+    const NODE_HEX: &str = "nodekey:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+    const DISCO_HEX: &str = "discokey:2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40";
+
+    /// With a LAN endpoint, publish #2 must carry the same fields and
+    /// values as ts_control.py's write_map (the client that is known to
+    /// publish endpoints successfully), per gen_publish2_lan_vector.py.
+    /// Compared as parsed JSON: Python orders keys and spaces them
+    /// differently, and the control server does not care about either.
+    /// The only intended difference is Hostinfo.OS, which the Python probe
+    /// hard-codes to "linux".
+    #[test]
+    fn publish2_with_lan_endpoint_matches_ts_control_write_map() {
+        let lan = lan_endpoint("192.168.15.20:50000".parse().unwrap(), 41641);
+        let body = publish2_body(NODE_HEX, DISCO_HEX, 11, lan).unwrap();
+        let ours: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let mut py: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tools/wg_validator/publish2_lan_body.json")).unwrap();
+        assert_eq!(py["Hostinfo"]["OS"], "linux");
+        py["Hostinfo"]["OS"] = "embedded".into();
+        assert_eq!(ours, py);
+        assert_eq!(ours["Endpoints"][0], "192.168.15.20:41641", "LAN endpoint goes first");
+    }
+
+    /// With no LAN endpoint (feature off, filter rejected it, or publishing
+    /// still switched off), the body must be exactly what bring_up sent
+    /// before Step 3. The expected bytes are built the way the old inline
+    /// code built them.
+    #[test]
+    fn publish2_without_lan_endpoint_is_byte_identical_to_derp_only() {
+        let region = 11u16;
+        let home_endpoint = format!("{}:{}", DERP_MAGIC_IP, region);
+        let endpoints = [home_endpoint.as_str()];
+        let old = to_json_buf(&MapRequest {
+            version: CAPABILITY_VERSION, compress: "", keep_alive: false,
+            node_key: NODE_HEX, endpoints: &endpoints, stream: false,
+            disco_key: Some(DISCO_HEX),
+            hostinfo: Some(HostInfo {
+                os: "embedded", hostname: "esp32c3",
+                net_info: Some(NetInfo { preferred_derp: region }),
+            }),
+            omit_peers: false,
+        }).unwrap();
+        let new = publish2_body(NODE_HEX, DISCO_HEX, region, None).unwrap();
+        assert_eq!(new.as_slice(), old.as_slice());
+    }
+
+    /// Step 5 flips this deliberately; until then nothing may leak out.
+    #[test]
+    fn lan_endpoint_publishing_is_still_off() {
+        assert!(!PUBLISH_LAN_ENDPOINT);
+    }
+
+    #[test]
+    fn lan_endpoint_filter_per_d1() {
+        let f = |s: &str| lan_endpoint(s.parse().unwrap(), 41641);
+        assert_eq!(f("100.64.1.2:1234"), None, "tailnet CGNAT range");
+        assert_eq!(f("100.127.255.254:1234"), None, "top of 100.64/10");
+        assert_eq!(f("127.0.0.1:1234"), None);
+        assert_eq!(f("0.0.0.0:1234"), None);
+        assert_eq!(f("[fd7a:115c:a1e0::1]:1234"), None, "v6 is out of scope");
+        assert_eq!(f("192.168.15.20:1234"), Some("192.168.15.20:41641".parse().unwrap()));
+        assert_eq!(f("8.8.4.4:1234"), Some("8.8.4.4:41641".parse().unwrap()), "public v4");
+        assert_eq!(f("100.63.0.1:1234"), Some("100.63.0.1:41641".parse().unwrap()), "just below 100.64/10");
+        assert_eq!(f("100.128.0.1:1234"), Some("100.128.0.1:41641".parse().unwrap()), "just above 100.64/10");
+        assert_eq!(lan_endpoint("192.168.15.20:1".parse().unwrap(), 0), None, "port 0 is not reachable");
     }
 }

@@ -1094,7 +1094,12 @@ impl Runtime {
         // before the DERP TLS handshake it eventually triggers.
         #[cfg(feature = "lan-direct")]
         let udp_task: BoxActorFut = match bind_lan_udp() {
-            Some(sock) => spawn_udp(sock),
+            Some(sock) => {
+                // Control derives the LAN endpoint from the actual bound
+                // port, which is not 41641 if bind_lan fell back to port 0.
+                config.control.lan_udp_port = sock.local_addr().ok().map(|a| a.port());
+                spawn_udp(sock)
+            }
             None => Box::pin(async {}),
         };
         config.control.connect_timeout = config.connect_timeout;

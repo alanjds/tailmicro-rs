@@ -837,3 +837,46 @@ and 30720 largest before `tls.open`), which did not reproduce on clean
 boots. Step 5 adds to this budget (the `DirectPath` state, the send path),
 so it should be flashed with the heap probes on and compared against these
 numbers.
+
+## Step 3 status (2026-09-29): done, host-tested, computed-and-logged on the ESP32-C3
+
+Implemented:
+
+- `tm_control::Config` gained `lan_udp_port: Option<u16>`. The app's
+  `control_config()` sets it to `None`. `tm_runtime` (under `lan-direct`)
+  overwrites it with the socket's actual bound port, which covers the
+  port-0 fallback.
+- `tm_control::lan_endpoint(local, port)` is the D1 filter. It accepts IPv4
+  only, and rejects unspecified, loopback, `100.64.0.0/10` and port 0.
+- Publish #2's body builder is factored out into `publish2_body(node, disco,
+  region, lan_ep)`. `lan_ep` goes first in `Endpoints` and the
+  `127.3.3.40:<region>` entry second. `EndpointTypes` is still omitted, as
+  the plan says.
+- `bring_up` computes `lan_ep` from `main_conn.local_addr()` and logs it.
+  It passes it into the body only when the private const
+  `PUBLISH_LAN_ENDPOINT` is true. That const is `false`, and Step 5 flips it
+  (D4).
+
+Validation, `cargo test -p tm_control`, 15/15 green:
+
+- `publish2_with_lan_endpoint_matches_ts_control_write_map`: the body is
+  compared, as parsed JSON, with the body that `ts_control.py`'s real
+  `write_map()` produces for the same inputs. That reference is captured by
+  `tools/wg_validator/gen_publish2_lan_vector.py` into
+  `publish2_lan_body.json`, with the transport stubbed. The comparison is on
+  parsed JSON because Python orders and spaces keys differently. The one
+  intended difference, `Hostinfo.OS` ("linux" in the Python probe), is
+  patched explicitly in the test.
+- `publish2_without_lan_endpoint_is_byte_identical_to_derp_only`: with
+  `None`, the bytes equal what the old inline code built. This holds with
+  the feature on (as long as the const is off) and with it off.
+- `lan_endpoint_filter_per_d1`: 100.64.1.2, 100.127.255.254, 127.0.0.1,
+  0.0.0.0 and an IPv6 address are rejected, as is port 0. 192.168.15.20,
+  8.8.4.4, 100.63.0.1 and 100.128.0.1 are accepted.
+- `lan_endpoint_publishing_is_still_off` guards the const.
+
+On the device (lan-direct build): `lan-direct: LAN endpoint
+192.168.15.74:41641 computed, not published yet`, followed by the usual
+DERP-only re-publish. Both peers handshook and tailnet HTTP returned 200. A
+LAN peer's `tailscale status` for the device shows no `Addrs` and relay
+`sao`, which confirms nothing was advertised.
