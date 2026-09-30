@@ -30,3 +30,8 @@ tracing             = { workspace = true }
 # target, not host builds/tests.
 [target.'cfg(target_os = "espidf")'.dependencies]
 esp-idf-sys = { workspace = true }
+
+[features]
+# Per-packet DiscoActor heap-blocks lines (ALLOCATIONS.md Step 9). Off by
+# default: they are blocking UART writes inside the PING->PONG path.
+heap-trace = []

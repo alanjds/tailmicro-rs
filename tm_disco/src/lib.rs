@@ -43,9 +43,18 @@ use tm_keys::DiscoPrivateKey;
 // avoid adding a tm_disco -> tm_derp dependency for a temporary debug aid).
 // Device-only; no-ops on host builds. Remove once Step 4 is resolved, or
 // promote to a shared crate if it proves broadly useful.
+//
+// Off by default (feature `heap-trace`): process() calls this four times per
+// PING, and each line is a blocking ~150 B UART write, so together they added
+// ~50 ms to every PONG (ALLOCATIONS.md Step 9, same reasoning as Step 8 Fix 3).
 #[inline(never)]
 pub(crate) fn heap_probe_blocks(tag: &str) {
-    #[cfg(target_os = "espidf")]
+    #[cfg(not(feature = "heap-trace"))]
+    {
+        let _ = tag;
+        return;
+    }
+    #[cfg(all(feature = "heap-trace", target_os = "espidf"))]
     unsafe {
         let mut info: esp_idf_sys::multi_heap_info_t = core::mem::zeroed();
         esp_idf_sys::heap_caps_get_info(&mut info, esp_idf_sys::MALLOC_CAP_INTERNAL);
@@ -56,7 +65,7 @@ pub(crate) fn heap_probe_blocks(tag: &str) {
             info.free_blocks, info.allocated_blocks, info.total_blocks,
         );
     }
-    #[cfg(not(target_os = "espidf"))]
+    #[cfg(all(feature = "heap-trace", not(target_os = "espidf")))]
     tracing::info!("DiscoActor heap-blocks [{}]: (host build; probe is device-only)", tag);
 }
 
