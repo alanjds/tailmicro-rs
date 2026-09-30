@@ -218,7 +218,8 @@ pub static LAN_UDP_STATS: tm_netstack::lan_udp::RxStats = tm_netstack::lan_udp::
 #[cfg(feature = "lan-direct")]
 const DISCO_PING_SETS_SEND_PATH: bool = false;
 
-/// Minimum free `tm_buf` pool buffers for the UDP task to take one. The pool
+/// Minimum free `tm_buf` pool buffers for the UDP task to take one (below
+/// it, the task waits, up to `lan_udp::RX_WAIT_BUDGET`, then drops). The pool
 /// is shared with DERP receive and the tailnet netif (`tm_buf::POOL_N`), and
 /// `PktBuf::acquire` falls back to a ~1.5 KB heap allocation when it is
 /// empty. Any LAN host can send to this socket, so it must neither cause
@@ -292,36 +293,78 @@ fn spawn_udp(
     Box::pin(udp_rx_task(sock, disco_tx, wg_tx))
 }
 
-/// Copy one accepted datagram out of the static receive buffer into a pooled
-/// `PktBuf`, or `None` (counted) when the pool is too low; see
-/// `UDP_MIN_FREE_PKTBUFS` / `UDP_DISCO_MIN_FREE_PKTBUFS`.
+/// Where the UDP receive loop hands accepted datagrams: disco to tm_disco as
+/// `DiscoSrc::Udp`, WireGuard to tm_wg as `Via::Udp`.
+///
+/// Unlike the event router, this task *awaits* room (pool floor, then
+/// channel slot) instead of dropping, bounded by `RX_WAIT_BUDGET`
+/// (ALLOCATIONS.md, "UDP receive waits instead of dropping"). That is
+/// deadlock-free because nothing waits on this task: its consumers (tm_wg,
+/// tm_disco) drain their command channels while blocked only on the event
+/// router, which never awaits a full channel (`forward_or_drop`); and pool
+/// buffers are returned by those actors, the router, tm_derp and lwIP's
+/// tcpip thread, never by this task. While it waits it holds at most one
+/// buffer, and lwIP's bounded recvmbox queues further datagrams.
+///
+/// The first datagram of each class is logged once at info level, the rest
+/// at `trace!`, plus `rx_loop`'s coarse periodic counter line, so a flood
+/// cannot turn into UART output (ALLOCATIONS.md Step 8, Fix 3).
 #[cfg(feature = "lan-direct")]
-fn udp_pktbuf(data: &[u8], disco: bool) -> Option<tm_buf::PktBuf> {
-    use core::sync::atomic::Ordering::Relaxed;
-    let min_free = if disco { UDP_DISCO_MIN_FREE_PKTBUFS } else { UDP_MIN_FREE_PKTBUFS };
-    if tm_buf::stats().free < min_free {
-        LAN_UDP_STATS.pool_drops.fetch_add(1, Relaxed);
-        if disco {
-            LAN_UDP_STATS.pool_drops_disco.fetch_add(1, Relaxed);
-        }
-        return None;
-    }
-    tm_buf::PktBuf::from_slice(data)
+struct UdpSink {
+    disco_tx: async_channel::Sender<DiscoCmd>,
+    wg_tx: async_channel::Sender<WgCmd>,
+    first_disco: bool,
+    first_wg: bool,
 }
 
-/// The receive task: disco datagrams go to tm_disco as `DiscoSrc::Udp`,
-/// WireGuard datagrams to tm_wg as `Via::Udp`. Never awaits an actor
-/// (`forward_or_drop`), so a LAN flood costs dropped datagrams, not a stalled
-/// runtime. The first datagram of each class is logged once at info level,
-/// the rest at `trace!`, plus `rx_loop`'s coarse periodic counter line, so a
-/// flood cannot turn into UART output (ALLOCATIONS.md Step 8, Fix 3).
+#[cfg(feature = "lan-direct")]
+impl tm_netstack::lan_udp::RxSink for UdpSink {
+    async fn deliver(&mut self, class: tm_netstack::lan_udp::RxClass, src: std::net::SocketAddrV4, data: &[u8]) {
+        use tm_netstack::lan_udp::{forward_backpressured, RxClass, RX_WAIT_BUDGET};
+        match class {
+            RxClass::Disco => {
+                tm_buf::lat::stamp(tm_buf::lat::Hop::UdpRxDisco);
+                if self.first_disco {
+                    self.first_disco = false;
+                    info!("lan-direct: first UDP disco datagram from {} ({} B)", src, data.len());
+                } else {
+                    trace!("lan-direct: UDP disco {} B from {}", data.len(), src);
+                }
+                let r = forward_backpressured(&self.disco_tx, data, UDP_DISCO_MIN_FREE_PKTBUFS, RX_WAIT_BUDGET, |buf| {
+                    DiscoCmd::MaybeDisco { src: tm_disco::DiscoSrc::Udp(src), data: buf }
+                })
+                .await;
+                LAN_UDP_STATS.record(r, true);
+            }
+            RxClass::WireGuard => {
+                if data[0] == 4 {
+                    tm_buf::lat::stamp(tm_buf::lat::Hop::UdpRxWg);
+                }
+                if self.first_wg {
+                    self.first_wg = false;
+                    info!("lan-direct: first UDP WireGuard datagram from {} (type {}, {} B)", src, data[0], data.len());
+                } else {
+                    trace!("lan-direct: UDP WireGuard type {} {} B from {}", data[0], data.len(), src);
+                }
+                let r = forward_backpressured(&self.wg_tx, data, UDP_MIN_FREE_PKTBUFS, RX_WAIT_BUDGET, |buf| {
+                    WgCmd::InboundPacket { via: tm_wg::Via::Udp(src), payload: buf }
+                })
+                .await;
+                LAN_UDP_STATS.record(r, false);
+            }
+            RxClass::Junk | RxClass::Tailnet => {}
+        }
+    }
+}
+
+/// The receive task: `rx_loop` over the LAN socket into a [`UdpSink`].
 #[cfg(feature = "lan-direct")]
 async fn udp_rx_task(
     sock: &'static tm_netstack::UdpSocket,
     disco_tx: async_channel::Sender<DiscoCmd>,
     wg_tx: async_channel::Sender<WgCmd>,
 ) {
-    use tm_netstack::lan_udp::{rx_buf_static, rx_loop, RxClass};
+    use tm_netstack::lan_udp::{rx_buf_static, rx_loop};
     // Prime the reactor's writable readiness before any PONG can be due.
     // tokio's `try_send_to` reports `WouldBlock` until the reactor has seen
     // the socket writable once, which would silently drop the first PONGs
@@ -331,44 +374,8 @@ async fn udp_rx_task(
         return;
     }
     let buf = rx_buf_static();
-    let mut first_disco = true;
-    let mut first_wg = true;
-    let err = rx_loop(sock, &mut buf[..], &LAN_UDP_STATS, |class, src, data| match class {
-        RxClass::Disco => {
-            tm_buf::lat::stamp(tm_buf::lat::Hop::UdpRxDisco);
-            if first_disco {
-                first_disco = false;
-                info!("lan-direct: first UDP disco datagram from {} ({} B)", src, data.len());
-            } else {
-                trace!("lan-direct: UDP disco {} B from {}", data.len(), src);
-            }
-            if let Some(buf) = udp_pktbuf(data, true) {
-                forward_or_drop(&disco_tx, DiscoCmd::MaybeDisco {
-                    src: tm_disco::DiscoSrc::Udp(src),
-                    data: buf,
-                }, "DiscoCmd::MaybeDisco (udp)");
-            }
-        }
-        RxClass::WireGuard => {
-            if data[0] == 4 {
-                tm_buf::lat::stamp(tm_buf::lat::Hop::UdpRxWg);
-            }
-            if first_wg {
-                first_wg = false;
-                info!("lan-direct: first UDP WireGuard datagram from {} (type {}, {} B)", src, data[0], data.len());
-            } else {
-                trace!("lan-direct: UDP WireGuard type {} {} B from {}", data[0], data.len(), src);
-            }
-            if let Some(buf) = udp_pktbuf(data, false) {
-                forward_or_drop(&wg_tx, WgCmd::InboundPacket {
-                    via: tm_wg::Via::Udp(src),
-                    payload: buf,
-                }, "WgCmd::InboundPacket (udp)");
-            }
-        }
-        RxClass::Junk | RxClass::Tailnet => {}
-    })
-    .await;
+    let mut sink = UdpSink { disco_tx, wg_tx, first_disco: true, first_wg: true };
+    let err = rx_loop(sock, &mut buf[..], &LAN_UDP_STATS, &mut sink).await;
     warn!("lan-direct: UDP receive loop stopped ({:?}); direct path off, DERP unaffected", err);
 }
 

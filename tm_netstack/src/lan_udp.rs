@@ -9,13 +9,23 @@
 //! - [`classify`]: the cheap, allocation-free demux of one received datagram.
 //! - [`rx_loop`]: the receive loop, which reads into one caller-provided
 //!   buffer (the static one from [`rx_buf_static`] on device), classifies,
-//!   counts, and hands disco/WireGuard datagrams to a callback.
+//!   counts, and hands disco/WireGuard datagrams to an [`RxSink`].
+//! - [`forward_backpressured`]: copy one datagram into a `tm_buf::PktBuf`
+//!   and queue it to an actor, waiting (bounded) for pool and channel room
+//!   instead of dropping (ALLOCATIONS.md, "UDP receive waits instead of
+//!   dropping").
 //!
 //! The loop never allocates per datagram. Accepted datagrams are lent to the
-//! callback as a slice of the receive buffer; a callback that needs to keep
-//! one copies it into a `tm_buf::PktBuf`. Holding a pooled `PktBuf` across
+//! sink as a slice of the receive buffer; a sink that needs to keep one
+//! copies it into a `tm_buf::PktBuf`. Holding a pooled `PktBuf` across
 //! `recv_from().await` instead would pin one of the four pool buffers
 //! forever (plan, "RAM/lwIP budget").
+//!
+//! The sink is async on purpose: while it waits, the loop does not call
+//! `recv_from`, so further datagrams stay in lwIP's bounded UDP recvmbox.
+//! That, not a drop in this task, is the backpressure. A dropped TCP SYN
+//! inside a WireGuard datagram costs the client its ~1 s SYN retransmit
+//! timer; a few ms of queueing costs a few ms.
 
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -125,6 +135,13 @@ pub struct RxStats {
     /// The disco subset of `pool_drops`. Kept apart because a dropped PING
     /// means a missing PONG, which makes the peer distrust the direct path.
     pub pool_drops_disco: AtomicU32,
+    /// Accepted datagrams dropped because the actor's command channel stayed
+    /// full for the rest of the wait budget (see [`forward_backpressured`]).
+    pub chan_drops: AtomicU32,
+    /// Accepted datagrams that had to wait (for pool or channel room) and
+    /// were then delivered. Nonzero is normal under load: each one is a
+    /// datagram that used to be dropped.
+    pub waited: AtomicU32,
     /// WireGuard datagrams sent directly over this socket (Step 5).
     pub tx_wg: AtomicU32,
     /// WireGuard datagrams whose direct send failed and went to DERP instead.
@@ -144,6 +161,8 @@ pub struct RxSnapshot {
     pub errors: u32,
     pub pool_drops: u32,
     pub pool_drops_disco: u32,
+    pub chan_drops: u32,
+    pub waited: u32,
     pub tx_wg: u32,
     pub tx_fallback: u32,
     pub tx_pong: u32,
@@ -160,6 +179,8 @@ impl RxStats {
             errors: AtomicU32::new(0),
             pool_drops: AtomicU32::new(0),
             pool_drops_disco: AtomicU32::new(0),
+            chan_drops: AtomicU32::new(0),
+            waited: AtomicU32::new(0),
             tx_wg: AtomicU32::new(0),
             tx_fallback: AtomicU32::new(0),
             tx_pong: AtomicU32::new(0),
@@ -176,6 +197,8 @@ impl RxStats {
             errors: self.errors.load(Ordering::Relaxed),
             pool_drops: self.pool_drops.load(Ordering::Relaxed),
             pool_drops_disco: self.pool_drops_disco.load(Ordering::Relaxed),
+            chan_drops: self.chan_drops.load(Ordering::Relaxed),
+            waited: self.waited.load(Ordering::Relaxed),
             tx_wg: self.tx_wg.load(Ordering::Relaxed),
             tx_fallback: self.tx_fallback.load(Ordering::Relaxed),
             tx_pong: self.tx_pong.load(Ordering::Relaxed),
@@ -192,6 +215,125 @@ impl RxStats {
         };
         c.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Count the outcome of one [`forward_backpressured`] call.
+    pub fn record(&self, outcome: Forwarded, disco: bool) {
+        match outcome {
+            Forwarded::Sent | Forwarded::Closed | Forwarded::Oversize => {}
+            Forwarded::SentAfterWait => {
+                self.waited.fetch_add(1, Ordering::Relaxed);
+            }
+            Forwarded::PoolTimeout => {
+                self.pool_drops.fetch_add(1, Ordering::Relaxed);
+                if disco {
+                    self.pool_drops_disco.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Forwarded::ChannelTimeout => {
+                self.chan_drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// How long [`forward_backpressured`] may wait, in total, for pool and
+/// channel room before it drops the datagram. Far below a TCP SYN
+/// retransmit (~1 s), far above the few ms the WireGuard actor needs per
+/// packet. The bound matters: while this task waits, lwIP holds the next
+/// datagrams (and their WiFi RX buffers, which are heap) in the socket's
+/// recvmbox, and a consumer stuck for long (e.g. pool buffers parked in the
+/// DERP command channel while DERP reconnects) must degrade to the old drop
+/// behavior, not to a stalled direct path.
+pub const RX_WAIT_BUDGET: Duration = Duration::from_millis(100);
+
+/// Poll period while waiting for the `tm_buf` pool to refill. The pool has
+/// no wakeup (its `Drop` runs on several FreeRTOS threads, lwIP's tcpip
+/// thread among them, and `tm_buf` stays a dependency-free leaf crate), so
+/// this is a timer wait: the task yields to the executor and, when nothing
+/// else is ready, the FreeRTOS task blocks. Not a busy loop.
+pub const POOL_POLL: Duration = Duration::from_millis(2);
+
+/// What [`forward_backpressured`] did with one datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forwarded {
+    /// Queued at once.
+    Sent,
+    /// Queued after waiting for pool or channel room.
+    SentAfterWait,
+    /// The pool stayed below `min_free` for the whole budget; dropped.
+    PoolTimeout,
+    /// The channel stayed full for the rest of the budget; dropped (its
+    /// `PktBuf` went back to the pool with the message).
+    ChannelTimeout,
+    /// The receiver is gone; dropped.
+    Closed,
+    /// Longer than `tm_buf::PKT_CAP`; dropped (cannot happen for datagrams
+    /// that pass [`rx_loop`]'s truncation check).
+    Oversize,
+}
+
+/// Copy `data` into a pooled `tm_buf::PktBuf`, wrap it with `make`, and
+/// queue it on `tx`, waiting up to `budget` in total for room:
+///
+/// 1. until at least `min_free` pool buffers are idle (the floor that keeps
+///    the last buffers for the DERP path and keeps a LAN sender from forcing
+///    `PktBuf`'s heap fallback), polling every [`POOL_POLL`]; nothing is
+///    held while waiting;
+/// 2. then, holding that one buffer, until the channel has a free slot
+///    (`async_channel`'s own wakeup, no polling).
+///
+/// Only for a producer that nothing else waits on (the UDP receive task).
+/// The event router must never call this: it is the only consumer of the
+/// actors' event channels, and an actor blocked sending to it cannot drain
+/// its own command channel (ALLOCATIONS.md Step 7 deadlock). Past the budget
+/// the datagram is dropped, exactly as before this existed. The fast path
+/// (room everywhere) never touches the timer.
+pub async fn forward_backpressured<T>(
+    tx: &async_channel::Sender<T>,
+    data: &[u8],
+    min_free: usize,
+    budget: Duration,
+    make: impl FnOnce(tm_buf::PktBuf) -> T,
+) -> Forwarded {
+    if data.len() > tm_buf::PKT_CAP {
+        return Forwarded::Oversize;
+    }
+    let mut deadline: Option<tokio::time::Instant> = None;
+    while tm_buf::stats().free < min_free {
+        let d = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + budget);
+        if tokio::time::Instant::now() >= d {
+            return Forwarded::PoolTimeout;
+        }
+        tokio::time::sleep(POOL_POLL).await;
+    }
+    let Some(buf) = tm_buf::PktBuf::from_slice(data) else {
+        return Forwarded::Oversize;
+    };
+    match tx.try_send(make(buf)) {
+        Ok(()) if deadline.is_some() => Forwarded::SentAfterWait,
+        Ok(()) => Forwarded::Sent,
+        Err(async_channel::TrySendError::Closed(_)) => Forwarded::Closed,
+        Err(async_channel::TrySendError::Full(msg)) => {
+            let d = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + budget);
+            match tokio::time::timeout_at(d, tx.send(msg)).await {
+                Ok(Ok(())) => Forwarded::SentAfterWait,
+                Ok(Err(_)) => Forwarded::Closed,
+                // The pending send, its message and the message's PktBuf are
+                // dropped with the timeout future: the buffer is recycled.
+                Err(_) => Forwarded::ChannelTimeout,
+            }
+        }
+    }
+}
+
+/// Where [`rx_loop`] hands each accepted (disco or WireGuard) datagram.
+///
+/// `deliver` may await; while it does, the loop receives nothing and lwIP
+/// queues (and, once its recvmbox is full, drops) further datagrams. An
+/// implementation must bound its wait (see [`forward_backpressured`]).
+#[allow(async_fn_in_trait)] // current-thread runtime; no Send bound wanted
+pub trait RxSink {
+    async fn deliver(&mut self, class: RxClass, src: SocketAddrV4, data: &[u8]);
 }
 
 /// Bind the LAN socket on `0.0.0.0:41641`, or an ephemeral port if 41641 is
@@ -227,15 +369,13 @@ pub fn rx_buf_static() -> &'static mut [u8; RX_BUF_LEN] {
 }
 
 /// Receive forever: classify each datagram, count it, and pass disco and
-/// WireGuard datagrams (with their IPv4 source) to `on_packet`. Tailnet-
-/// sourced and junk datagrams are counted and dropped here.
+/// WireGuard datagrams (with their IPv4 source) to `sink`, awaiting it
+/// before the next `recv_from`. Tailnet-sourced and junk datagrams are
+/// counted and dropped here.
 ///
 /// Returns only when the socket keeps failing ([`MAX_CONSECUTIVE_ERRORS`] in
 /// a row); the caller then logs and carries on DERP-only.
-pub async fn rx_loop<F>(sock: &UdpSocket, buf: &mut [u8], stats: &RxStats, mut on_packet: F) -> NetError
-where
-    F: FnMut(RxClass, SocketAddrV4, &[u8]),
-{
+pub async fn rx_loop<S: RxSink>(sock: &UdpSocket, buf: &mut [u8], stats: &RxStats, sink: &mut S) -> NetError {
     let mut summary = tokio::time::interval(SUMMARY_PERIOD);
     summary.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_logged = RxSnapshot::default();
@@ -250,7 +390,7 @@ where
                     let class = if n >= buf.len() { RxClass::Junk } else { classify(src, &buf[..n]) };
                     stats.count(class);
                     if let (RxClass::Disco | RxClass::WireGuard, SocketAddr::V4(v4)) = (class, src) {
-                        on_packet(class, v4, &buf[..n]);
+                        sink.deliver(class, v4, &buf[..n]).await;
                     }
                 }
                 Err(e) => {
@@ -290,8 +430,8 @@ fn log_summary(s: RxSnapshot) {
     #[cfg(not(target_os = "espidf"))]
     let (largest, total) = (0usize, 0usize);
     log::info!(
-        "udp rx: disco={} wg={} junk={} tailnet={} err={} pool_drop={} (disco {}) | tx: wg={} fallback={} pong={} pong_err={} (heap largest_free={} total_free={})",
-        s.disco, s.wireguard, s.junk, s.tailnet, s.errors, s.pool_drops, s.pool_drops_disco,
+        "udp rx: disco={} wg={} junk={} tailnet={} err={} pool_drop={} (disco {}) chan_drop={} waited={} | tx: wg={} fallback={} pong={} pong_err={} (heap largest_free={} total_free={})",
+        s.disco, s.wireguard, s.junk, s.tailnet, s.errors, s.pool_drops, s.pool_drops_disco, s.chan_drops, s.waited,
         s.tx_wg, s.tx_fallback, s.tx_pong, s.tx_pong_err, largest, total,
     );
 }
@@ -364,6 +504,114 @@ mod tests {
         assert_eq!(classify(v6, &ka), RxClass::Junk);
     }
 
+    /// Test sink: records what it is handed, optionally taking `delay` per
+    /// datagram (a slow consumer).
+    struct Recorder {
+        seen: Rc<RefCell<Vec<(RxClass, SocketAddrV4, usize)>>>,
+        delay: Option<Duration>,
+    }
+
+    impl RxSink for Recorder {
+        async fn deliver(&mut self, class: RxClass, src: SocketAddrV4, data: &[u8]) {
+            if let Some(d) = self.delay {
+                tokio::time::sleep(d).await;
+            }
+            self.seen.borrow_mut().push((class, src, data.len()));
+        }
+    }
+
+    /// A sink that awaits does not lose datagrams: the loop stops reading
+    /// while the sink waits, and the socket's receive queue holds the rest.
+    /// This is the backpressure `forward_backpressured` relies on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rx_loop_waits_for_a_slow_sink_without_dropping() {
+        let rx = UdpSocket::bind_sync(v4([127, 0, 0, 1], 0)).unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let tx = UdpSocket::bind_sync(v4([127, 0, 0, 1], 0)).unwrap();
+        let init = hex(WG_INIT_HEX);
+        tx.writable().await.unwrap();
+        for _ in 0..5 {
+            tx.try_send_to(rx_addr, &init).unwrap();
+        }
+        let stats = RxStats::new();
+        let seen: Rc<RefCell<Vec<(RxClass, SocketAddrV4, usize)>>> = Rc::default();
+        let mut sink = Recorder { seen: seen.clone(), delay: Some(Duration::from_millis(30)) };
+        let mut buf = vec![0u8; RX_BUF_LEN];
+        let _ = tokio::time::timeout(Duration::from_millis(400), rx_loop(&rx, &mut buf, &stats, &mut sink)).await;
+        assert_eq!(seen.borrow().len(), 5);
+        assert_eq!(stats.snapshot().wireguard, 5);
+    }
+
+    /// `forward_backpressured` against the channel: waits for a slot instead
+    /// of dropping, and past the budget drops and recycles the buffer. Also
+    /// the pool floor: waits (holding nothing) for buffers to come back.
+    /// One test on purpose: the `tm_buf` pool is process-global, and test
+    /// threads would otherwise race on its free count.
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_backpressured_waits_then_drops_past_budget() {
+        let pkt = [4u8; 64];
+        let free0 = {
+            tm_buf::prewarm();
+            tm_buf::stats().free
+        };
+        assert_eq!(free0, tm_buf::POOL_N);
+
+        // Channel room at once.
+        let (tx, rx) = async_channel::bounded::<tm_buf::PktBuf>(1);
+        let r = forward_backpressured(&tx, &pkt, 2, Duration::from_millis(50), |b| b).await;
+        assert_eq!(r, Forwarded::Sent);
+
+        // Channel full; the consumer frees a slot after 20 ms: delivered.
+        let consumer = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            rx.recv().await.unwrap()
+        };
+        let (r, first) = tokio::join!(
+            forward_backpressured(&tx, &pkt, 2, Duration::from_millis(200), |b| b),
+            consumer,
+        );
+        assert_eq!(r, Forwarded::SentAfterWait);
+        drop(first);
+        assert_eq!(rx.len(), 1);
+
+        // Channel stays full: dropped after the budget, and the dropped
+        // message's buffer is back in the pool.
+        let t0 = std::time::Instant::now();
+        let r = forward_backpressured(&tx, &pkt, 2, Duration::from_millis(40), |b| b).await;
+        assert_eq!(r, Forwarded::ChannelTimeout);
+        assert!(t0.elapsed() >= Duration::from_millis(35), "{:?}", t0.elapsed());
+        assert_eq!(tm_buf::stats().free, tm_buf::POOL_N - 1, "only the queued one is out");
+        drop(rx.try_recv().unwrap());
+        assert_eq!(tm_buf::stats().free, tm_buf::POOL_N);
+
+        // Pool floor: hold all but one buffer. min_free = 2 is unreachable
+        // within the budget: dropped without taking a buffer.
+        let (tx, rx) = async_channel::bounded::<tm_buf::PktBuf>(4);
+        let mut held: Vec<tm_buf::PktBuf> = (0..tm_buf::POOL_N - 1).map(|_| tm_buf::PktBuf::acquire()).collect();
+        let r = forward_backpressured(&tx, &pkt, 2, Duration::from_millis(30), |b| b).await;
+        assert_eq!(r, Forwarded::PoolTimeout);
+        assert_eq!(tm_buf::stats().free, 1);
+        // A buffer comes back after 15 ms: delivered, and it went through
+        // the pool (no heap fallback).
+        let allocs0 = tm_buf::stats().allocs;
+        let releaser = async {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            held.pop();
+        };
+        let (r, ()) = tokio::join!(forward_backpressured(&tx, &pkt, 2, Duration::from_millis(200), |b| b), releaser);
+        assert_eq!(r, Forwarded::SentAfterWait);
+        assert_eq!(tm_buf::stats().allocs, allocs0);
+        drop(held);
+        drop(rx.try_recv().unwrap());
+        assert_eq!(tm_buf::stats().free, tm_buf::POOL_N);
+
+        // A closed channel is reported, not waited on.
+        let (tx, rx) = async_channel::bounded::<tm_buf::PktBuf>(1);
+        drop(rx);
+        assert_eq!(forward_backpressured(&tx, &pkt, 2, Duration::from_millis(50), |b| b).await, Forwarded::Closed);
+        assert_eq!(tm_buf::stats().free, tm_buf::POOL_N);
+    }
+
     /// End to end over real loopback UDP: the loop counts every class and
     /// hands only disco/WireGuard (with the right source) to the callback.
     #[tokio::test(flavor = "current_thread")]
@@ -388,9 +636,9 @@ mod tests {
 
         let stats = RxStats::new();
         let seen: Rc<RefCell<Vec<(RxClass, SocketAddrV4, usize)>>> = Rc::default();
-        let seen2 = seen.clone();
+        let mut sink = Recorder { seen: seen.clone(), delay: None };
         let mut buf = vec![0u8; RX_BUF_LEN];
-        let run = rx_loop(&rx, &mut buf, &stats, move |c, src, d| seen2.borrow_mut().push((c, src, d.len())));
+        let run = rx_loop(&rx, &mut buf, &stats, &mut sink);
         let _ = tokio::time::timeout(Duration::from_millis(300), run).await;
 
         let s = stats.snapshot();
