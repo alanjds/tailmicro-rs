@@ -177,6 +177,14 @@ struct PeerRateLimit {
     /// 100 ms of each other are both allowed.
     last_pong_derp: Option<Instant>,
     last_pong_udp:  Option<Instant>,
+    /// The NaCl box (X25519 shared key + HSalsa20 subkey) for this peer's
+    /// disco key, computed on its first authenticated-looking datagram and
+    /// reused. ALLOCATIONS.md Step 9: `SalsaBox::new` is a full X25519
+    /// scalar multiplication, about 46 ms on this CPU, and a PING used to
+    /// pay for it twice (open, then seal the PONG). tailscaled caches the
+    /// same way (`magicsock` `sharedKey`). Keyed by `disco_key`, so a
+    /// rotated key is a new entry and never reuses a stale box.
+    shared: Option<crypto_box::SalsaBox>,
 }
 
 /// Minimum spacing between PONGs sent to the same peer, per path (see
@@ -289,12 +297,17 @@ pub struct DiscoActor {
     /// Pre-decrypt rate limit state, keyed by UDP source IP only (see
     /// `UDP_DECRYPT_RATE_LIMIT`). Empty/unused for DERP-sourced disco.
     udp_ip_rate:   ArrayVec<(Ipv4Addr, Instant), MAX_UDP_RATE_IPS>,
+    /// Our disco public key, derived once. Deriving it is itself an X25519
+    /// base-point multiplication, which every PONG used to repeat.
+    our_disco_pub: [u8; 32],
 }
 
 impl DiscoActor {
     pub fn new(our_disco_key: DiscoPrivateKey) -> Self {
+        let our_disco_pub = *our_disco_key.public().as_bytes();
         Self {
             our_disco_key,
+            our_disco_pub,
             allowed: ArrayVec::new(),
             home_region: 0,
             udp_ip_rate: ArrayVec::new(),
@@ -353,6 +366,7 @@ impl DiscoActor {
             node_key,
             last_pong_derp: None,
             last_pong_udp: None,
+            shared: None,
         });
     }
 
@@ -435,9 +449,18 @@ impl DiscoActor {
         // subkey derivation; previously this fed the raw X25519 shared
         // secret straight into ChaCha20Poly1305 as a key, which is neither
         // the same cipher family nor the same key-derivation NaCl specifies.
-        let sender_pub = crypto_box::PublicKey::from(sender_key);
-        let our_secret = crypto_box::SecretKey::from(*self.our_disco_key.as_bytes());
-        let bx = crypto_box::SalsaBox::new(&sender_pub, &our_secret);
+        //
+        // The box is cached per allowlisted peer (see `PeerRateLimit::shared`):
+        // only the first datagram from a peer pays for the DH. The
+        // pre-decrypt IP rate limit above still bounds a flood, and a
+        // flood claiming an allowlisted key costs one DH per key, total.
+        let our_disco_key = &self.our_disco_key;
+        let bx = peer_state.shared.get_or_insert_with(|| {
+            crypto_box::SalsaBox::new(
+                &crypto_box::PublicKey::from(sender_key),
+                &crypto_box::SecretKey::from(*our_disco_key.as_bytes()),
+            )
+        });
 
         let nonce_start = MAGIC_LEN + PUBKEY_LEN;
         let ct_start = nonce_start + NONCE_LEN;
@@ -523,10 +546,10 @@ impl DiscoActor {
 
                 match src {
                     DiscoSrc::Derp { node_key } => {
-                        let wire = build_sealed_pong(
-                            &self.our_disco_key,
+                        let wire = seal_pong(
+                            bx,
+                            self.our_disco_pub,
                             PongSrc::Derp(self.home_region),
-                            sender_key,
                             tx_id,
                             nonce_bytes,
                         );
@@ -542,10 +565,10 @@ impl DiscoActor {
                         // `addr`) -- it tells the peer what address WE saw
                         // them send from, so it can confirm the round trip
                         // and trust the direct path.
-                        let wire = build_sealed_pong(
-                            &self.our_disco_key,
+                        let wire = seal_pong(
+                            bx,
+                            self.our_disco_pub,
                             PongSrc::Udp(*addr),
-                            sender_key,
                             tx_id,
                             nonce_bytes,
                         );
@@ -592,12 +615,33 @@ enum PongSrc {
     Udp(SocketAddrV4),
 }
 
+#[cfg(test)]
 fn build_sealed_pong(
     our_disco_key: &DiscoPrivateKey,
     src_ipport:    PongSrc,
     sender_pub:    [u8; 32],
     tx_id:         [u8; PING_LEN],
     nonce_bytes:   [u8; NONCE_LEN],
+) -> [u8; SEALED_PONG_LEN] {
+    // Same SalsaBox(our_priv, sender_pub) construction `process` uses to
+    // decrypt a PING, just run in the encrypt direction -- exactly what
+    // `tools/wg_validator/disco.py`'s `_seal` does with pynacl's
+    // `Box.encrypt`.
+    let bx = crypto_box::SalsaBox::new(
+        &crypto_box::PublicKey::from(sender_pub),
+        &crypto_box::SecretKey::from(*our_disco_key.as_bytes()),
+    );
+    seal_pong(&bx, *our_disco_key.public().as_bytes(), src_ipport, tx_id, nonce_bytes)
+}
+
+/// [`build_sealed_pong`] with the peer's box and our public key already
+/// computed, i.e. without any X25519 operation (ALLOCATIONS.md Step 9).
+fn seal_pong(
+    bx:          &crypto_box::SalsaBox,
+    our_pub:     [u8; 32],
+    src_ipport:  PongSrc,
+    tx_id:       [u8; PING_LEN],
+    nonce_bytes: [u8; NONCE_LEN],
 ) -> [u8; SEALED_PONG_LEN] {
     let mut pong_plaintext = [0u8; PONG_PLAINTEXT_LEN];
     pong_plaintext[0] = MSG_PONG;
@@ -608,21 +652,12 @@ fn build_sealed_pong(
         PongSrc::Udp(addr) => encode_src_ipport(addr, &mut pong_plaintext[2 + PING_LEN..]),
     }
 
-    // Same SalsaBox(our_priv, sender_pub) construction `process` uses to
-    // decrypt a PING, just run in the encrypt direction -- exactly what
-    // `tools/wg_validator/disco.py`'s `_seal` does with pynacl's
-    // `Box.encrypt`.
-    let bx = crypto_box::SalsaBox::new(
-        &crypto_box::PublicKey::from(sender_pub),
-        &crypto_box::SecretKey::from(*our_disco_key.as_bytes()),
-    );
     let nonce = crypto_box::Nonce::from(nonce_bytes);
     let ciphertext = bx
         .encrypt(&nonce, pong_plaintext.as_ref())
         .expect("SalsaBox seal of a fixed 32-byte plaintext cannot fail");
     debug_assert_eq!(ciphertext.len(), PONG_PLAINTEXT_LEN + TAG_LEN);
 
-    let our_pub = *our_disco_key.public().as_bytes();
     let mut wire = [0u8; SEALED_PONG_LEN];
     let mut off = 0;
     wire[off..off + MAGIC_LEN].copy_from_slice(DISCO_MAGIC);
@@ -1009,6 +1044,48 @@ mod udp_security {
         assert!(evts.is_empty(),
             "a UDP PING claiming a node key that doesn't match the disco key's \
              netmap pairing must be dropped silently, not answered");
+    }
+
+    /// ALLOCATIONS.md Step 9: the per-peer box is cached, so later PINGs
+    /// skip the X25519 DH. Every PONG, first and cached, must still open
+    /// under the peer's own independently computed box, and the cache must
+    /// not let a forged PING through.
+    #[test]
+    fn cached_box_pongs_open_and_forgeries_still_fail() {
+        let receiver = receiver_key();
+        let mut actor = DiscoActor::new(receiver.clone());
+        let peer_sk = peer_secret();
+        let peer_pub = *peer_sk.public_key().as_bytes();
+        let node_key = [0x11u8; 32];
+        actor.add_peer(peer_pub, node_key);
+        let peer_box = crypto_box::SalsaBox::new(
+            &crypto_box::PublicKey::from(*receiver.public().as_bytes()),
+            &peer_sk,
+        );
+        for (i, ip) in [5u8, 6, 7].iter().enumerate() {
+            let tx_id = [i as u8 + 1; PING_LEN];
+            let wire = build_sealed_ping(*receiver.public().as_bytes(), &peer_sk, tx_id, Some(node_key), [i as u8; NONCE_LEN]);
+            // A fresh source IP per PING sidesteps the 100 ms pre-decrypt limit.
+            let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, *ip), 41641);
+            let evts = actor.process(&DiscoSrc::Udp(addr), &wire);
+            let pong = match evts.first() {
+                Some(DiscoEvent::SendPongUdp { payload, .. }) => *payload,
+                _ => panic!("PING {} not answered", i),
+            };
+            assert_eq!(&pong[MAGIC_LEN..MAGIC_LEN + PUBKEY_LEN], receiver.public().as_bytes());
+            let n = crypto_box::Nonce::from(<[u8; NONCE_LEN]>::try_from(&pong[MAGIC_LEN + PUBKEY_LEN..MAGIC_LEN + PUBKEY_LEN + NONCE_LEN]).unwrap());
+            let pt = peer_box.decrypt(&n, &pong[MAGIC_LEN + PUBKEY_LEN + NONCE_LEN..]).expect("PONG opens under the peer's box");
+            assert_eq!(pt[0], MSG_PONG);
+            assert_eq!(&pt[2..2 + PING_LEN], &tx_id);
+            std::thread::sleep(std::time::Duration::from_millis(110));
+        }
+        assert!(actor.allowed[0].shared.is_some());
+        // Same claimed disco key, sealed by someone else: must not open.
+        let forger = crypto_box::SecretKey::from([0x43u8; 32]);
+        let mut wire = build_sealed_ping(*receiver.public().as_bytes(), &forger, [9; PING_LEN], Some(node_key), [9; NONCE_LEN]);
+        wire[MAGIC_LEN..MAGIC_LEN + PUBKEY_LEN].copy_from_slice(&peer_pub);
+        let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 9), 41641);
+        assert!(actor.process(&DiscoSrc::Udp(addr), &wire).is_empty());
     }
 
     /// The matching-node-key counterpart: a UDP PING whose claimed node key
