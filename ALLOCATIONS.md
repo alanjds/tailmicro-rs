@@ -1462,6 +1462,96 @@ Options for a real fix, left for a decision:
   deadlock, and lwIP's bounded recvmbox then provides the backpressure.
   `rx_loop` takes a sync callback, so this needs a restructure.
 
+### Step 11 (2026-09-30): `POOL_N = 6` plus a 4-slot `WgCmd` channel; kept
+
+**Change**: the first option from Step 10.
+- `tm_buf::POOL_N` goes from 4 to 6.
+- A new `tm_runtime::WG_CMD_CHAN_CAP = 4` sizes the router-to-WG `WgCmd`
+  channel.
+- Every other inter-actor channel stays at `CHAN_CAP = 2`.
+
+**Cost, measured** from the ELF:
+- Pool: `.dram0.bss` grows by exactly 3088 B, as in Step 10 (`BLOCKS`
+  0x1820 to 0x2430).
+- Channel: static cost 0. `async_channel::bounded` allocates its slot array
+  on the heap. From DWARF, `tm_wg::WgCmd` is 56 B and
+  `concurrent_queue::bounded::Slot<WgCmd>` is 64 B, so going from 2 to 4
+  slots adds 128 B in one heap allocation, allocated once at boot.
+- Boot heap: `Heap after storing device` measured 54272, 54288 and
+  54384 B, against 54396 B for `POOL_N = 6` alone and 57208 B at 4. The
+  total is about 3.2 KB of DRAM against Step 9's build.
+- The 2 extra slots hold `PktBuf` handles, not bytes. The packet data stays
+  in the pool.
+
+**Result**: same harness and direct path as Steps 9 and 10.
+- The full soak ran twice, each from a fresh boot.
+- On a third boot, 5 back-to-back 40-request passes ran 20 s apart,
+  followed by a 4x20 parallel run. That parallel run passed but went
+  unlogged: a harness bug had stopped the serial capture before it.
+- Then 6 further fresh boots each served one request, to check the boot
+  phase's heap.
+
+| | Step 10, `POOL_N = 4` | Step 10, `POOL_N = 6` | soak 1 | soak 2 | 5 x b2b40, one boot |
+|---|---|---|---|---|---|
+| b2b connects > 500 ms | 40/40 | 39/40 | 5/40 | 6/40 | 4, 3, 3, 4, 7 of 40 |
+| b2b connect p50 / total p50, ms | 1160 / 1306 | 1171 / 1311 | 172 / 344 | 170 / 342 | 167-179 / 328-353 |
+| 10 requests, 3 s apart: slow, connect p50 | 0, 133 | 0, 115 | 0, 124 | 1, 122 | |
+| back-to-back 60, parallel 4x20, slow soak, final burst | 60/60, 80/80, 36/36, 30/30 | same | 60/60, 80/80, 36/36, 30/30 | 60/60, 80/80, 36/36, 30/30 | parallel 80/80 |
+| resets, alloc failures, timeouts | 0, 0, 0 | 0, 0, 0 | 0, 0, 0 | 0, 0, 0 | 0, 0, 0 |
+| heap_watch min largest_free | 14336 | 11776 | 13312 | **7936** (at boot, see below) | 15872 |
+| largest_free at accept/close, min | 16384 | 14336 | 16384 | 16384 | 18432 |
+| min_ever_free | 23244 | 22376 | 22092 | **2592** (at boot, see below) | 23620 |
+| main-task stack min free | | 7408 | 7408 | 7392 | |
+| UDP `pool_drop` (whole run) | 167 | 6 | 25 | 30 | 3 |
+| WG command channel drops (whole run) | | 32 by 83 s | 8 to 15 | 8 to 15 | 0 |
+
+Over all 280 back-to-back connects, 32 (11%) were slow, against 98-100%
+before. Connect p50 is 169 ms and total p50 337 ms, against about 1.17 s
+and 1.31 s. The rate stays between 3 and 7 per 40 across 7 passes on 3
+boots, so Step 10's short sample of 5/40 was representative.
+
+**The residual 11% is not these two queues.** On the 5-pass boot, the 21
+slow connects coincided with 0 WG command channel drops and 3 UDP pool
+drops for the whole boot. One slow connect also occurred with 3 s gaps
+(soak 2). The remaining ~1.1 s connects are still SYN-retransmit shaped.
+Where that SYN is lost was not investigated: WiFi (modem sleep, Step 9),
+lwIP, or the tailnet netif are all open. The obvious suspect,
+`LWIP_MAX_ACTIVE_TCP=16` against 40 closes in about 15 s with
+`TCP_MSL=60000`, was not tested. lwIP reclaims TIME_WAIT PCBs when that
+limit is hit, so it is not an obvious drop point.
+
+**One boot-time heap dip, not reproduced.** On soak 2's boot, at 22 s of
+uptime, the heap reached `min_ever_free=2592`, with a 7936 B largest free
+block. That was before the harness's first request (at 50 s), during the
+first WireGuard handshakes with all three peers, DERP connect, and disco.
+Some packets were dropped on the DERP-path `WgCmd` channel at the same
+moment. The heapdiag map from that instant has 10 x 1664 B and 11 x 1728 B
+used blocks, about 35 KB. That size does not match a `tm_buf` heap
+fallback, which is about 1.55 KB. They look like WiFi/lwIP receive
+buffers, but this is inferred from the size; no allocation was traced to
+its owner.
+
+That boot was the first after a different firmware build (from a parallel
+experiment) had run on the board. The dip did not recur in any other boot
+of this build: soak 1, the 5-pass boot, and 6 more fresh boots (min_ever_free
+20408-26556, heap_watch min largest_free 11776-19456). It appears in none
+of the ~12 earlier captured boots in Steps 8-10, which were all at 18.6 KB
+or more. It cannot be ruled out that this change makes such a burst more
+likely: 2 more `WgCmd` slots let more received packets wait at once. It
+is recorded here as open. No reset or allocation failure followed.
+
+**Kept**: about 3.2 KB of DRAM relative to `POOL_N = 4` buys roughly
+7x faster connects (p50 169 ms vs about 1.17 s) and 3.9x faster requests
+(p50 337 ms vs 1.31 s) for back-to-back HTTP clients. Outside the one boot
+dip, the minimum largest free block did not measurably drop:
+- heap_watch minimum: 13312 and 15872, against 14336 at `POOL_N = 4`;
+- accept-time minimum: 16384 and 18432, against 16384.
+
+Run-to-run spread on the same build is about 2-3 KB. Step 10's second option,
+`udp_rx_task` awaiting WG channel space, remains the no-extra-RAM
+alternative. It would not address the residual 11% either, since that
+occurs with neither queue dropping.
+
 ## Design principle going forward
 
 Fixed-size, same-shape allocations that recur on a hot path should be
