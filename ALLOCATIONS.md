@@ -1272,6 +1272,152 @@ on. It also catches regressions early. The heap floor is now a number in
 every log instead of something rediscovered after a crash. Later cleanups
 should not remove it without a new explicit decision.
 
+### Step 9 (2026-09-30): LAN round-trip latency; the router's 50-tick yield and per-PING disco work were most of it
+
+**Context**: with LAN-direct up, `tailscale ping esp32c3` from the phone
+averaged about 561 ms (290 to 1166 ms) on a confirmed direct path. A LAN
+round trip should be tens of ms. The phone also saw the same range over
+other paths, which points at the device, not the network.
+
+**Method**: a new `latency-trace` feature (tm_buf `lat` module, forwarded
+by tm_runtime; off by default) stamps each hop in microseconds into static
+atomics:
+- ICMP-over-WG: UDP rx, WG dequeue, decrypt, router, lwIP echo out, inject
+  return, router netif, WG send, encrypt, router outbound, UDP tx;
+- disco: UDP rx, disco dequeue, PONG sealed, router, UDP tx.
+
+It prints at most one line per 300 ms plus a 10 s router summary (loop
+iterations and time blocked in `vTaskDelay`), so the trace cannot saturate
+the UART (Step 8 Fix 3). All numbers below are from the real ESP32-C3.
+Traffic came from bospill, direct via `192.168.15.74:41641`, 30 samples per
+run, and the load case was a back-to-back `curl /cm?cmnd=Status` loop.
+Device-side values are from the device stamps; end-to-end values are what
+bospill measured.
+
+**Findings (before)**:
+
+1. **The event router blocked 50 ms per event.** `tokio_freertos_yield()`
+   is `vTaskDelay(50)`, and `CONFIG_FREERTOS_HZ=1000` makes that 50 ms. It
+   ran at the top of every router iteration and after forwards. On the
+   single-threaded executor that stalls every actor. Its effect:
+   - An ICMP echo crossed the router three times and paid about 55 to 65 ms
+     each time. Device-side hops in ms: WG dequeue 7-9, decrypt 3-4, to
+     router 2-8, lwIP echo 1, **netif to router 56-94, router to WG send
+     52-57**, encrypt 2, **to router outbound 58-65**, UDP send 3. The total
+     p50 was 191 ms, of which about 170 ms was vTaskDelay.
+   - Under curl load, 58-73% of wall time was spent in vTaskDelay. The
+     router topped out near 9 events/s, so every queued event added 50 to
+     100 ms. It also dropped more packets: WG channel drops reached 128 in
+     the soak below, and pool drops 277.
+2. **Disco spent about 138 ms per PING in `process()`**, out of 146-176 ms
+   from UDP rx to PONG sent. The cost came from two things:
+   - three X25519 scalar multiplications: `SalsaBox::new` to open,
+     `SalsaBox::new` again to seal, and `our_disco_key.public()`;
+   - four unconditional info-level `heap_probe_blocks` lines, about 600 B
+     of blocking UART per PING.
+
+   With the cache in place, the only PING that still builds a box took
+   38.7 ms in `process()`. So one box costs about 35 to 40 ms and the UART
+   lines about 30 ms. That split is inferred; no probe-gating-only build
+   was flashed.
+3. **WiFi modem sleep** (ESP-IDF default `WIFI_PS_MIN_MODEM`; nothing calls
+   `esp_wifi_set_ps`). Plain LAN ICMP to the WiFi IP, with no tailmicro
+   code involved, measured min 2-4, p50 58-71, max 112-122 ms, which
+   matches waiting for DTIM beacons. This is the device radio, not
+   tailmicro.
+
+**Ruled out** (measured, each at most a few ms): WG decrypt (3.4 ms) and
+encrypt (2.5 ms), UDP syscalls (2-3 ms), lwIP's echo (1 ms), and actor
+channel queueing at idle. The WG data path does not wait for the 400 ms
+tick; it is event-driven. **Path independence**: all of the device-side
+cost is paid before and after path selection. DERP-received packets pass
+through the same router, WG, and disco actors, so the phone seeing the same
+300-1200 ms on another path fits: the latency was mostly on-device
+scheduling plus the radio, not the network.
+
+**Fixes**:
+- `tm_runtime`: the event router yields 1 tick (`ROUTER_YIELD_TICKS`), not
+  50, per event. It still yields to FreeRTOS on every iteration, so idle
+  and lower-priority tasks keep running and the TWDT stays fed. The boot
+  path in `Runtime::build` keeps its 50-tick yields.
+- `tm_disco`:
+  - the per-peer `SalsaBox` is built once and kept in the peer's
+    rate-limit entry;
+  - our disco public key is computed once in `DiscoActor::new`;
+  - `seal_pong` takes the cached box;
+  - a test checks that cached-box PONGs open and that forgeries still fail.
+- `tm_disco`: the `heap_probe_blocks` calls are compiled out unless the new
+  `heap-trace` feature is on (the Step 8 Fix 3 rule: per-packet
+  diagnostics are opt-in). The permanent safety net is untouched: tasmolike
+  `heap_watch`/`heap_probe_at_accept` and `tm_wg::heapdiag`.
+
+**Results** (min / p50 / avg / p90 / max, ms):
+
+| measurement | before | after |
+|---|---|---|
+| disco `tailscale ping`, idle | 174-178 / 228-230 / 245-273 / 290-429 / 424-542 (3 runs) | 45 / 124 / 121 / 128 / 135 |
+| kernel ICMP over WG, idle | 202 / 276 / 276 / 322 / 404 | 57 / 115 / 115 / 167 / 190 |
+| disco, under curl load | 214 / 476 / 478 / 754 / 965 | 20 / 88 / 94 / 131 / 260 |
+| ICMP over WG, under curl load | 248 / 480 / 529 / 859 / 894, 20% loss | 54 / 113 / 126 / 218 / 241, 3% loss |
+| device-side disco, UDP rx to PONG sent | p50 150-154 | p50 15.5, p90 19.3 |
+| device-side ICMP, UDP rx to reply sent | p50 191, max 496 | p50 40.6, max 63.9 (load: p90 65.6, max 144.5) |
+| router time in vTaskDelay, under load | 58-73% | 1% |
+| curl `Status` total, under load | p50 2273, max 4752 (43 in 110 s) | p50 1303, max 1441 (69 in 110 s) |
+
+After the fixes, the device-side ICMP hops are: dequeue 4-10, decrypt 3.4,
+to router 2-9, lwIP 1.2, netif to router 5-8, to WG send 3-8, encrypt 2.5,
+to router outbound 6-13, send 2.4.
+
+**Heap safety of the faster router.** The Step 8 soak harness was run
+over the direct path on both builds, from the same boot state:
+
+| | before | after |
+|---|---|---|
+| back-to-back 60 | 60/60 in 134 s | 60/60 in 81 s |
+| parallel 4x20 Status 0 (10 s timeout) | 38/80 | 80/80 |
+| slow soak / final burst | 35/36, 30/30 | 36/36, 30/30 |
+| resets, alloc failures, timeouts | 0, 0, 0 | 0, 0, 0 |
+| heap_watch min largest_free | 11776 | 13824 |
+| largest_free at accept/close, min | 18432 | 17408 |
+| min_ever_free | 18676 | 22832 |
+| main-task stack min free | 7424 | 7424 |
+| UDP pool drops / WG channel drops | 277 / 128+ | 144 / 64+ |
+
+There is no heap regression. The router moves packets faster, so fewer
+wait in flight.
+
+**Remaining, not fixed here**:
+- **WiFi modem sleep is about 100 ms of the remaining idle round trip.**
+  An experiment build of the wrapper (not committed) called
+  `esp_wifi_set_ps(WIFI_PS_NONE)` after `wifi.start()`. Results:
+  - idle disco: 16 / 22 / 22 / 26 / 29 ms;
+  - idle ICMP over WG: p50 46 ms;
+  - plain LAN ICMP: p50 3 ms;
+  - under load, disco p50 26 ms and ICMP p50 48 ms.
+
+  Turning modem sleep off costs radio power, so it is the application's
+  choice.
+- **A back-to-back TCP connect costs about 1 s.** Each new connection
+  opened right after the previous one closed took about 1.07 s to connect,
+  which is Linux's initial SYN retransmit timeout. With 3 s gaps, 10/10
+  connected in about 45 ms. In one sample, 5 slow connects matched exactly
+  5 `pool_drop` increments. The SYN arrives while the previous
+  connection's tail segments still hold `tm_buf` buffers, and
+  `UDP_MIN_FREE_PKTBUFS` (2 of `POOL_N` = 4) drops it. This is most of the
+  remaining curl time. Options:
+  - wait briefly for a buffer in `rx_loop` instead of dropping, so lwIP's
+    bounded UDP recvmbox provides the backpressure;
+  - raise `POOL_N` to 6, about 3 KB more static DRAM.
+
+  Both touch the Step 5/6 design and the heap budget, so they are left for
+  a decision.
+- **Observation, not investigated.** On two boots, the device's second full
+  MapResponse, at about 75-115 s, arrived while bospill was briefly
+  reconnecting to control. It listed only one peer. The device then logged
+  `no peer for handshake initiator key` every 5 s and never re-added
+  bospill until it rebooted. Disco PINGs were still answered. No later
+  MapUpdate arrived to repair it.
+
 ## Design principle going forward
 
 Fixed-size, same-shape allocations that recur on a hot path should be
