@@ -219,7 +219,7 @@ pub static LAN_UDP_STATS: tm_netstack::lan_udp::RxStats = tm_netstack::lan_udp::
 const DISCO_PING_SETS_SEND_PATH: bool = false;
 
 /// Minimum free `tm_buf` pool buffers for the UDP task to take one. The pool
-/// is shared with DERP receive and the tailnet netif (4 buffers), and
+/// is shared with DERP receive and the tailnet netif (`tm_buf::POOL_N`), and
 /// `PktBuf::acquire` falls back to a ~1.5 KB heap allocation when it is
 /// empty. Any LAN host can send to this socket, so it must neither cause
 /// that heap churn nor take the last buffer from the DERP path.
@@ -1270,6 +1270,16 @@ fn spawn_event_router(
 /// Reduced from 4 to 2 to save memory on ESP32-C3.
 const CHAN_CAP: usize = 2;
 
+/// Capacity of the `WgCmd` channel (router -> WG actor), wider than
+/// `CHAN_CAP`. Every inbound WireGuard packet (UDP and DERP) crosses it, and
+/// the router `try_send`s into it (`forward_or_drop`), so a full channel is
+/// a dropped packet. At 2, a client's closing ACK/FIN and its next SYN
+/// arriving together overflowed it while the actor decrypted, and each
+/// back-to-back TCP connect paid a ~1 s SYN retransmit (ALLOCATIONS.md
+/// Steps 10-11). The slots hold `WgCmd` by value and the packet bytes stay
+/// in `tm_buf`, so 2 more slots cost little heap.
+const WG_CMD_CHAN_CAP: usize = 4;
+
 use std::net::Ipv4Addr;
 
 /// Channel for receiving the Tailnet IPv4 address.
@@ -1398,7 +1408,7 @@ impl Runtime {
         tokio_freertos_yield().await;
         log_heap("after DiscoEvent channel");
 
-        let (wg_tx,    wg_rx)    = async_channel::bounded::<WgCmd>(CHAN_CAP);
+        let (wg_tx,    wg_rx)    = async_channel::bounded::<WgCmd>(WG_CMD_CHAN_CAP);
         tokio_freertos_yield().await;
         log_heap("after WgCmd channel");
 
@@ -1562,7 +1572,7 @@ impl Runtime {
         let (disco_tx, disco_rx) = async_channel::bounded::<DiscoCmd>(CHAN_CAP);
         let (_disco_ev_tx, mut _disco_ev_rx) = async_channel::bounded::<DiscoEvent>(CHAN_CAP);
 
-        let (wg_tx,    wg_rx)    = async_channel::bounded::<WgCmd>(CHAN_CAP);
+        let (wg_tx,    wg_rx)    = async_channel::bounded::<WgCmd>(WG_CMD_CHAN_CAP);
         let (_wg_ev_tx, mut _wg_ev_rx) = async_channel::bounded::<WgEvent>(CHAN_CAP);
 
         // ── Spawn actors ──────────────────────────────────────────────────────
