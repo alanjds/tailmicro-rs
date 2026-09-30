@@ -4,10 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-# LAN-only direct UDP path (docs/lan-direct-path-plan.md, D5). Off by default:
-# with it off there is no UDP socket, no receive task, and nothing about the
-# control-plane publish or the data plane changes. Enable from the app's
-# Cargo.toml (`tm_runtime = { ..., features = ["lan-direct"] }`).
+default = ["lan-direct"]
+# LAN-only direct UDP path (docs/lan-direct-path-plan.md, D5). On by default,
+# so an app that depends on tm_runtime plainly gets it and a rebuild cannot
+# silently fall back to DERP-only. To opt out, depend with
+# `default-features = false`: then there is no UDP socket, no receive task,
+# and nothing about the control-plane publish or the data plane changes.
 lan-direct = []
 # TEST ONLY (docs/lan-direct-path-plan.md, Step 6.2): periodically drop every
 # datagram the device sends over the LAN socket, as a peer-side
