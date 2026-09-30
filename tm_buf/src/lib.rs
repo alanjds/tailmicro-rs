@@ -68,13 +68,19 @@ use heapless::pool::object::{Object, ObjectBlock};
 /// (1500 + 32), `tm_wg`'s 1500 and `tm_disco`'s 256.
 pub const PKT_CAP: usize = 1500 + 32;
 
-/// Number of pooled buffers (~1.5 KB each, ~6 KB of static RAM, which
-/// comes out of the same DRAM as the heap).
+/// Number of pooled buffers (1544 B each with the pool node, ~9 KB of
+/// static RAM, which comes out of the same DRAM as the heap).
 /// Realistic steady-state in-flight count is 2-4 (one packet per hop being
 /// processed plus a couple queued); bursts beyond this fall back to heap
 /// allocation and show up in [`PoolStats::allocs`]. Tune from that counter
 /// rather than guessing.
-pub const POOL_N: usize = 4;
+///
+/// 6, not 4: with 4, the UDP receive path's 2-free-buffer floor dropped the
+/// SYN of a back-to-back TCP connection while the previous connection's
+/// tail still held buffers, costing a ~1 s SYN retransmit per connect
+/// (ALLOCATIONS.md Steps 9-11). Only helps together with the wider WgCmd
+/// channel in tm_runtime (`WG_CMD_CHAN_CAP`).
+pub const POOL_N: usize = 6;
 
 /// The storage behind a packet buffer.
 pub type PktInner = heapless::Vec<u8, PKT_CAP>;
