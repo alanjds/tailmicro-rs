@@ -715,7 +715,15 @@ impl LatState {
                 }
                 info!("lat {} {}:{}", what, if direct { "udp" } else { "derp" }, line.as_str());
             }
-            None => info!("lat {} {}: chain incomplete or mixed", what, if direct { "udp" } else { "derp" }),
+            None => {
+                // Offsets from the first hop in ms; "-" = never stamped.
+                let mut line: heapless::String<200> = heapless::String::new();
+                for o in tm_buf::lat::offsets(hops).iter() {
+                    use core::fmt::Write;
+                    let _ = if *o == i32::MIN { write!(line, " -") } else { write!(line, " {}", o / 1000) };
+                }
+                info!("lat {} {}: chain refused, offsets ms:{}", what, if direct { "udp" } else { "derp" }, line.as_str());
+            }
         }
         for h in hops {
             tm_buf::lat::clear(*h);

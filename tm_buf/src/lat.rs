@@ -210,6 +210,23 @@ pub fn is_icmp_echo(pkt: &[u8], ty: u8) -> bool {
     pkt.len() > ihl && pkt[ihl] == ty
 }
 
+/// Signed offsets in µs of each hop from the first one (0 = unstamped
+/// shows as the raw negative clock), for diagnosing a refused chain.
+pub fn offsets(hops: &[Hop]) -> heapless::Vec<i32, 16> {
+    let mut out = heapless::Vec::new();
+    #[cfg(feature = "latency-trace")]
+    {
+        let first = imp::load(hops[0] as usize);
+        for h in hops {
+            let t = imp::load(*h as usize);
+            let _ = out.push(if t == 0 { i32::MIN } else { t.wrapping_sub(first) as i32 });
+        }
+    }
+    #[cfg(not(feature = "latency-trace"))]
+    let _ = hops;
+    out
+}
+
 /// Clear a hop so a later chain cannot reuse it.
 pub fn clear(hop: Hop) {
     #[cfg(feature = "latency-trace")]
