@@ -187,8 +187,10 @@ pub const ICMP_CHAIN: [Hop; 11] = [
     Hop::WgIn,
     Hop::WgDecrypted,
     Hop::RouterInbound,
-    Hop::Injected,
+    // lwIP's tcpip thread (prio 18) preempts the injecting task, so the echo
+    // reply leaves the netif before inject_inbound() even returns.
     Hop::NetifOut,
+    Hop::Injected,
     Hop::RouterNetif,
     Hop::WgSendIn,
     Hop::WgEncrypted,
