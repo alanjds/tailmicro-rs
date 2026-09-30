@@ -1418,6 +1418,50 @@ wait in flight.
   bospill until it rebooted. Disco PINGs were still answered. No later
   MapUpdate arrived to repair it.
 
+### Step 10 (2026-09-30): `POOL_N = 6` for the back-to-back TCP stall; tried, not kept
+
+**Hypothesis** (Step 9, "Remaining"): the new connection's SYN is dropped by
+the UDP receive path's 2-free-buffer floor, so raising `POOL_N` from 4 to 6
+removes the ~1 s connect.
+
+**Cost, measured** from the ELFs: `tm_buf::BLOCKS` grows from 0x1820 to
+0x2430 bytes (6176 to 9264), 1544 B per buffer (1532 data, the `Vec` length
+word, the pool node). `.dram0.bss` grows by exactly 3088 B, and boot free
+heap drops from 57208 to 54396.
+
+**Result**: same method as Step 9, over the direct path, from a fresh boot
+each time. `b2b` is 40 back-to-back `Status` requests; a connect over 500 ms
+is a SYN retransmit.
+
+| | `POOL_N = 4` | `POOL_N = 6` | `POOL_N = 6`, WG cmd channel 4 (experiment) |
+|---|---|---|---|
+| b2b connects > 500 ms | 40/40 | 39/40 | 5/40 |
+| b2b connect p50 / total p50, ms | 1160 / 1306 | 1171 / 1311 | 171 / 338 |
+| 10 requests, 3 s apart: connect p50 | 133 | 115 | |
+| UDP `pool_drop` (whole run) | 167 | 6 | 14 (short run) |
+| back-to-back 60, parallel 4x20, slow soak, final burst | 60/60, 80/80, 36/36, 30/30 | 60/60, 80/80, 36/36, 30/30 | parallel 4x10: 40/40 |
+| resets, alloc failures, timeouts | 0, 0, 0 | 0, 0, 0 | 0, 0 |
+| heap_watch min largest_free | 14336 | 11776 | 13824 (short run) |
+| largest_free at accept/close, min | 16384 | 14336 | |
+| min_ever_free | 23244 | 22376 | |
+
+`POOL_N = 6` removes the pool drops, but the stall stays: the drops move one
+hop later, to `forward_or_drop` into the `CHAN_CAP = 2` WG command channel
+("WgCmd::InboundPacket (udp) channel full"). During the b2b phase that
+counter reached 32 by 83 s of uptime at 6, versus 159 s at 4. The likely
+shape: a client's final ACK/FIN and its next SYN arrive together, and a
+2-slot queue cannot hold them while the WG actor decrypts. Only the combination, in an
+uncommitted experiment, mostly fixes it. On its own, 6 costs 3 KB and about
+2 KB of minimum largest free block for no gain, so it was reverted.
+
+Options for a real fix, left for a decision:
+- `POOL_N = 6` plus a WG command channel of 4 (measured above; the
+  remaining 5 slow connects match the remaining pool/channel drops);
+- have `udp_rx_task` wait for WG channel space instead of `try_send`.
+  The UDP task is not the router, so awaiting does not risk the Step 7
+  deadlock, and lwIP's bounded recvmbox then provides the backpressure.
+  `rx_loop` takes a sync callback, so this needs a restructure.
+
 ## Design principle going forward
 
 Fixed-size, same-shape allocations that recur on a hot path should be
