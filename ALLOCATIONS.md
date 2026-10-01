@@ -1552,6 +1552,156 @@ Run-to-run spread on the same build is about 2-3 KB. Step 10's second option,
 alternative. It would not address the residual 11% either, since that
 occurs with neither queue dropping.
 
+### Step 12 (2026-10-01): UDP receive waits instead of dropping; the residual was the netif outbound channel; `POOL_N` back to 4
+
+**Changes** (three commits):
+1. `udp_rx_task` awaits room instead of dropping (Step 10's second option).
+   `lan_udp::rx_loop` now takes an async `RxSink` instead of a sync
+   callback. `lan_udp::forward_backpressured` waits, polling every 2 ms,
+   while the pool is below the UDP floor, then `try_send`s. If the channel
+   is full, it awaits `send`. Both waits share one 100 ms budget
+   (`RX_WAIT_BUDGET`), after which the packet is dropped and counted
+   (`pool_drop`, `chan_drop`; `waited` counts packets that went through
+   after a wait). The pool has no wakeup because buffers are freed on
+   several FreeRTOS threads, so it is polled; that is a timer sleep, not a
+   spin.
+2. The tailnet netif outbound channel (lwIP tcpip thread to router) goes
+   from `CHAN_CAP = 2` to `NETIF_OUT_CHAN_CAP = 8`. Its drops were silent;
+   they are now counted (`netif_out_drop`, plus `netif_out_hwm` and the
+   pool's heap-fallback count `pool_heap_allocs` on the `udp rx:` line).
+   Past 2 queued packets, the output callback queues only pool buffers
+   (new `PktBuf::try_acquire_pooled`) and drops otherwise, so the extra
+   depth never holds heap-fallback buffers.
+3. `POOL_N` goes back to 4 and `WG_CMD_CHAN_CAP` back to 2, reverting Step
+   11's values. This is a separate commit and can be dropped on its own.
+
+**Deadlock reasoning** (single-threaded tokio, all actors in one
+`join!`). The UDP task is the only new waiter.
+- Nothing waits on the UDP task: UDP transmit is a synchronous
+  `try_send_to` from the router.
+- The WG and disco actors it waits on drain their command channels. They
+  block only on `events.send().await` to the router, and the router never
+  awaits a full channel (Step 7's `forward_or_drop`). So the chain
+  UDP -> WG/disco -> router ends at a task that does not block.
+- Pool buffers are freed by the WG, disco and DERP actors, the router and
+  lwIP's tcpip thread, never by the UDP task. The UDP task holds no buffer
+  during the pool wait and one during the channel wait.
+- If buffers are parked somewhere that does not drain promptly (e.g. the
+  DERP send channel during a reconnect), the 100 ms budget bounds the wait,
+  and the task drops as before.
+
+The cost of waiting: while the task waits, lwIP's UDP recvmbox (6 entries)
+holds datagrams and so pins WiFi RX buffers. The budget bounds that too.
+The netif output callback cannot wait (it runs on the tcpip thread), which
+is why change 2 is a deeper queue rather than a wait.
+
+**Finding: where the residual 11% came from.** With change 1 alone, UDP
+receive drops went to 0 (`pool_drop=0 chan_drop=0` over 5 back-to-back
+passes), but slow connects stayed (3, 6, 7, 10, 9 of 40). The new counter
+showed the netif outbound channel dropping about 45 packets per 40
+connects (47, 93, 135, 185, 243 cumulative), about one per connection.
+lwIP's tcpip thread (priority 18) emits a connection's SYN-ACK, ACKs,
+response and FIN in bursts faster than the router (priority 1, one event
+per iteration, a 1-tick yield after each forward) takes them. A lost
+SYN-ACK costs the client its ~1 s SYN retransmit, the same shape as the
+original stall. The measured high-water mark in back-to-back use is 4.
+
+**Result.** Same harness, direct path, fresh boot per run. "multi" is 5 x
+b2b40 then a 4x20 parallel run on one boot; "soak" is Step 10's full
+soak. Variants, all on top of Step 11 except where stated:
+- **T**: Step 11 as committed (baseline).
+- **A**: change 1 only.
+- **C**: changes 1 and 2, but channel 8 with no pool-only rule. Rejected.
+- **E**: changes 1 and 2 with a 4-slot channel. Rejected.
+- **F**: changes 1 and 2 at `POOL_N = 6`, `WgCmd` 4.
+- **H**: F, plus queuing past 2 only while the pool has more than 2
+  free. Rejected.
+- **G**: changes 1, 2 and 3, i.e. the committed result (`POOL_N = 4`,
+  `WgCmd` 2). Verified to build to the same section sizes as the
+  committed tree.
+
+| | b2b connects > 500 ms | b2b connect p50, ms | parallel 4x20 | min largest_free in parallel run | accept-time largest_free min | min_ever_free | boot heap |
+|---|---|---|---|---|---|---|---|
+| T multi | 23/200 (9,3,4,4,3) | 162-180 | 80/80 | 10752 | 15360 | 19472 | 54220 |
+| A multi (2 boots; heap columns from the 2nd) | 53/400 (3,6,7,10,9; 2,2,6,2,6) | 160-185 | 80/80 | 13312 | 15872 | 19044 | 54020 |
+| change 1 at `POOL_N = 4`, `WgCmd` 2, soak | 7/40, gap 1/10 | 189 | 80/80 | 14848 (whole run) | 19456 | 24196 | 57072 |
+| C multi / soak | 0/200, 0/40 | 175-189 | 80/80, 80/80 | **7680, 7680** | 9216 | 14648, 10804 | 53844 |
+| E multi / soak | 1/200, 0/40 | 167-181 | **73/80, 73/80** | 10240 | 13312 | 17988 | 53964 |
+| F multi / soak | 0/200, 0/40, gap 0/10 | 180-194 | 80/80, 80/80 | 8704, 8192 | 14336, 13312 | 18724, 18352 | 54188 |
+| H multi | 14/200 | 175-182 | 80/80 | 8192 | 14848 | 15540 | 53788 |
+| **G multi / soak** | **1/200, 0/40, gap 0/10** | **185-200** | **80/80, 80/80** | **13824, 10752** | **16384, 16384** | **20236, 22296** | **57040, 56780** |
+
+Across F and G together, 1 slow back-to-back connect in 480, against
+11% for Step 11 and 98-100% before it. Connect p50 is 180-200 ms against Step 11's 169 ms;
+total p50 is 360-390 ms against 337 ms. That is about 10-20 ms slower per
+request, but without the 1.1-1.2 s tail (Step 11's avg was 240-400 ms; G's
+is 182-207 ms).
+
+In all runs: 0 resets, 0 allocation failures, 0 server timeouts, except E
+(one 10 s timeout, and 7 of 80 parallel requests failed in each of its two
+runs). Main-task stack minimum free was 7376 in every run against Step
+11's 7392-7408. The multi runs' 4x20 parallel phase took 155-165 s on T,
+A, H and G, 117 s on F and 67 s on C: the fewer outbound segments are
+dropped and retransmitted, the faster it goes.
+
+**Heap.**
+- **C**: an unrestricted 8-deep queue cost about 5 KB of minimum largest
+  free block under parallel load (7680 twice, p5 9216). The queued
+  packets took heap-fallback buffers and starved the WG actor's output
+  buffers of the pool.
+- **F**: the pool-only rule recovered some of that, to 8.2-8.7 KB.
+- **H**: queuing past 2 only while the pool had spare buffers did not
+  improve the heap minimum (8192), and it reintroduced 7% slow connects.
+- **G**: `POOL_N = 4` gave the best minimum of the stall-free variants
+  (13824 and 10752 in the parallel runs, 16384 at accept on both boots).
+  That is at or above the Step 11 baseline (10752, 15360), and 2.8 KB
+  more boot heap.
+
+Each variant has one or two boots, and run-to-run spread is 2-3 KB
+(Step 11). The F-vs-G difference is about one spread wide, so it is
+suggestive, not proven. One explanation consistent with the counters:
+a smaller pool means the netif queue's pool-only rule drops earlier
+under parallel load (G: 292 netif drops in the parallel run; F: 127). That
+caps concurrent in-flight segments, at the price of more heap-fallback
+churn (G: about 50 fallback buffers per b2b pass, 391 by the end of the
+multi run; F: 67), and of the UDP task waiting more often (G: 649 waits;
+F: 144). No heap-fallback allocation failed.
+
+Two heap events unrelated to this change, both seen here:
+- **E soak**: at 76 s, the control server closed the long poll ("early
+  eof") and the reconnect allocated the Noise channel (2 x 4114 B). For
+  the rest of the run, largest_free stayed at 7680 with 34 KB free. A
+  long-lived allocation landed in the middle of the big block. This
+  can happen on any build when control reconnects under load.
+- **F multi boot**: heap_watch hit 7680 at 25 s, before the first request,
+  during the first handshakes. This is the boot-dip shape Step 11
+  recorded and left open. It did not recur on any other boot here.
+
+**`POOL_N`**: it did not need to change. The stall was UDP receive
+dropping (fixed by waiting) plus the netif outbound channel (fixed by
+widening it), not the pool size. Step 11's `POOL_N = 6` and 4-slot
+`WgCmd` channel helped only by dropping fewer of the UDP packets that
+receive now waits for. With both causes fixed, 4 vs 6 made about no
+difference to the stall (G 1/240, F 0/240 in back-to-back connects) and
+G's heap minima were the better ones, so change 3 reverts them.
+
+**Scheduling**: no latency-trace build was run. The evidence is the
+connect/total p50 above (+10-20 ms against Step 11, within the 189 ms of
+the wait-only run) and the stack minimum. The UDP task now sleeps in 2 ms
+steps while the pool is short. In the multi runs, G recorded 423 such
+waits over 200 connects, against 4-6 for F, so with the smaller pool the
+UDP path is regularly up to a few ms later. Requests 3 s apart are
+unaffected (gap connect p50 115-128 ms against Step 11's 122-124).
+
+**Open**:
+- The netif queue still drops under parallel load (G: 292 over 80
+  parallel requests, all recovered by TCP).
+- The router's one-event-per-iteration loop with a 1-tick yield after
+  each forward is the underlying rate limit. Draining the netif channel
+  in batches would address it more directly than a deeper queue, but it
+  was not tried.
+- The boot dip from Step 11 remains unexplained.
+
 ## Design principle going forward
 
 Fixed-size, same-shape allocations that recur on a hot path should be
