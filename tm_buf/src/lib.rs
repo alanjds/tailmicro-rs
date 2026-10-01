@@ -53,6 +53,7 @@
 //! packet-carrying crate (including `tm_netstack`, which depends on no other
 //! `tm_*` crate) can use it.
 
+pub mod chan;
 pub mod lat;
 
 use core::fmt;

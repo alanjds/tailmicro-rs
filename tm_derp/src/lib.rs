@@ -277,9 +277,10 @@ impl DerpActor {
     /// or a new `Connect`/`Shutdown` command interrupts the backoff sleep.
     pub async fn run(
         self,
-        mut cmds:  async_channel::Receiver<DerpCmd>,
+        cmds:  async_channel::Receiver<DerpCmd>,
         events:    async_channel::Sender<DerpEvent>,
     ) {
+        let mut cmds = core::pin::pin!(cmds);
         // The most recent dial target, kept so a connection error can
         // redial it without needing a fresh `Connect` command.
         let mut target: Option<(heapless::String<64>, u16, Option<[u8; 32]>)> = None;
@@ -332,7 +333,7 @@ impl DerpActor {
                     loop {
                         tokio::select! {
                             _ = &mut sleep => break,
-                            cmd = cmds.recv() => match cmd {
+                            cmd = tm_buf::chan::recv_next(cmds.as_mut()) => match cmd {
                                 Ok(DerpCmd::Connect { host, port, cert_fingerprint }) => {
                                     target = Some((host, port, cert_fingerprint));
                                     interrupted = true;
@@ -377,7 +378,7 @@ impl DerpActor {
         host:             &str,
         port:             u16,
         _fingerprint:     Option<[u8; 32]>,
-        cmds:             &mut async_channel::Receiver<DerpCmd>,
+        cmds:             &mut core::pin::Pin<&mut async_channel::Receiver<DerpCmd>>,
         events:           &async_channel::Sender<DerpEvent>,
     ) -> Result<StopReason, DerpError> {
         use embedded_io_adapters::tokio_1::FromTokio;
@@ -425,7 +426,7 @@ impl DerpActor {
         loop {
             let decision = tokio::select! {
                 biased;
-                cmd = cmds.recv() => match cmd {
+                cmd = tm_buf::chan::recv_next(cmds.as_mut()) => match cmd {
                     Ok(DerpCmd::SendPacket { dst_key, payload }) => Decision::Send(dst_key, payload),
                     Ok(DerpCmd::Disconnect) => Decision::Stop(StopReason::Disconnected),
                     Ok(DerpCmd::Shutdown) | Err(_) => Decision::Stop(StopReason::Shutdown),
@@ -495,7 +496,7 @@ impl DerpActor {
         _host:            &str,
         _port:            u16,
         _fingerprint:     Option<[u8; 32]>,
-        cmds:             &mut async_channel::Receiver<DerpCmd>,
+        cmds:             &mut core::pin::Pin<&mut async_channel::Receiver<DerpCmd>>,
         _events:          &async_channel::Sender<DerpEvent>,
     ) -> Result<StopReason, DerpError> {
         loop {

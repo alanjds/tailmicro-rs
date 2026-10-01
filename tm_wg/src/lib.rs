@@ -238,12 +238,13 @@ impl WgActor {
         cmds: async_channel::Receiver<WgCmd>,
         events: async_channel::Sender<WgEvent>,
     ) {
+        let mut cmds = core::pin::pin!(cmds);
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
-                cmd = cmds.recv() => {
+                cmd = tm_buf::chan::recv_next(cmds.as_mut()) => {
                     match cmd {
                         // Box::pin the per-command handlers so their (multi-KB)
                         // futures are heap-allocated on demand instead of being

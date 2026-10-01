@@ -730,10 +730,10 @@ static ROUTER_DROPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 /// each with heapless::Vec construction and multi-field `info!` calls -- out
 /// of `join`'s frame.
 async fn event_router_task(
-    mut ctrl_ev_rx: async_channel::Receiver<ControlEvent>,
-    mut derp_ev_rx: async_channel::Receiver<DerpEvent>,
-    mut disco_ev_rx: async_channel::Receiver<DiscoEvent>,
-    mut wg_ev_rx: async_channel::Receiver<WgEvent>,
+    ctrl_ev_rx: async_channel::Receiver<ControlEvent>,
+    derp_ev_rx: async_channel::Receiver<DerpEvent>,
+    disco_ev_rx: async_channel::Receiver<DiscoEvent>,
+    wg_ev_rx: async_channel::Receiver<WgEvent>,
     mut netif_out_rx: tailnet::OutboundReceiver,
     ctrl_tx3: async_channel::Sender<ControlCmd>,
     derp_tx2: async_channel::Sender<DerpCmd>,
@@ -772,13 +772,18 @@ async fn event_router_task(
     let mut last_via: heapless::Vec<([u8; 32], Option<std::net::SocketAddrV4>), 8> = heapless::Vec::new();
     #[cfg(feature = "latency-trace")]
     let mut lat = LatState::new();
+    let mut ctrl_ev_rx = core::pin::pin!(ctrl_ev_rx);
+    let mut derp_ev_rx = core::pin::pin!(derp_ev_rx);
+    let mut disco_ev_rx = core::pin::pin!(disco_ev_rx);
+    let mut wg_ev_rx = core::pin::pin!(wg_ev_rx);
+    let mut netif_out_rx = core::pin::pin!(netif_out_rx);
     loop {
         #[cfg(target_os = "espidf")]
         router_yield().await;
         #[cfg(feature = "latency-trace")]
         lat.on_iter();
         tokio::select! {
-            evt = ctrl_ev_rx.recv() => {
+            evt = tm_buf::chan::recv_next(ctrl_ev_rx.as_mut()) => {
                 match evt {
                     Ok(evt) => match evt {
                         ControlEvent::MapUpdate(map) => {
@@ -909,7 +914,7 @@ async fn event_router_task(
                     }
                 }
             }
-            evt = derp_ev_rx.recv() => {
+            evt = tm_buf::chan::recv_next(derp_ev_rx.as_mut()) => {
                 match evt {
                     Ok(evt) => match evt {
                         DerpEvent::PacketReceived { src_key, payload } => {
@@ -988,7 +993,7 @@ async fn event_router_task(
                 }
             }
             // ── WireGuard data-plane events (previously dropped) ──────
-            evt = wg_ev_rx.recv() => {
+            evt = tm_buf::chan::recv_next(wg_ev_rx.as_mut()) => {
                 match evt {
                     // `via` is tm_wg's trusted direct path for this peer
                     // (`WgEndpoint::path_for`), or None for DERP.
@@ -1100,7 +1105,7 @@ async fn event_router_task(
                 }
             }
             // ── DISCO events ──────────────────────────────────────────
-            evt = disco_ev_rx.recv() => {
+            evt = tm_buf::chan::recv_next(disco_ev_rx.as_mut()) => {
                 match evt {
                     Ok(DiscoEvent::SendPong { dst_node_key, payload }) => {
                         // Bug 2 fix: `tm_disco` now hands back a fully
@@ -1166,7 +1171,7 @@ async fn event_router_task(
             // handed this packet to us because it wants to send it out the
             // tailnet interface. Route it to the WireGuard peer that owns
             // its destination IP, if we know one.
-            pkt = netif_out_rx.recv() => {
+            pkt = tm_buf::chan::recv_next(netif_out_rx.as_mut()) => {
                 match pkt {
                     Ok(tailnet::OutboundPacket { dst_ip, data }) => {
                         #[cfg(feature = "latency-trace")]

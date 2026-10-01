@@ -11,6 +11,8 @@ latency-trace = []
 
 [dependencies]
 heapless = { workspace = true }
+async-channel = { workspace = true }
+futures-core = { workspace = true }
 # Registers the `critical_section::Impl` that heapless's portable-atomic
 # backend (`portable-atomic-critical-section`, set on the workspace heapless
 # dependency) uses for the 64-bit tagged-pointer CAS in `heapless::pool` --

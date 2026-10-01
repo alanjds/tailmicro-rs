@@ -2082,7 +2082,9 @@ dependencies = [
 name = "tm_buf"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "critical-section",
+ "futures-core",
  "heapless 0.9.3",
 ]
 
