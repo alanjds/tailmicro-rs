@@ -1,11 +1,11 @@
 //! Streaming (push) MapResponse decoder.
 //!
-//! The buffer-and-parse decoder in [`crate::map_serde`] needs the whole
-//! de-prefixed JSON body (tens of KB, ~48 KB when the tailnet is inflated by
-//! ephemeral ghost peers) in one contiguous allocation. On the ESP32-C3's
-//! fragmented ~57 KB heap that `try_reserve_exact` fails, and the stream_map
-//! reader then has to discard the whole netmap to stay online -- losing the
-//! peers/DERPMap that the data plane needs (card t_e34afeed v2).
+//! A buffer-and-parse decoder would need the whole de-prefixed JSON body
+//! (tens of KB, ~48 KB when the tailnet is inflated by ephemeral ghost peers)
+//! in one contiguous allocation. On the ESP32-C3's fragmented ~57 KB heap
+//! that `try_reserve_exact` fails, and the stream_map reader would then have
+//! to discard the whole netmap to stay online -- losing the peers/DERPMap
+//! that the data plane needs.
 //!
 //! This module feeds the body to a push (event) JSON parser [`actson`] as the
 //! decrypted H2 DATA frames arrive, extracting only the handful of fields the
@@ -16,16 +16,14 @@
 //! bytes arrive across `await` points in a cooperative single-task runtime, so
 //! a pull/`from_reader` parser would block the executor.
 //!
-//! The extraction rules mirror [`crate::map_serde::parse`] exactly (online-only
-//! peers, first-IPv4-wins, region id from the key or body), and the shared
-//! scalar decoders (`hex_key`, `parse_ipv4`, `parse_derp_region`,
-//! `region_id_or`) are reused from there so the two decoders cannot drift.
+//! Extraction rules: online-only peers, first-IPv4-wins, region id from the
+//! key or body. The scalar decoders live in [`crate::map_scalars`].
 
 use actson::feeder::PushJsonFeeder;
 use actson::{JsonEvent, JsonParser};
 use arrayvec::ArrayVec;
 
-use crate::map_serde::{hex_key, parse_derp_region, parse_ipv4, region_id_or};
+use crate::map_scalars::{hex_key, parse_derp_region, parse_ipv4, region_id_or};
 use crate::{DerpRegion, MapState, PeerInfo, TailnetIp};
 
 /// Where we are in the MapResponse document. One is pushed per open
@@ -68,7 +66,7 @@ struct RegionScratch {
 }
 
 /// Error surfaced by the streaming decoder. Both collapse to the same
-/// caller-visible `JsonError::ParseError` (map_serde parity), but are kept
+/// caller-visible `JsonError::ParseError`, but are kept
 /// distinct here for logging.
 #[derive(Debug)]
 pub enum StreamError {
@@ -371,14 +369,14 @@ impl<const MAX_PEERS: usize, const MAX_REGIONS: usize> MapStreamParser<MAX_PEERS
     }
 
     /// Commit the scratch peer to the netmap, applying the same online-only /
-    /// key+ip-required policy as [`crate::map_serde::parse`].
+    /// key+ip-required policy.
     fn commit_peer(&mut self) {
         let p = core::mem::take(&mut self.peer);
         if self.out.peers.is_full() {
             return;
         }
         if p.online != Some(true) {
-            return; // online-only netmap (map_serde parity)
+            return; // online-only netmap
         }
         let (Some(key), Some(ip)) = (p.key, p.ip) else {
             return;
@@ -442,8 +440,8 @@ mod tests {
         p.finish().unwrap()
     }
 
-    // Same shape as map_serde's test (nested skipped subtrees whose strings
-    // carry structural bytes), to prove parity with the buffer-and-parse path.
+    // Real MapResponse shape, including nested skipped subtrees whose strings
+    // carry structural bytes ({}[],).
     const JSON: &str = r#"{
         "Node": {"Addresses": ["100.64.0.1/32", "fd7a:115c::a/128"], "Hostinfo": {"Hostname": "me"}},
         "PacketFilter": [{"SrcIPs": ["100.64.0.0/10"], "DstPorts": [{"IP":"*","Ports":{"First":0,"Last":65535}}]}],
@@ -481,7 +479,7 @@ mod tests {
     }
 
     // Offline / missing-Online peers must not occupy an ArrayVec slot, and an
-    // online peer listed after them must still be kept (map_serde parity).
+    // online peer listed after them must still be kept.
     const JSON_MIXED_ONLINE: &str = r#"{
         "Node": {"Addresses": ["100.64.0.1/32"]},
         "Peers": [

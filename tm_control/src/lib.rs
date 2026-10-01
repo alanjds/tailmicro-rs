@@ -12,7 +12,7 @@
 //! avoids per-task heap allocations, keeping the total memory footprint
 //! reasonable.
 pub mod noise;
-pub mod map_serde;
+pub mod map_scalars;
 pub mod map_stream;
 pub mod pin;
 mod io;
@@ -717,8 +717,7 @@ impl ControlActor {
         // Both the non-streaming publish and the streaming poll frame each
         // MapResponse as a 4-byte-LE length prefix + JSON (per
         // tools/wg_validator/ts_control.py's read_full_body/read_stream_message
-        // + write_map), which map_serde then parses. (The hand-rolled map_parser
-        // mis-parsed the real server response and was removed; see map_serde.)
+        // + write_map), which `map_stream` parses incrementally.
         //
         // Message reassembly state. Each MapResponse is `u32-LE length + JSON`.
         // We collect the 4-byte prefix first, then allocate the body buffer

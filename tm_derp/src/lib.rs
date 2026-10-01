@@ -13,7 +13,6 @@
 //! ## tailscale-rs patterns used
 //!
 //! * Actor with `mpsc::channel` mailbox.
-//! * `IoStream` trait for platform-independent I/O.
 //! * Strongly-typed message enums.
 
 use tm_keys::NodePublicKey;
@@ -507,55 +506,6 @@ impl DerpActor {
             }
         }
     }
-
-    async fn send_packet_frame<S: crate::IoStream>(
-        stream:  &mut S,
-        dst_key: &NodePublicKey,
-        payload: &[u8],
-    ) -> Result<(), DerpError> {
-        // Frame: type(1) + length(4) + dst_pubkey(32) + payload
-        let body_len = 32 + payload.len();
-        let mut hdr = [0u8; 5];
-        DerpHeader {
-            frame_type: DerpFrameType::SendPacket,
-            length: body_len as u32,
-        }.to_bytes(&mut hdr);
-
-        stream.write_all(&hdr).await.map_err(|_| DerpError::Io)?;
-        stream.write_all(dst_key.as_bytes()).await.map_err(|_| DerpError::Io)?;
-        stream.write_all(payload).await.map_err(|_| DerpError::Io)?;
-        Ok(())
-    }
-
-    async fn recv_frame<S: crate::IoStream>(
-        stream:     &mut S,
-        frame_buf:  &mut [u8; MAX_DERP_PAYLOAD],
-    ) -> Result<(DerpFrameType, usize), DerpError> {
-        let mut hdr_bytes = [0u8; 5];
-        stream.read_exact(&mut hdr_bytes).await.map_err(|_| DerpError::Io)?;
-        let hdr = DerpHeader::from_bytes(&hdr_bytes)
-            .ok_or(DerpError::Io)?;
-
-        if hdr.length as usize > frame_buf.len() {
-            return Err(DerpError::FrameTooLarge(hdr.length));
-        }
-        let body_len = hdr.length as usize;
-        stream.read_exact(&mut frame_buf[..body_len]).await
-            .map_err(|_| DerpError::Io)?;
-
-        Ok((hdr.frame_type, body_len))
-    }
-}
-
-// ── IoStream (same trait as tm_control) ──────────────────────────────────────
-// Defined here so tm_derp doesn't depend on tm_control.
-// Platform code should implement this trait for their TLS type.
-
-pub trait IoStream: Send {
-    fn read_exact<'a>(&'a mut self, buf: &'a mut [u8])
-        -> impl core::future::Future<Output = Result<(), ()>> + 'a;
-    fn write_all<'a>(&'a mut self, buf: &'a [u8])
-        -> impl core::future::Future<Output = Result<(), ()>> + 'a;
 }
 
 // ── DERP reconnect-with-backoff tests (2026-09 fix) ─────────────────────────

@@ -5,21 +5,15 @@
 //!
 //! ## Key difference from ts_runtime
 //!
-//! `ts_runtime` uses `tokio::spawn` for each actor, creating multiple tasks
-//! that Tokio schedules independently.  On ESP32-C3 with `current_thread`,
-//! spawned tasks still work, but each `spawn` requires Tokio to allocate a
-//! task descriptor on the heap.
-//!
-//! Here we offer two modes:
-//! * `Runtime::spawn` (default, mirrors tailscale-rs API) — uses `tokio::spawn`
-//! * `Runtime::join` (ESP32-C3 recommended) — uses `tokio::join!` inside a
-//!   single task, avoiding per-task heap overhead.
+//! `ts_runtime` uses `tokio::spawn` for each actor. Here every actor is a
+//! future folded into one `tokio::join!` inside the `Driver` returned by
+//! `Runtime::connect`, so there is no per-task heap allocation and all actors
+//! share one stack.
 //!
 //! ## Channel implementation
 //!
-//! Uses `crossbeam::channel` instead of `tokio::sync::mpsc` for predictable
-//! memory usage on ESP32-C3. Crossbeam channels use a pre-allocated ring buffer
-//! with no dynamic heap allocation after initialization.
+//! Uses bounded `async_channel` channels (heap ring allocated once at build)
+//! for predictable memory usage on ESP32-C3.
 //!
 //! All channels use a capacity of 2.  A backpressure of 2 messages × typical
 //! message size (~1.5 KB for a packet) = ~3 KB maximum queued per channel.
@@ -89,7 +83,7 @@ type BoxActorFut = core::pin::Pin<Box<dyn core::future::Future<Output = ()>>>;
 ///
 /// `#[inline(never)]`: the `info!`/`heap_caps_*` format temporaries would
 /// otherwise be reserved (once per call site, no slot reuse in the debug
-/// build) inside the single `Runtime::join` poll frame. With ~15 heap-probe
+/// build) inside the single `Runtime::build` poll frame. With ~15 heap-probe
 /// call sites that alone pushed the frame well past the 32 KB main-task
 /// stack. Kept in its own (reused) frame here instead. See
 /// docs/wg-dataplane-notes.md.
@@ -612,53 +606,6 @@ fn build_icmp_echo_request(src: [u8; 4], dst: [u8; 4], ident: u16, seq: u16) -> 
     let icmp_csum = inet_checksum(&pkt[20..28]);
     pkt[22..24].copy_from_slice(&icmp_csum.to_be_bytes());
     pkt
-}
-
-/// If `req` is an IPv4 ICMP echo request addressed to `our_ip`, build the
-/// matching echo reply: source/destination swapped, ICMP type 8 -> 0, both
-/// checksums recomputed, and ident/seq/data preserved. Returns `None` for
-/// anything that is not such a request.
-///
-/// No longer called from `event_router_task`: now that `tm_netstack::tailnet`
-/// gives the device a real lwIP netif (plan (a),
-/// docs/tailnet-http-lwip-netif-plan.md), decrypted inbound packets are
-/// handed to `tailnet::inject_inbound` instead, and lwIP's own ICMP handling
-/// answers pings the same way it answers everything else on that netif. Kept
-/// (dead-code-allowed) as the rung-6a elicitor's reply-side counterpart and
-/// for anyone bisecting the pre-netif behavior; see the plan's "retiring the
-/// hand-rolled ICMP responder" item.
-#[allow(dead_code)]
-fn build_icmp_echo_reply(req: &[u8], our_ip: [u8; 4]) -> Option<heapless::Vec<u8, 1500>> {
-    if req.len() < 20 || req[0] >> 4 != 4 { return None; } // IPv4 only
-    let ihl = (req[0] & 0x0f) as usize * 4;                // IPv4 header length
-    if ihl < 20 || req.len() < ihl + 8 { return None; }
-    if req[9] != 1 { return None; }                        // protocol: ICMP
-    if req[16..20] != our_ip { return None; }              // addressed to us
-    if req[ihl] != 8 { return None; }                      // ICMP type: echo request
-
-    // Copy the whole packet, then mutate in place; length/ident/seq/data all
-    // carry over unchanged from the request, as ping expects.
-    let mut reply: heapless::Vec<u8, 1500> = heapless::Vec::new();
-    reply.extend_from_slice(req).ok()?;
-
-    // Swap source and destination IPv4 addresses.
-    let mut src = [0u8; 4]; src.copy_from_slice(&reply[12..16]);
-    let mut dst = [0u8; 4]; dst.copy_from_slice(&reply[16..20]);
-    reply[12..16].copy_from_slice(&dst);
-    reply[16..20].copy_from_slice(&src);
-    // Recompute the IPv4 header checksum over the (variable-length) header.
-    reply[10] = 0; reply[11] = 0;
-    let ip_csum = inet_checksum(&reply[..ihl]);
-    reply[10..12].copy_from_slice(&ip_csum.to_be_bytes());
-
-    // Echo request (8) -> echo reply (0); recompute the ICMP checksum over the
-    // whole ICMP message (header + any ping payload).
-    reply[ihl] = 0;
-    reply[ihl + 2] = 0; reply[ihl + 3] = 0;
-    let icmp_csum = inet_checksum(&reply[ihl..]);
-    reply[ihl + 2..ihl + 4].copy_from_slice(&icmp_csum.to_be_bytes());
-
-    Some(reply)
 }
 
 /// Router-side state of the `latency-trace` diagnostic (ALLOCATIONS.md
@@ -1387,7 +1334,7 @@ where
 }
 
 impl Runtime {
-    /// Shared actor/channel construction for both `join` and `connect`.
+    /// Actor/channel construction for `connect`.
     ///
     /// Builds every actor and the event router exactly as before, sends the
     /// initial `ControlCmd::Start`, and returns the still-idle `Runtime`
@@ -1532,23 +1479,6 @@ impl Runtime {
         (Runtime { control_tx: ctrl_tx, derp_tx, disco_tx, wg_tx }, driver)
     }
 
-    /// Run all actors within a single task using `tokio::join!`.
-    ///
-    /// This avoids per-task heap allocations that `tokio::spawn` incurs.
-    /// All actors run cooperatively on the same stack.
-    ///
-    /// Never returns while the connection is up (the streaming MapResponse
-    /// poll is deliberately unbounded so the node stays marked online) --
-    /// prefer `Runtime::connect` for any caller that needs to do other work
-    /// (e.g. run an HTTP server) concurrently with the data plane, since
-    /// that other work can't proceed until this returns. See
-    /// docs/wg-dataplane-notes.md "Readiness-decoupled connect handle".
-    pub async fn join(config: RuntimeConfig) -> Self {
-        let (runtime, driver) = Self::build(config).await;
-        driver.await;
-        runtime
-    }
-
     /// Connect and return as soon as the tailnet IP is assigned
     /// (`ControlEvent::OurIpAssigned`), handing back the still-pending data
     /// plane `Driver` future for the caller to fold into its own
@@ -1577,131 +1507,6 @@ impl Runtime {
             Ok(ip) => Ok((runtime, ip, driver)),
             Err(()) => Err(ConnectError),
         }
-    }
-
-    /// Use tokio::spawn to run actors in separate tasks.
-    /// This is the recommended method for ESP32-C3 when Runtime::join causes memory issues.
-    #[cfg(not(target_os = "espidf"))]
-    pub async fn spawn(mut config: RuntimeConfig) -> Self {
-        let (ctrl_tx,  ctrl_rx)  = async_channel::bounded::<ControlCmd>(CHAN_CAP);
-        let (ctrl_ev_tx, mut ctrl_ev_rx) = async_channel::bounded::<ControlEvent>(CHAN_CAP);
-
-        let (derp_tx,  derp_rx)  = async_channel::bounded::<DerpCmd>(CHAN_CAP);
-        let (derp_ev_tx, mut derp_ev_rx) = async_channel::bounded::<DerpEvent>(CHAN_CAP);
-
-        let (disco_tx, disco_rx) = async_channel::bounded::<DiscoCmd>(CHAN_CAP);
-        let (_disco_ev_tx, mut _disco_ev_rx) = async_channel::bounded::<DiscoEvent>(CHAN_CAP);
-
-        let (wg_tx,    wg_rx)    = async_channel::bounded::<WgCmd>(WG_CMD_CHAN_CAP);
-        let (_wg_ev_tx, mut _wg_ev_rx) = async_channel::bounded::<WgEvent>(CHAN_CAP);
-
-        // ── Spawn actors ──────────────────────────────────────────────────────
-
-        let our_pub = config.node_state.node_key.public();
-        let disco_key = config.node_state.disco_key.clone();
-        // WireGuard static key == the node key (captured before node_state is
-        // moved into ControlActor below).
-        let wg_priv = *config.node_state.node_key.as_bytes();
-
-        config.control.connect_timeout = config.connect_timeout;
-        let control_actor = ControlActor::new(config.control, config.node_state);
-        tokio::spawn(control_actor.run(ctrl_rx, ctrl_ev_tx));
-
-        let derp_actor = DerpActor::new(our_pub, wg_priv);
-        tokio::spawn(derp_actor.run(derp_rx, derp_ev_tx));
-
-        let disco_actor = DiscoActor::new(disco_key);
-        tokio::spawn(disco_actor.run(disco_rx, _disco_ev_tx));
-
-        let wg_actor = WgActor::new(wg_priv, config.priority_peer);
-        tokio::spawn(wg_actor.run(wg_rx, _wg_ev_tx));
-
-        // ── Event router task ─────────────────────────────────────────────────
-        //
-        // A single task fans out events from the control actor to the other
-        // actors.  This is the "message bus" from ts_runtime, simplified.
-        //
-        // On ESP32-C3 this is just another cooperatively-scheduled future —
-        // no extra OS stack.
-
-        let ctrl_tx3 = ctrl_tx.clone();
-        let ctrl_tx4 = ctrl_tx.clone();
-        let derp_tx2  = derp_tx.clone();
-        let wg_tx2    = wg_tx.clone();
-        let disco_tx2 = disco_tx.clone();
-
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    evt = ctrl_ev_rx.recv() => {
-                        match evt {
-                            Ok(evt) => match evt {
-                                ControlEvent::MapUpdate(map) => {
-                                    // Update WireGuard peers
-                                    let _ = wg_tx2.send(WgCmd::ApplyMap(map)).await;
-                                    // TODO: update DERP preferred region
-                                }
-                                ControlEvent::OurIpAssigned(ip) => {
-                                    tracing::debug!("Tailnet IP: {:?}", ip.0);
-                                }
-                                ControlEvent::KeyExpiry => {
-                                    let _ = ctrl_tx3.send(ControlCmd::Reauth).await; // trigger reauth
-                                }
-                                ControlEvent::Error(e) => {
-                                    tracing::error!("Control error: {:?}", e);
-                                }
-                            }
-                            Err(_) => {
-                                tracing::debug!("Control event channel closed, breaking");
-                                break;
-                            }
-                        }
-                    }
-                    evt = derp_ev_rx.recv() => {
-                        match evt {
-                            Ok(evt) => match evt {
-                                DerpEvent::PacketReceived { src_key, payload } => {
-                                    // Distinguish DISCO vs WireGuard by first byte
-                                    if !payload.is_empty() && payload[0] == 0x6d {
-                                        // DISCO magic prefix (simplified check).
-                                        // Buffer forwarded as-is (tm_buf::PktBuf).
-                                        forward_or_drop(&disco_tx2, DiscoCmd::MaybeDisco {
-                                            src: tm_disco::DiscoSrc::Derp { node_key: *src_key.as_bytes() },
-                                            data: payload,
-                                        }, "DiscoCmd::MaybeDisco");
-                                    } else {
-                                        // WireGuard packet, forwarded as-is.
-                                        forward_or_drop(&wg_tx2, WgCmd::InboundPacket {
-                                            via: tm_wg::Via::Derp { src_key: *src_key.as_bytes() },
-                                            payload,
-                                        }, "WgCmd::InboundPacket");
-                                    }
-                                }
-                                DerpEvent::Connected => {
-                                    tracing::debug!("DERP connected");
-                                }
-                                DerpEvent::PingReceived => {}
-                                DerpEvent::Disconnected => {
-                                    tracing::debug!("DERP disconnected");
-                                }
-                                DerpEvent::Error(e) => {
-                                    tracing::error!("DERP error: {:?}", e);
-                                }
-                            }
-                            Err(_) => {
-                                tracing::debug!("DERP event channel closed, breaking");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        // Start the control actor by sending a Start command (via clone)
-        let _ = ctrl_tx4.send(ControlCmd::Start { auth_key: config.auth_key.clone() }).await;
-
-        Runtime { control_tx: ctrl_tx, derp_tx, disco_tx, wg_tx }
     }
 }
 

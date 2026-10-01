@@ -10,7 +10,6 @@ members = [
     "tm_wg",
     "tm_runtime",
     "tm_netstack",
-    "tm_tls",
     "tm_buf",
 ]
 
@@ -83,7 +82,6 @@ tm_disco     = { path = "tm_disco" }
 tm_wg        = { path = "tm_wg" }
 tm_runtime   = { path = "tm_runtime" }
 tm_netstack  = { path = "tm_netstack" }
-tm_tls       = { path = "tm_tls" }
 tm_buf       = { path = "tm_buf" }
 
 # ── Root crate (mirrors tailscale crate in tailscale-rs) ──────────────────────
@@ -120,15 +118,6 @@ async-channel = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time", "net"] }
 tracing-subscriber = "0.3"
-
-[[example]]
-name = "peer_ping"
-
-[[example]]
-name = "tcp_echo"
-
-[[example]]
-name = "udp_echo"
 
 # ── Build profiles ────────────────────────────────────────────────────────────
 [profile.release]

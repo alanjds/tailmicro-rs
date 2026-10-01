@@ -24,7 +24,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// Minimal constructor — auth key provided separately to `Device::new`.
+    /// Minimal constructor — auth key provided separately to `Device::connect`.
     pub fn new(_auth_key: &str) -> Self {
         Self::default()
     }
@@ -55,7 +55,7 @@ impl Config {
     /// Set the bring-up-only connect deadline (see `connect_timeout` field
     /// doc). The caller (e.g. the app's outer wrapper) is expected to use
     /// this INSTEAD OF an external `select!`/`timeout(..)` wrapped around
-    /// `Device::new(..)` — wrapping the whole `Device::new` future in a
+    /// `Device::connect(..)` — wrapping the whole `Device::connect` future in a
     /// dropping timeout races the streaming poll and, if it ever fires
     /// after bring-up, drops every actor and gets the ephemeral node
     /// garbage-collected off the tailnet. This deadline only ever bounds

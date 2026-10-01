@@ -222,14 +222,6 @@ impl<'a, S: AsyncRead + AsyncWrite> DerpTls<'a, S> {
         write_frame(&mut self.tls, DerpFrameType::SendPacket as u8, &[dst_key, packet]).await
     }
 
-    /// Read one DERP frame into `buf`; returns `(frame_type_byte, body_len)`.
-    pub async fn read_frame(
-        &mut self,
-        buf: &mut [u8; MAX_DERP_PAYLOAD],
-    ) -> Result<(u8, usize), DerpError> {
-        read_frame(&mut self.tls, buf).await
-    }
-
     /// Answer a server PING (0x12) with a PONG (0x13) echoing its payload.
     pub async fn pong(&mut self, ping_body: &[u8]) -> Result<(), DerpError> {
         write_frame(&mut self.tls, DerpFrameType::Pong as u8, &[ping_body]).await
@@ -238,11 +230,10 @@ impl<'a, S: AsyncRead + AsyncWrite> DerpTls<'a, S> {
     /// Cancellation-safe, resumable read of one DERP frame.
     ///
     /// Returns `(frame_type_byte, body_len)`; the body lives in [`Self::frame`]
-    /// (`&self.frame()[..body_len]`). Unlike [`Self::read_frame`], which reads
-    /// into a caller buffer and loses those bytes if its future is dropped
-    /// mid-frame, this method persists all progress in `self`, so it is safe to
-    /// use as one branch of a `tokio::select!` whose other branch may win and
-    /// drop this future. On the next call it resumes from the exact byte.
+    /// (`&self.frame()[..body_len]`). All progress persists in `self`, so it is
+    /// safe to use as one branch of a `tokio::select!` whose other branch may
+    /// win and drop this future. On the next call it resumes from the exact
+    /// byte.
     pub async fn read_frame_buffered(&mut self) -> Result<(u8, usize), DerpError> {
         while self.rd_hdr_got < 5 {
             let n = self
