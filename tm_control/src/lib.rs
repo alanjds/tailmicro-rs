@@ -38,7 +38,7 @@ const MAX_REQUEST_SIZE: usize = 4096 + 256;
 /// Cap for the small, fixed-shape JSON request bodies this crate sends
 /// (`RegisterRequest`, `MapRequest`): a handful of short string fields, well
 /// under 1KB in practice. See [`to_json_buf`].
-const REQUEST_BODY_CAP: usize = 768;
+const REQUEST_BODY_CAP: usize = 1024;
 
 /// Serialize `value` into a fixed-capacity buffer instead of `serde_json::
 /// to_vec`'s heap-growing `Vec<u8>`.
@@ -410,6 +410,13 @@ struct HostInfo<'a> {
     #[serde(rename = "OS")]
     os: &'a str,
     hostname: &'a str,
+    // Shown by the admin console as client version / client name / machine.
+    // Same convention as tailscale-rs: the crate version, an `App` tag that
+    // tells this client from tailscaled, and the CPU architecture.
+    #[serde(rename = "IPNVersion")]
+    ipn_version: &'a str,
+    app: &'a str,
+    machine: &'a str,
     // Carries PreferredDERP (our home region) on the non-streaming publish
     // MapRequest; None on the register and streaming requests, where it is
     // either irrelevant or read-only. skip_serializing_if keeps those bodies
@@ -425,7 +432,11 @@ struct HostInfo<'a> {
 /// replaces the stored Hostinfo from whichever request arrives last, so a
 /// request with a different Services list flaps it to every peer.
 fn host_info(config: &Config, net_info: Option<NetInfo>) -> HostInfo<'_> {
-    HostInfo { os: "embedded", hostname: config.hostname, net_info, services: config.services }
+    HostInfo {
+        os: "embedded", hostname: config.hostname,
+        ipn_version: env!("CARGO_PKG_VERSION"), app: "tailmicro", machine: std::env::consts::ARCH,
+        net_info, services: config.services,
+    }
 }
 
 #[derive(Deserialize)]
@@ -1298,6 +1309,11 @@ mod tests {
             "../../tools/wg_validator/publish2_lan_body.json")).unwrap();
         assert_eq!(py["Hostinfo"]["OS"], "linux");
         py["Hostinfo"]["OS"] = "embedded".into();
+        let mut ours = ours;
+        // Identity fields the Python probe does not send.
+        for k in ["IPNVersion", "App", "Machine"] {
+            assert!(ours["Hostinfo"].as_object_mut().unwrap().remove(k).is_some(), "{k}");
+        }
         assert_eq!(ours, py);
         assert_eq!(ours["Endpoints"][0], "192.168.15.20:41641", "LAN endpoint goes first");
     }
@@ -1315,11 +1331,7 @@ mod tests {
             version: CAPABILITY_VERSION, compress: "", keep_alive: false,
             node_key: NODE_HEX, endpoints: &endpoints, stream: false,
             disco_key: Some(DISCO_HEX),
-            hostinfo: Some(HostInfo {
-                os: "embedded", hostname: "esp32c3",
-                net_info: Some(NetInfo { preferred_derp: region }),
-                services: &[],
-            }),
+            hostinfo: Some(host_info(&cfg(&[]), Some(NetInfo { preferred_derp: region }))),
             omit_peers: false,
         }).unwrap();
         let new = publish2_body(&cfg(&[]), NODE_HEX, DISCO_HEX, region, None).unwrap();
@@ -1359,6 +1371,15 @@ mod tests {
         Service::udp(5353, "0123456789abcdef0123456789abcdef"),
         Service::tcp(8080, "0123456789abcdef0123456789abcdef"),
     ];
+
+    #[test]
+    fn hostinfo_reports_identity() {
+        let body = publish2_body(&cfg(&[]), NODE_HEX, DISCO_HEX, 11, None).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["Hostinfo"]["IPNVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["Hostinfo"]["App"], "tailmicro");
+        assert_eq!(v["Hostinfo"]["Machine"], std::env::consts::ARCH);
+    }
 
     #[test]
     fn publish2_carries_hostname_and_services() {
