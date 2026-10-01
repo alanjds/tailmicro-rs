@@ -243,13 +243,8 @@ fn chip_seed() -> [u8; 6] {
     HOST_TEST_CHIP_SEED
 }
 
-// ── rand_core shim ────────────────────────────────────────────────────────────
-// On ESP-IDF, getrandom is available via esp-idf-sys.
-// On host (tests), uses OsRng.
 fn rand_core_shim() -> impl rand_core::CryptoRng + rand_core::RngCore {
-    // This compiles on both targets because getrandom's esp-idf feature
-    // routes through esp_random().
-    rand::rngs::OsRng
+    rand_core::OsRng
 }
 
 #[cfg(test)]

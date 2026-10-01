@@ -406,7 +406,7 @@ impl DerpActor {
             host,
             &our_pub,
             &self.node_priv,
-            rand::rngs::OsRng,
+            rand_core::OsRng,
         )
         .await?;
         heap_probe("after DerpTls::connect");

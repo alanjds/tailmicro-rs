@@ -31,7 +31,7 @@
  
 use arrayvec::ArrayVec;
 use crypto_box::aead::Aead;
-use rand::RngCore;
+use rand_core::{OsRng, RngCore};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::{Duration, Instant};
 use tm_keys::DiscoPrivateKey;
@@ -551,7 +551,7 @@ impl DiscoActor {
 
                 heap_probe_blocks("process: before OsRng nonce + build_sealed_pong");
                 let mut nonce_bytes = [0u8; NONCE_LEN];
-                rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+                OsRng.fill_bytes(&mut nonce_bytes);
 
                 match src {
                     DiscoSrc::Derp { node_key } => {

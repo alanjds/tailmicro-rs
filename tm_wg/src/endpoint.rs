@@ -976,8 +976,7 @@ fn trust_direct(peer: &mut Peer, addr: SocketAddrV4, now: Instant) {
 
 /// A small, cheap jitter source in `[0, HANDSHAKE_JITTER_MS)`.
 fn handshake_jitter_ms() -> u64 {
-    use rand::rngs::OsRng;
-    use rand_core::RngCore;
+    use rand_core::{OsRng, RngCore};
     OsRng.next_u64() % HANDSHAKE_JITTER_MS
 }
 

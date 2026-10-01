@@ -16,10 +16,8 @@ heapless            = { workspace = true }
 arrayvec            = { workspace = true }
 tokio               = { workspace = true, features = ["sync"] }
 async-channel = { workspace = true }
-# Bug 2 fix: a fresh random nonce per sealed PONG. getrandom-backed (on
-# ESP32-C3, getrandom is served by esp_fill_random, the same source tm_derp
-# and tm_wg already use). Same pattern as tm_derp's Cargo.toml.
-rand                = { workspace = true, features = ["getrandom"] }
+# A fresh random nonce per sealed PONG (OsRng).
+rand_core           = { workspace = true }
 tracing             = { workspace = true }
 
 # Heap probes bracketing AllowPeer / build_sealed_pong (round 6 of the

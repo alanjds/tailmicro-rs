@@ -14,7 +14,7 @@ use aead::AeadInPlace;
 use blake2::{Blake2s256, Digest};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 use hkdf::SimpleHkdf;
-use rand::rngs::OsRng;
+use rand_core::OsRng;
 use zerocopy::{FromZeros, IntoBytes};
 
 use super::{

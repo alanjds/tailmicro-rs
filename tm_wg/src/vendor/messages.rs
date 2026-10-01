@@ -8,8 +8,7 @@
 
 use core::fmt::{Debug, Formatter};
 
-use rand::rngs::OsRng;
-use rand_core::RngCore;
+use rand_core::{OsRng, RngCore};
 use zerocopy::{
     FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned,
     byteorder::little_endian::{U32, U64},
