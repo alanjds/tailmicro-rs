@@ -31,7 +31,8 @@ tm_netstack.workspace = true
 heapless  = { workspace = true }
 async-channel.workspace = true
 log.workspace = true
-esp-idf-svc = { workspace = true }
-esp-idf-sys = { workspace = true }
 tokio     = { workspace = true, features = ["sync", "rt", "macros"] }
 tracing   = { workspace = true }
+
+[target.'cfg(target_os = "espidf")'.dependencies]
+esp-idf-sys = { workspace = true }

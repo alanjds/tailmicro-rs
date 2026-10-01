@@ -40,6 +40,14 @@ pub async fn tokio_freertos_yield() {
     freertos_yield_ticks(50).await;
 }
 
+/// Host stand-in: there is no FreeRTOS idle task or task watchdog to feed, so
+/// only the cooperative yield remains (keeps the boot interleaving of the
+/// device build).
+#[cfg(not(target_os = "espidf"))]
+pub async fn tokio_freertos_yield() {
+    tokio::task::yield_now().await;
+}
+
 /// How long the event router may run without a gap before it hands the CPU
 /// to FreeRTOS for one tick.
 ///
@@ -1067,6 +1075,7 @@ async fn event_router_task(
                         // from this (non-tcpip) task -- see
                         // tm_netstack::tailnet's module doc comment.
                         trace!("Runtime::join() - WgEvent::InboundDecrypted {} bytes from peer {:02x}{:02x}..", payload.len(), src_key[0], src_key[1]);
+                        #[cfg(target_os = "espidf")]
                         if tm_wg::heapdiag::ENABLED { unsafe {
                             let pool = tm_buf::stats();
                             debug!("Runtime::join() - heap after inbound-decrypted (before inject_inbound): total_free={} largest_internal={} largest_default={} pktbuf_pool: free={} allocs={} frees={}",
