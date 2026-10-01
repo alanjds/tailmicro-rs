@@ -28,7 +28,7 @@ async fn main() {
         .expect("pin verification failed");
     println!("Pin verified OK. Connecting to {host}:80 with that pinned Noise key.");
 
-    let config = Config { control_host: host, control_port: 80, control_pin, connect_timeout: None, lan_udp_port: None, hostname: "esp32c3", services: &[] };
+    let config = Config { control_host: host, control_port: 80, control_pin, connect_timeout: None, lan_udp_port: None, hostname: "esp32c3", os_version: Default::default(), services: &[] };
     let node_state = NodeState::generate();
     let actor = ControlActor::new(config, node_state);
 

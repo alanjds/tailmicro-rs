@@ -22,6 +22,7 @@ pub struct Config {
     /// — see `tm_control::Config::connect_timeout`.
     pub(crate) connect_timeout: Option<std::time::Duration>,
     pub(crate) hostname: &'static str,
+    pub(crate) os_version: heapless::String<{ tm_control::MAX_OS_VERSION }>,
     pub(crate) services: &'static [tm_control::Service],
 }
 
@@ -77,6 +78,14 @@ impl Config {
         Ok(self)
     }
 
+    /// Platform description shown as the node's OS version in the admin
+    /// console, e.g. `"ESP32-C3 r0.4 myapp 1.2.3"`. Printable ASCII, at most
+    /// [`MAX_OS_VERSION`](tm_control::MAX_OS_VERSION) bytes.
+    pub fn with_os_version(mut self, os_version: &str) -> Result<Self, Error> {
+        self.os_version = tm_control::check_os_version(os_version).map_err(Error::InvalidConfig)?;
+        Ok(self)
+    }
+
     /// Services to advertise on the tailnet (e.g. `Service::tcp(80, "HTTP")`).
     /// They are informational: peers can see them, nothing enforces them.
     /// Sent with every control request, so a change needs a reconnect.
@@ -119,6 +128,7 @@ impl Config {
             // socket is bound; the app config has no say in it.
             lan_udp_port: None,
             hostname: self.hostname,
+            os_version: self.os_version.clone(),
             services: self.services,
         }
     }
@@ -133,6 +143,7 @@ impl Default for Config {
             control_pin:  [0u8; 32],
             connect_timeout: None,
             hostname:     "esp32c3",
+            os_version:   heapless::String::new(),
             services:     &[],
         }
     }

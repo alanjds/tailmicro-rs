@@ -166,6 +166,10 @@ pub struct Config {
     /// Node name sent in every `Hostinfo`; control derives the MagicDNS name
     /// from it. Must satisfy [`valid_hostname`].
     pub hostname: &'static str,
+    /// Free-form platform description sent as `Hostinfo.OSVersion` (the admin
+    /// console shows it as the OS version); empty omits it. See
+    /// [`check_os_version`].
+    pub os_version: heapless::String<MAX_OS_VERSION>,
     /// Services advertised in every `Hostinfo`. Informational only: the
     /// control server hands them to peers, nothing enforces them. At most
     /// [`MAX_SERVICES`] entries, see [`check_services`].
@@ -176,6 +180,7 @@ pub struct Config {
 /// bounded to keep the bodies inside [`REQUEST_BODY_CAP`].
 pub const MAX_SERVICES: usize = 4;
 pub const MAX_SERVICE_DESC: usize = 32;
+pub const MAX_OS_VERSION: usize = 48;
 
 /// Only the protocols Tailscale treats as plain informational entries. The
 /// `peerapi*` pseudo-services are never sent: peers would act on them.
@@ -211,6 +216,13 @@ pub fn check_services(services: &[Service]) -> Result<(), &'static str> {
         if sv.description.len() > MAX_SERVICE_DESC { return Err("service description too long"); }
     }
     Ok(())
+}
+
+/// Copy `v` into a `Config::os_version` value; `Err` with the reason if it is
+/// too long or has anything but printable ASCII.
+pub fn check_os_version(v: &str) -> Result<heapless::String<MAX_OS_VERSION>, &'static str> {
+    if !v.bytes().all(|c| (0x20..0x7f).contains(&c)) { return Err("os_version must be printable ASCII"); }
+    heapless::String::try_from(v).map_err(|_| "os_version too long")
 }
 
 /// A single lowercase DNS label: what control turns into the MagicDNS name.
@@ -410,13 +422,15 @@ struct HostInfo<'a> {
     #[serde(rename = "OS")]
     os: &'a str,
     hostname: &'a str,
-    // Shown by the admin console as client version / client name / machine.
-    // Same convention as tailscale-rs: the crate version, an `App` tag that
-    // tells this client from tailscaled, and the CPU architecture.
+    // Shown by the admin console as client version / machine / OS version.
+    // Same convention as tailscale-rs for the first two: the crate version
+    // and the CPU architecture. (`App` is deliberately not sent: the console
+    // does not show it and it only disambiguates tsnet programs.)
     #[serde(rename = "IPNVersion")]
     ipn_version: &'a str,
-    app: &'a str,
     machine: &'a str,
+    #[serde(rename = "OSVersion", skip_serializing_if = "str::is_empty")]
+    os_version: &'a str,
     // Carries PreferredDERP (our home region) on the non-streaming publish
     // MapRequest; None on the register and streaming requests, where it is
     // either irrelevant or read-only. skip_serializing_if keeps those bodies
@@ -434,7 +448,8 @@ struct HostInfo<'a> {
 fn host_info(config: &Config, net_info: Option<NetInfo>) -> HostInfo<'_> {
     HostInfo {
         os: "embedded", hostname: config.hostname,
-        ipn_version: env!("CARGO_PKG_VERSION"), app: "tailmicro", machine: std::env::consts::ARCH,
+        ipn_version: env!("CARGO_PKG_VERSION"), machine: std::env::consts::ARCH,
+        os_version: config.os_version.as_str(),
         net_info, services: config.services,
     }
 }
@@ -1239,6 +1254,7 @@ mod tests {
             connect_timeout: Some(Duration::from_millis(50)),
             lan_udp_port: None,
             hostname: "esp32c3",
+            os_version: heapless::String::new(),
             services: &[],
         };
 
@@ -1269,6 +1285,7 @@ mod tests {
             connect_timeout: None,
             lan_udp_port: None,
             hostname: "esp32c3",
+            os_version: heapless::String::new(),
             services: &[],
         };
 
@@ -1286,7 +1303,8 @@ mod tests {
     fn cfg(services: &'static [Service]) -> Config {
         Config {
             control_host: "localhost", control_port: 80, control_pin: [0u8; 32],
-            connect_timeout: None, lan_udp_port: None, hostname: "esp32c3", services,
+            connect_timeout: None, lan_udp_port: None, hostname: "esp32c3",
+            os_version: heapless::String::new(), services,
         }
     }
 
@@ -1311,7 +1329,7 @@ mod tests {
         py["Hostinfo"]["OS"] = "embedded".into();
         let mut ours = ours;
         // Identity fields the Python probe does not send.
-        for k in ["IPNVersion", "App", "Machine"] {
+        for k in ["IPNVersion", "Machine"] {
             assert!(ours["Hostinfo"].as_object_mut().unwrap().remove(k).is_some(), "{k}");
         }
         assert_eq!(ours, py);
@@ -1377,8 +1395,13 @@ mod tests {
         let body = publish2_body(&cfg(&[]), NODE_HEX, DISCO_HEX, 11, None).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["Hostinfo"]["IPNVersion"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(v["Hostinfo"]["App"], "tailmicro");
         assert_eq!(v["Hostinfo"]["Machine"], std::env::consts::ARCH);
+        assert!(v["Hostinfo"].get("OSVersion").is_none(), "empty os_version is omitted");
+        assert!(v["Hostinfo"].get("App").is_none());
+        let c = Config { os_version: check_os_version("ESP32-C3 r0.4 tasmolike-rs 1.2.3").unwrap(), ..cfg(&[]) };
+        let body = publish2_body(&c, NODE_HEX, DISCO_HEX, 11, None).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["Hostinfo"]["OSVersion"], "ESP32-C3 r0.4 tasmolike-rs 1.2.3");
     }
 
     #[test]
@@ -1413,7 +1436,11 @@ mod tests {
 
     #[test]
     fn max_services_fit_the_request_cap() {
-        let c = Config { hostname: "a-63-char-label-0123456789-0123456789-0123456789-0123456789", ..cfg(&FOUR) };
+        let c = Config {
+            hostname: "a-63-char-label-0123456789-0123456789-0123456789-0123456789",
+            os_version: check_os_version(&"v".repeat(MAX_OS_VERSION)).unwrap(),
+            ..cfg(&FOUR)
+        };
         assert!(check_services(&FOUR).is_ok());
         let lan = lan_endpoint("192.168.15.20:50000".parse().unwrap(), 41641);
         let body = publish2_body(&c, NODE_HEX, DISCO_HEX, 11, lan).unwrap();
@@ -1430,6 +1457,8 @@ mod tests {
         assert!(check_services(&[Service::tcp(0, "")]).is_err());
         assert!(check_services(&[Service::tcp(80, "0123456789abcdef0123456789abcdef0")]).is_err());
         assert!(check_services(&[Service::tcp(80, ""); MAX_SERVICES + 1]).is_err());
+        assert!(check_os_version(&"v".repeat(MAX_OS_VERSION + 1)).is_err());
+        assert!(check_os_version("tab\there").is_err() && check_os_version("caf\u{e9}").is_err());
         assert!(valid_hostname("esp32c3") && valid_hostname("a-b"));
         for bad in ["", "-a", "a-", "A", "a_b", "a.b", &"a".repeat(64)] {
             assert!(!valid_hostname(bad), "{bad}");
