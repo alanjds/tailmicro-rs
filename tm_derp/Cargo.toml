@@ -26,8 +26,8 @@ tracing   = { workspace = true }
 # TLS 1.3-only, no_std, smallest-RAM. Custom ChaCha20-Poly1305 suite reuses the
 # RustCrypto AEAD/hash already compiled for Noise/WireGuard.
 embedded-tls          = { version = "0.19", default-features = false, optional = true }
-embedded-io-async     = { version = "0.7", optional = true }
-embedded-io-adapters  = { version = "0.7", optional = true, features = ["tokio-1"] }
+embedded-io-async     = { workspace = true, optional = true }
+embedded-io-adapters  = { workspace = true, optional = true }
 chacha20poly1305      = { version = "0.10", default-features = false, optional = true }
 crypto_box            = { version = "0.9", default-features = false, features = ["alloc", "salsa20"], optional = true }
 sha2                  = { version = "0.10", default-features = false, optional = true }

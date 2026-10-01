@@ -17,7 +17,9 @@ async fn main() {
     let real_host = "controlplane.tailscale.com"; // used only for the Host header / handshake host arg
     let proxy_addr = "127.0.0.1:8899"; // actual TCP destination
 
-    let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    let mut stream = embedded_io_adapters::tokio_1::FromTokio::new(
+        tokio::net::TcpStream::connect(proxy_addr).await.unwrap(),
+    );
     println!("connected to proxy at {proxy_addr}, Host header will say {real_host}");
     let machine_key = MachinePrivateKey::generate();
     match tm_control::noise::do_noise_handshake(&mut stream, &machine_key, &control_pin, real_host, 72).await {

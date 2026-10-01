@@ -27,7 +27,10 @@ use tm_h2::{
 };
 use tm_keys::NodeState;
 use noise::{NoiseChannel, do_noise_handshake};
-pub use io::IoStream;
+
+/// The control connection's transport: tokio TCP seen through
+/// `embedded-io-async`, the trait the Noise and H/2 code is written against.
+type TokioStream = embedded_io_adapters::tokio_1::FromTokio<tokio::net::TcpStream>;
 
 // Max request size: body + headers (headers ~256 bytes)
 const MAX_REQUEST_SIZE: usize = 4096 + 256;
@@ -533,7 +536,7 @@ impl ControlActor {
     /// `tokio::time::timeout` when `connect_timeout` is set.
     async fn bring_up(&mut self, auth_key: &str,
                        events: &async_channel::Sender<ControlEvent>)
-        -> Result<(tokio::net::TcpStream, NoiseChannel, H2State, heapless::String<80>), ControlError>
+        -> Result<(TokioStream, NoiseChannel, H2State, heapless::String<80>), ControlError>
     {
         info!("Tailscale connect_and_poll starting");
         let host = self.config.control_host;
@@ -659,7 +662,7 @@ impl ControlActor {
         if let Some(region) = home_region {
             let disco_key_hex = self.node_state.disco_key.public().to_hex();
             let lan_ep = self.config.lan_udp_port.and_then(|port| {
-                let ep = main_conn.local_addr().ok().and_then(|la| lan_endpoint(la, port));
+                let ep = main_conn.inner().local_addr().ok().and_then(|la| lan_endpoint(la, port));
                 match ep {
                     Some(ep) if PUBLISH_LAN_ENDPOINT => info!("lan-direct: publishing LAN endpoint {}", ep),
                     Some(ep) => info!("lan-direct: LAN endpoint {} computed, not published yet", ep),
@@ -694,7 +697,7 @@ impl ControlActor {
     /// caller re-publishes with this as its `PreferredDERP`; the runtime picks
     /// the same region from the same `MapUpdate`. `None` for empty responses
     /// (e.g. the keepalive poll), whose return value the caller ignores.
-    async fn stream_map_response<S: IoStream>(
+    async fn stream_map_response<S: embedded_io_async::Read + embedded_io_async::Write>(
         &self, stream: &mut S, noise: &mut NoiseChannel,
         h2: &mut H2State, events: &async_channel::Sender<ControlEvent>,
         expected_stream: u32, emit_events: bool,
@@ -922,10 +925,10 @@ impl ControlActor {
 // host and ESP-IDF, so there is no per-platform branch here.
 
 impl ControlActor {
-    async fn open_tcp(&self, host: &str, port: u16) -> Result<tokio::net::TcpStream, ControlError> {
+    async fn open_tcp(&self, host: &str, port: u16) -> Result<TokioStream, ControlError> {
         let s = tokio::net::TcpStream::connect((host, port)).await.map_err(|_| ControlError::Io)?;
         tracing::debug!("open_tcp: connected local={:?} peer={:?} nodelay={:?}", s.local_addr(), s.peer_addr(), s.nodelay());
-        Ok(s)
+        Ok(TokioStream::new(s))
     }
 }
 
@@ -960,7 +963,7 @@ fn build_h2_post(path: &str, host: &str, stream_id: u32, body: &[u8]) -> Box<Arr
     out
 }
 
-async fn read_one_h2_body<S: IoStream>(
+async fn read_one_h2_body<S: embedded_io_async::Read + embedded_io_async::Write>(
     stream: &mut S, noise: &mut NoiseChannel, h2: &mut H2State, expected_stream: u32,
 ) -> Result<Box<ArrayVec<u8, 4096>>, ControlError> {
     // Boxed: this local is live across every await in the loop below (it

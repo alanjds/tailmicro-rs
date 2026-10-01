@@ -69,6 +69,8 @@ esp-idf-hal   = { version = "0.45", git = "https://github.com/esp-rs/esp-idf-hal
 esp-idf-sys   = { version = "0.36", git = "https://github.com/esp-rs/esp-idf-sys", rev = "2749423ff0", default-features = false }
 embedded-svc  = { version = "0.28.0", default-features = false }
 async-channel = { version = "2" }
+embedded-io-async = { version = "0.7" }
+embedded-io-adapters = { version = "0.7", features = ["tokio-1"] }
 futures-core = { version = "0.3", default-features = false }
 
 # Local crates

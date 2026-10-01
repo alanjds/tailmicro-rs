@@ -94,6 +94,7 @@
 //! For our purposes (ESP32-C3 embedded client), the EarlyNoise payload
 //! is informational only.  We skip it if present.
 
+use embedded_io_async::{Read, Write};
 use snow::Builder as NoiseBuilder;
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag, KeyInit, AeadInPlace};
 use crate::{ControlError, NoiseError};
@@ -222,7 +223,7 @@ impl NoiseChannel {
     /// Handles message boundaries transparently — a single Noise message
     /// may be read in multiple calls, or a single call may consume multiple
     /// Noise messages (uncommon for our frame sizes).
-    pub async fn read_exact<S: crate::IoStream>(
+    pub async fn read_exact<S: Read + Write>(
         &mut self,
         stream: &mut S,
         out:    &mut [u8],
@@ -247,7 +248,7 @@ impl NoiseChannel {
     ///
     /// Fragments automatically if `data > 65519` bytes (won't happen for
     /// our use case — H/2 frames are ≤ 4096 bytes).
-    pub async fn write_all<S: crate::IoStream>(
+    pub async fn write_all<S: Read + Write>(
         &mut self,
         stream: &mut S,
         data:   &[u8],
@@ -280,21 +281,20 @@ impl NoiseChannel {
             self.write_buf[0] = MSG_TYPE_RECORD;
             self.write_buf[1..3].copy_from_slice(&(ciphertext_len as u16).to_be_bytes());
 
-            stream.write_all(&self.write_buf[..FRAME_HEADER_LEN + ciphertext_len]).await
-                .map_err(|_| ControlError::Io)?;
+            crate::io::write_all(stream, &self.write_buf[..FRAME_HEADER_LEN + ciphertext_len]).await?;
 
             offset += chunk_len;
         }
         Ok(())
     }
 
-    async fn fill_read_buf<S: crate::IoStream>(
+    async fn fill_read_buf<S: Read + Write>(
         &mut self,
         stream: &mut S,
     ) -> Result<(), ControlError> {
         // Read the 3-byte frame header (type + big-endian length).
         let mut hdr = [0u8; FRAME_HEADER_LEN];
-        stream.read_exact(&mut hdr).await.map_err(|_| ControlError::Io)?;
+        crate::io::read_exact(stream, &mut hdr).await?;
         let msg_type = hdr[0];
         let ciphertext_len = u16::from_be_bytes([hdr[1], hdr[2]]) as usize;
 
@@ -302,8 +302,7 @@ impl NoiseChannel {
             return Err(ControlError::Noise(NoiseError::Decrypt));
         }
 
-        stream.read_exact(&mut self.read_buf[..ciphertext_len]).await
-            .map_err(|_| ControlError::Io)?;
+        crate::io::read_exact(stream, &mut self.read_buf[..ciphertext_len]).await?;
 
         match msg_type {
             MSG_TYPE_RECORD => {
@@ -342,7 +341,7 @@ impl NoiseChannel {
     /// sends one as its first Record (see `CHALLENGE_MAGIC`'s doc comment).
     /// If the first bytes aren't the magic, they're left buffered for the
     /// caller's next `read_exact` (this is real H/2 traffic, not a challenge).
-    async fn skip_challenge_packet<S: crate::IoStream>(
+    async fn skip_challenge_packet<S: Read + Write>(
         &mut self,
         stream: &mut S,
     ) -> Result<(), ControlError> {
@@ -395,7 +394,7 @@ fn be_nonce(counter: u64) -> [u8; 12] {
 /// 4. Handle optional EarlyNoise payload
 /// 5. Read and process the Noise response message
 /// 6. Transition to transport mode
-    pub async fn do_noise_handshake<S: crate::IoStream>(
+    pub async fn do_noise_handshake<S: Read + Write>(
         stream:      &mut S,
         machine_key: &MachinePrivateKey,
         server_key:  &[u8; 32],   // from Config::control_pin (verified offline pin, not fetched)
@@ -451,7 +450,7 @@ fn be_nonce(counter: u64) -> [u8; 12] {
 
     let req = build_upgrade_request(host, cap_version, init_payload);
     tracing::debug!("do_noise_handshake() - request ({} bytes, init_payload {} bytes):\n{}", req.len(), init_payload.len(), req.as_str());
-    stream.write_all(req.as_bytes()).await.map_err(|_| ControlError::Io)?;
+    crate::io::write_all(stream, req.as_bytes()).await?;
     tracing::debug!("do_noise_handshake() - request write_all returned Ok");
 
     // ── Step 3: Parse 101 Switching Protocols ─────────────────────────────────
@@ -468,20 +467,19 @@ fn be_nonce(counter: u64) -> [u8; 12] {
     // - anything else: it's already the response frame's type byte.
 
     let mut first_byte = [0u8; 1];
-    stream.read_exact(&mut first_byte).await.map_err(|_| ControlError::Io)?;
+    crate::io::read_exact(stream, &mut first_byte).await?;
 
     let msg_type = if first_byte[0] == EARLY_PAYLOAD_MAGIC_BYTE {
         // Read remaining 4 bytes of the 5-byte EarlyNoise header
         let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await.map_err(|_| ControlError::Io)?;
+        crate::io::read_exact(stream, &mut len_buf).await?;
         let json_len = u32::from_be_bytes(len_buf) as usize;
 
         // Skip the JSON if it fits in our budget; otherwise drain byte-by-byte
         // to avoid allocating a large buffer
         if json_len <= MAX_EARLY_NOISE_LEN {
             let mut json_buf = [0u8; MAX_EARLY_NOISE_LEN];
-            stream.read_exact(&mut json_buf[..json_len]).await
-                .map_err(|_| ControlError::Io)?;
+            crate::io::read_exact(stream, &mut json_buf[..json_len]).await?;
             // Could parse server node key from EarlyNoise here for future use
         } else {
             // Drain without buffering
@@ -489,15 +487,14 @@ fn be_nonce(counter: u64) -> [u8; 12] {
             let mut remaining = json_len;
             while remaining > 0 {
                 let take = remaining.min(drain.len());
-                stream.read_exact(&mut drain[..take]).await
-                    .map_err(|_| ControlError::Io)?;
+                crate::io::read_exact(stream, &mut drain[..take]).await?;
                 remaining -= take;
             }
         }
 
         // The response frame follows; read its type byte fresh.
         let mut type_byte = [0u8; 1];
-        stream.read_exact(&mut type_byte).await.map_err(|_| ControlError::Io)?;
+        crate::io::read_exact(stream, &mut type_byte).await?;
         type_byte[0]
     } else {
         first_byte[0]
@@ -506,7 +503,7 @@ fn be_nonce(counter: u64) -> [u8; 12] {
     // Read the remaining 2 bytes of the 3-byte response frame header
     // (message type already consumed above; this is the big-endian length).
     let mut resp_len_buf = [0u8; 2];
-    stream.read_exact(&mut resp_len_buf).await.map_err(|_| ControlError::Io)?;
+    crate::io::read_exact(stream, &mut resp_len_buf).await?;
     let resp_frame_len = u16::from_be_bytes(resp_len_buf) as usize;
 
     let mut noise_resp_buf = [0u8; NOISE_RESP_MSG_LEN];
@@ -516,14 +513,14 @@ fn be_nonce(counter: u64) -> [u8; 12] {
                 tracing::error!("ts2021 response frame: unexpected length {} (want {})", resp_frame_len, NOISE_RESP_MSG_LEN);
                 return Err(ControlError::Noise(NoiseError::Handshake));
             }
-            stream.read_exact(&mut noise_resp_buf).await.map_err(|_| ControlError::Io)?;
+            crate::io::read_exact(stream, &mut noise_resp_buf).await?;
         }
         MSG_TYPE_ERROR => {
             // msgTypeError: unauthenticated human-readable text, per the
             // real protocol - not encrypted/authenticated, hint only.
             let mut err_buf = [0u8; MAX_EARLY_NOISE_LEN];
             let take = resp_frame_len.min(err_buf.len());
-            stream.read_exact(&mut err_buf[..take]).await.map_err(|_| ControlError::Io)?;
+            crate::io::read_exact(stream, &mut err_buf[..take]).await?;
             tracing::error!("ts2021 server rejected handshake: {}", core::str::from_utf8(&err_buf[..take]).unwrap_or("<invalid utf8>"));
             return Err(ControlError::Noise(NoiseError::Handshake));
         }
@@ -625,7 +622,7 @@ fn build_upgrade_request(host: &str, cap_version: u16, init_payload: &[u8]) -> h
 // the HTTP/1.1 response headers.  The response body does NOT exist — the
 // connection is immediately "hijacked" to the Noise stream.
 
-async fn read_101_response<S: crate::IoStream>(
+async fn read_101_response<S: Read + Write>(
     stream: &mut S,
 ) -> Result<(), ControlError> {
     // Read until \r\n\r\n (end of HTTP response headers).
@@ -641,7 +638,7 @@ async fn read_101_response<S: crate::IoStream>(
             // Read one byte at a time to avoid consuming Noise bytes
             // that immediately follow the \r\n\r\n boundary.
             let single = &mut [0u8; 1];
-            stream.read_exact(single).await.map_err(|_| ControlError::Io)?;
+            crate::io::read_exact(stream, single).await?;
             buf[total] = single[0];
             1
         };
