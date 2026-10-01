@@ -209,7 +209,25 @@ unsafe extern "C" fn tailnet_output_cb(
     // packet buffer itself; every subsequent `extend_from_slice` below
     // writes straight into that heap memory. The pool's Mutex is held only
     // for one pop, so taking it from this (tcpip) thread is fine.
-    let mut buf: tm_buf::PktBuf = tm_buf::PktBuf::acquire();
+    //
+    // Up to `OUTBOUND_HEAP_DEPTH` queued packets, this behaves as it did
+    // with the old 2-slot channel (heap fallback allowed when the pool is
+    // empty). Deeper than that, a packet queues only if it gets a pool
+    // buffer, and is dropped otherwise, so the wider queue (ALLOCATIONS.md
+    // Step 12) absorbs bursts in pool memory and never holds heap-fallback
+    // buffers.
+    let Some(tx) = OUTBOUND_TX.get() else {
+        return err_enum_t_ERR_OK as err_t;
+    };
+    let buf = if tx.len() < super::OUTBOUND_HEAP_DEPTH {
+        Some(tm_buf::PktBuf::acquire())
+    } else {
+        tm_buf::PktBuf::try_acquire_pooled()
+    };
+    let Some(mut buf) = buf else {
+        super::OUTBOUND_DROPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return err_enum_t_ERR_OK as err_t;
+    };
     unsafe {
         let mut cur = p;
         while !cur.is_null() {
@@ -232,15 +250,15 @@ unsafe extern "C" fn tailnet_output_cb(
     if tm_buf::lat::ENABLED && tm_buf::lat::is_icmp_echo(&buf, 0) {
         tm_buf::lat::stamp(tm_buf::lat::Hop::NetifOut);
     }
-    if let Some(tx) = OUTBOUND_TX.get() {
-        // try_send: synchronous, non-blocking, thread-safe without an
-        // executor (async_channel's queue is a plain concurrent structure).
-        // Drop-on-full is the same backpressure philosophy as every other
-        // inter-actor channel in this workspace (CHAN_CAP = 2 in
-        // tm_runtime) -- a full channel means the event router is behind,
-        // and dropping here is strictly better than blocking the tcpip
-        // thread.
-        let _ = tx.try_send(OutboundPacket { dst_ip, data: buf });
+    // try_send: synchronous, non-blocking, thread-safe without an executor
+    // (async_channel's queue is a plain concurrent structure). A full
+    // channel (`NETIF_OUT_CHAN_CAP` in tm_runtime) means the event router
+    // is behind; dropping here (TCP retransmits) is strictly better than
+    // blocking the tcpip thread.
+    if tx.try_send(OutboundPacket { dst_ip, data: buf }).is_err() {
+        super::OUTBOUND_DROPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    } else {
+        super::OUTBOUND_HWM.fetch_max(tx.len() as u32, core::sync::atomic::Ordering::Relaxed);
     }
     err_enum_t_ERR_OK as err_t
 }

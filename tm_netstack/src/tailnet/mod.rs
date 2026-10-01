@@ -91,6 +91,25 @@ pub struct OutboundPacket {
 pub type OutboundSender = async_channel::Sender<OutboundPacket>;
 pub type OutboundReceiver = async_channel::Receiver<OutboundPacket>;
 
+/// Packets lwIP handed to the tailnet netif's `output` callback that were
+/// dropped because the outbound channel to the event router was full (or
+/// closed). The callback runs on lwIP's tcpip thread and must not block, so
+/// it drops; this counts it (it used to be silent). Read by the periodic
+/// `udp rx:` line.
+pub static OUTBOUND_DROPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Outbound queue depth below which the netif `output` callback queues
+/// every packet, taking a heap-fallback `tm_buf` buffer if the pool is
+/// empty. At or above it, a packet queues only if it gets a pool buffer,
+/// and is dropped otherwise (TCP retransmits). 2 is the capacity of the old
+/// 2-slot channel, so the heap-fallback buffers the queue can hold are what
+/// they were before it was widened (ALLOCATIONS.md Step 12).
+pub const OUTBOUND_HEAP_DEPTH: usize = 2;
+
+/// Deepest the outbound channel has been right after a successful send
+/// (its high-water mark), to size it. Read by the periodic `udp rx:` line.
+pub static OUTBOUND_HWM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 #[cfg(target_os = "espidf")]
 mod device;
 #[cfg(target_os = "espidf")]

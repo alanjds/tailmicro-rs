@@ -430,9 +430,10 @@ fn log_summary(s: RxSnapshot) {
     #[cfg(not(target_os = "espidf"))]
     let (largest, total) = (0usize, 0usize);
     log::info!(
-        "udp rx: disco={} wg={} junk={} tailnet={} err={} pool_drop={} (disco {}) chan_drop={} waited={} | tx: wg={} fallback={} pong={} pong_err={} (heap largest_free={} total_free={})",
+        "udp rx: disco={} wg={} junk={} tailnet={} err={} pool_drop={} (disco {}) chan_drop={} waited={} | tx: wg={} fallback={} pong={} pong_err={} | netif_out_drop={} netif_out_hwm={} pool_heap_allocs={} (heap largest_free={} total_free={})",
         s.disco, s.wireguard, s.junk, s.tailnet, s.errors, s.pool_drops, s.pool_drops_disco, s.chan_drops, s.waited,
-        s.tx_wg, s.tx_fallback, s.tx_pong, s.tx_pong_err, largest, total,
+        s.tx_wg, s.tx_fallback, s.tx_pong, s.tx_pong_err,
+        crate::tailnet::OUTBOUND_DROPS.load(Ordering::Relaxed), crate::tailnet::OUTBOUND_HWM.load(Ordering::Relaxed), tm_buf::stats().allocs, largest, total,
     );
 }
 

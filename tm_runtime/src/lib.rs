@@ -1287,6 +1287,20 @@ const CHAN_CAP: usize = 2;
 /// in `tm_buf`, so 2 more slots cost little heap.
 const WG_CMD_CHAN_CAP: usize = 4;
 
+/// Capacity of the tailnet netif outbound channel (lwIP tcpip thread ->
+/// router), wider than `CHAN_CAP`. The producer is lwIP's `output` callback,
+/// which runs on the tcpip thread and cannot wait, so a full channel is a
+/// lost outbound TCP segment (`tailnet::OUTBOUND_DROPS`). The tcpip thread
+/// (priority 18) emits a connection's SYN-ACK, ACKs, response and FIN in
+/// bursts faster than the router (priority 1, one event per iteration)
+/// drains them; at 2 slots about one packet per back-to-back HTTP
+/// connection was lost, and a lost SYN-ACK costs the client a ~1 s SYN
+/// retransmit (ALLOCATIONS.md Step 12). The slots hold a small
+/// `OutboundPacket` by value; the bytes are in `tm_buf`. Past
+/// `tailnet::OUTBOUND_HEAP_DEPTH` queued packets, the callback queues only
+/// pool buffers, so the extra depth never holds heap-fallback buffers.
+const NETIF_OUT_CHAN_CAP: usize = 8;
+
 use std::net::Ipv4Addr;
 
 /// Channel for receiving the Tailnet IPv4 address.
@@ -1426,9 +1440,8 @@ impl Runtime {
         // Tailnet netif outbound-packet channel (plan (a) item 3): packets
         // lwIP's netif `output` callback wants sent out the tailnet
         // interface, drained by `event_router_task` and routed to a
-        // WireGuard peer. Same capacity/backpressure philosophy as every
-        // other inter-actor channel here.
-        let (netif_out_tx, netif_out_rx) = async_channel::bounded::<tailnet::OutboundPacket>(CHAN_CAP);
+        // WireGuard peer. Wider than `CHAN_CAP`; see `NETIF_OUT_CHAN_CAP`.
+        let (netif_out_tx, netif_out_rx) = async_channel::bounded::<tailnet::OutboundPacket>(NETIF_OUT_CHAN_CAP);
         tokio_freertos_yield().await;
         log_heap("after tailnet netif outbound channel");
 

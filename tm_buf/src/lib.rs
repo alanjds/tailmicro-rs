@@ -135,13 +135,8 @@ impl PktBuf {
     /// Take an empty buffer from the pool, falling back to a heap
     /// allocation if the pool is empty. Never blocks or waits.
     pub fn acquire() -> Self {
-        ensure_managed();
-        match PktPool.request() {
-            Some(obj) => {
-                POOL_OUT.fetch_add(1, Ordering::Relaxed);
-                debug_assert!(obj.is_empty());
-                PktBuf(Storage::Pooled(obj))
-            }
+        match Self::try_acquire_pooled() {
+            Some(buf) => buf,
             None => {
                 ALLOCS.fetch_add(1, Ordering::Relaxed);
                 // Built directly in the heap allocation: no ~1.5 KB stack
@@ -149,6 +144,16 @@ impl PktBuf {
                 PktBuf(Storage::Heap(Box::write(Box::new_uninit(), heapless::Vec::new())))
             }
         }
+    }
+
+    /// Take an empty buffer from the pool, or `None` if the pool is empty.
+    /// Never allocates from the heap, blocks or waits.
+    pub fn try_acquire_pooled() -> Option<Self> {
+        ensure_managed();
+        let obj = PktPool.request()?;
+        POOL_OUT.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(obj.is_empty());
+        Some(PktBuf(Storage::Pooled(obj)))
     }
 
     /// Acquire a buffer holding a copy of `data`, or `None` if `data` is
@@ -267,7 +272,13 @@ mod tests {
         assert_eq!(stats().free, 0);
         assert_eq!(stats().allocs, 2);
         assert_eq!(held.iter().filter(|p| matches!(p.0, Storage::Heap(_))).count(), 2);
+        // try_acquire_pooled never falls back to the heap.
+        assert!(PktBuf::try_acquire_pooled().is_none());
+        assert_eq!(stats().allocs, 2);
         drop(held);
+        let p = PktBuf::try_acquire_pooled().expect("pool has room again");
+        assert!(matches!(p.0, Storage::Pooled(_)));
+        drop(p);
         let s1 = stats();
         assert_eq!(s1.free, POOL_N);
         assert_eq!(s1.frees, 2);
