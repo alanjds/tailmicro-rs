@@ -21,6 +21,8 @@ pub struct Config {
     /// keepalive poll that follows runs unbounded regardless of this value
     /// — see `tm_control::Config::connect_timeout`.
     pub(crate) connect_timeout: Option<std::time::Duration>,
+    pub(crate) hostname: &'static str,
+    pub(crate) services: &'static [tm_control::Service],
 }
 
 impl Config {
@@ -65,6 +67,25 @@ impl Config {
         self
     }
 
+    /// Node name announced to the control server, which derives the MagicDNS
+    /// name from it (default `esp32c3`). A single lowercase DNS label.
+    pub fn with_hostname(mut self, hostname: &'static str) -> Result<Self, Error> {
+        if !tm_control::valid_hostname(hostname) {
+            return Err(Error::InvalidConfig("hostname must be one lowercase DNS label (a-z, 0-9, '-')"));
+        }
+        self.hostname = hostname;
+        Ok(self)
+    }
+
+    /// Services to advertise on the tailnet (e.g. `Service::tcp(80, "HTTP")`).
+    /// They are informational: peers can see them, nothing enforces them.
+    /// Sent with every control request, so a change needs a reconnect.
+    pub fn with_services(mut self, services: &'static [tm_control::Service]) -> Result<Self, Error> {
+        tm_control::check_services(services).map_err(Error::InvalidConfig)?;
+        self.services = services;
+        Ok(self)
+    }
+
     pub(crate) async fn load_or_generate_keys(&self) -> Result<NodeState, Error> {
         // K2 (docs/stable-node-identity-plan.md): derive the node identity
         // deterministically from the chip's eFuse MAC via HKDF-SHA256, so
@@ -97,6 +118,8 @@ impl Config {
             // Filled in by tm_runtime once (and if) its lan-direct UDP
             // socket is bound; the app config has no say in it.
             lan_udp_port: None,
+            hostname: self.hostname,
+            services: self.services,
         }
     }
 }
@@ -109,6 +132,8 @@ impl Default for Config {
             key_file:     None,
             control_pin:  [0u8; 32],
             connect_timeout: None,
+            hostname:     "esp32c3",
+            services:     &[],
         }
     }
 }

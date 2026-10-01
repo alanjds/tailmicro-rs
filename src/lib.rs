@@ -51,6 +51,7 @@ use std::time::Duration;
 
 pub use config::Config;
 pub use error::Error;
+pub use tm_control::{Service, ServiceProto, MAX_SERVICES, MAX_SERVICE_DESC};
 pub use tm_keys::NodeState;
 pub use tm_runtime::{tokio_freertos_yield, OurIpReceiver, OurIpSender};
 

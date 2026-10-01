@@ -163,6 +163,62 @@ pub struct Config {
     /// advertised once `PUBLISH_LAN_ENDPOINT` is on (Step 5, D4), because
     /// peers must not be pointed at a socket that cannot answer yet.
     pub lan_udp_port: Option<u16>,
+    /// Node name sent in every `Hostinfo`; control derives the MagicDNS name
+    /// from it. Must satisfy [`valid_hostname`].
+    pub hostname: &'static str,
+    /// Services advertised in every `Hostinfo`. Informational only: the
+    /// control server hands them to peers, nothing enforces them. At most
+    /// [`MAX_SERVICES`] entries, see [`check_services`].
+    pub services: &'static [Service],
+}
+
+/// Services are re-sent in each of the four Hostinfos, so their size is
+/// bounded to keep the bodies inside [`REQUEST_BODY_CAP`].
+pub const MAX_SERVICES: usize = 4;
+pub const MAX_SERVICE_DESC: usize = 32;
+
+/// Only the protocols Tailscale treats as plain informational entries. The
+/// `peerapi*` pseudo-services are never sent: peers would act on them.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceProto { Tcp, Udp }
+
+/// One `tailcfg.Service` entry of `Hostinfo.Services`.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub struct Service {
+    pub proto: ServiceProto,
+    pub port: u16,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub description: &'static str,
+}
+
+impl Service {
+    pub const fn tcp(port: u16, description: &'static str) -> Self {
+        Self { proto: ServiceProto::Tcp, port, description }
+    }
+    pub const fn udp(port: u16, description: &'static str) -> Self {
+        Self { proto: ServiceProto::Udp, port, description }
+    }
+}
+
+/// `Err` with the reason when `services` could overflow the request bodies
+/// or carries an entry control would reject.
+pub fn check_services(services: &[Service]) -> Result<(), &'static str> {
+    if services.len() > MAX_SERVICES { return Err("too many services"); }
+    for sv in services {
+        if sv.port == 0 { return Err("service port 0"); }
+        if sv.description.len() > MAX_SERVICE_DESC { return Err("service description too long"); }
+    }
+    Ok(())
+}
+
+/// A single lowercase DNS label: what control turns into the MagicDNS name.
+pub fn valid_hostname(h: &str) -> bool {
+    let b = h.as_bytes();
+    !b.is_empty() && b.len() <= 63
+        && b[0] != b'-' && b[b.len() - 1] != b'-'
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -302,7 +358,7 @@ pub fn lan_endpoint(local: std::net::SocketAddr, port: u16) -> Option<std::net::
 /// tests can pin it against ts_control.py's write_map and against the
 /// DERP-only body. `lan_ep` goes first: tailscaled tries endpoints in
 /// order, and the DERP magic entry is the fallback.
-fn publish2_body(node_key_hex: &str, disco_key_hex: &str, region: u16,
+fn publish2_body(config: &Config, node_key_hex: &str, disco_key_hex: &str, region: u16,
                  lan_ep: Option<std::net::SocketAddrV4>)
     -> Result<heapless::Vec<u8, REQUEST_BODY_CAP>, JsonError>
 {
@@ -327,10 +383,7 @@ fn publish2_body(node_key_hex: &str, disco_key_hex: &str, region: u16,
         version: CAPABILITY_VERSION, compress: "", keep_alive: false,
         node_key: node_key_hex, endpoints, stream: false,
         disco_key: Some(disco_key_hex),
-        hostinfo: Some(HostInfo {
-            os: "embedded", hostname: "esp32c3",
-            net_info: Some(NetInfo { preferred_derp: region }),
-        }),
+        hostinfo: Some(host_info(config, Some(NetInfo { preferred_derp: region }))),
         omit_peers: false,
     })
 }
@@ -363,6 +416,16 @@ struct HostInfo<'a> {
     // byte-identical to before this change.
     #[serde(rename = "NetInfo", skip_serializing_if = "Option::is_none")]
     net_info: Option<NetInfo>,
+    #[serde(skip_serializing_if = "<[Service]>::is_empty")]
+    services: &'a [Service],
+}
+
+/// The one place a `Hostinfo` is built. Every request (register, both
+/// publishes, the streaming poll) must carry the same values: headscale
+/// replaces the stored Hostinfo from whichever request arrives last, so a
+/// request with a different Services list flaps it to every peer.
+fn host_info(config: &Config, net_info: Option<NetInfo>) -> HostInfo<'_> {
+    HostInfo { os: "embedded", hostname: config.hostname, net_info, services: config.services }
 }
 
 #[derive(Deserialize)]
@@ -497,7 +560,7 @@ impl ControlActor {
                     version: CAPABILITY_VERSION, compress: "", keep_alive: true,
                     node_key: node_key_hex.as_str(), endpoints: &[], stream: true,
                     disco_key: None,
-                    hostinfo: Some(HostInfo { os: "embedded", hostname: "esp32c3", net_info: None }),
+                    hostinfo: Some(host_info(&self.config, None)),
                     omit_peers: true,
                 }).map_err(ControlError::Json)?;
                 let map_req = build_h2_post("/machine/map", self.config.control_host, MAP_STREAM_ID, &map_body);
@@ -580,7 +643,7 @@ impl ControlActor {
                 version: CAPABILITY_VERSION, node_key: node_key_hex.as_str(),
                 old_node_key: None,
                 auth: RegisterAuth { auth_key },
-                hostinfo: HostInfo { os: "embedded", hostname: "esp32c3", net_info: None },
+                hostinfo: host_info(&self.config, None),
             }).map_err(ControlError::Json)?;
 
             info!("Tailscale Step 4: registering node");
@@ -631,7 +694,7 @@ impl ControlActor {
                 version: CAPABILITY_VERSION, compress: "", keep_alive: false,
                 node_key: node_key_hex.as_str(), endpoints: &[], stream: false,
                 disco_key: Some(disco_key_hex.as_str()),
-                hostinfo: Some(HostInfo { os: "embedded", hostname: "esp32c3", net_info: None }),
+                hostinfo: Some(host_info(&self.config, None)),
                 omit_peers: false,
             }).map_err(ControlError::Json)?;
 
@@ -673,7 +736,7 @@ impl ControlActor {
             let published_lan = if PUBLISH_LAN_ENDPOINT { lan_ep } else { None };
             info!("Tailscale Step 7.6: re-publishing with PreferredDERP={} endpoint={}:{}", region, DERP_MAGIC_IP, region);
             let republish_body = publish2_body(
-                node_key_hex.as_str(), disco_key_hex.as_str(), region, published_lan,
+                &self.config, node_key_hex.as_str(), disco_key_hex.as_str(), region, published_lan,
             ).map_err(ControlError::Json)?;
             let republish_req = build_h2_post("/machine/map", host, MAP_REPUBLISH_STREAM_ID, &republish_body);
             noise.write_all(&mut main_conn, &republish_req).await?;
@@ -1164,6 +1227,8 @@ mod tests {
             control_pin: [0u8; 32],
             connect_timeout: Some(Duration::from_millis(50)),
             lan_udp_port: None,
+            hostname: "esp32c3",
+            services: &[],
         };
 
         match run_once(config).await {
@@ -1192,6 +1257,8 @@ mod tests {
             control_pin: [0u8; 32],
             connect_timeout: None,
             lan_udp_port: None,
+            hostname: "esp32c3",
+            services: &[],
         };
 
         match run_once(config).await {
@@ -1204,6 +1271,13 @@ mod tests {
     }
 
     // ── Step 3 of docs/lan-direct-path-plan.md: LAN endpoint, unpublished ──
+
+    fn cfg(services: &'static [Service]) -> Config {
+        Config {
+            control_host: "localhost", control_port: 80, control_pin: [0u8; 32],
+            connect_timeout: None, lan_udp_port: None, hostname: "esp32c3", services,
+        }
+    }
 
     const NODE_HEX: &str = "nodekey:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
     const DISCO_HEX: &str = "discokey:2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40";
@@ -1218,7 +1292,7 @@ mod tests {
     #[test]
     fn publish2_with_lan_endpoint_matches_ts_control_write_map() {
         let lan = lan_endpoint("192.168.15.20:50000".parse().unwrap(), 41641);
-        let body = publish2_body(NODE_HEX, DISCO_HEX, 11, lan).unwrap();
+        let body = publish2_body(&cfg(&[]), NODE_HEX, DISCO_HEX, 11, lan).unwrap();
         let ours: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let mut py: serde_json::Value = serde_json::from_str(include_str!(
             "../../tools/wg_validator/publish2_lan_body.json")).unwrap();
@@ -1244,10 +1318,11 @@ mod tests {
             hostinfo: Some(HostInfo {
                 os: "embedded", hostname: "esp32c3",
                 net_info: Some(NetInfo { preferred_derp: region }),
+                services: &[],
             }),
             omit_peers: false,
         }).unwrap();
-        let new = publish2_body(NODE_HEX, DISCO_HEX, region, None).unwrap();
+        let new = publish2_body(&cfg(&[]), NODE_HEX, DISCO_HEX, region, None).unwrap();
         assert_eq!(new.as_slice(), old.as_slice());
     }
 
@@ -1275,5 +1350,68 @@ mod tests {
         assert_eq!(f("100.63.0.1:1234"), Some("100.63.0.1:41641".parse().unwrap()), "just below 100.64/10");
         assert_eq!(f("100.128.0.1:1234"), Some("100.128.0.1:41641".parse().unwrap()), "just above 100.64/10");
         assert_eq!(lan_endpoint("192.168.15.20:1".parse().unwrap(), 0), None, "port 0 is not reachable");
+    }
+
+    static ONE: [Service; 1] = [Service::tcp(80, "tasmolike HTTP")];
+    static FOUR: [Service; 4] = [
+        Service::tcp(80, "0123456789abcdef0123456789abcdef"),
+        Service::tcp(443, "0123456789abcdef0123456789abcdef"),
+        Service::udp(5353, "0123456789abcdef0123456789abcdef"),
+        Service::tcp(8080, "0123456789abcdef0123456789abcdef"),
+    ];
+
+    #[test]
+    fn publish2_carries_hostname_and_services() {
+        let c = Config { hostname: "kitchen-1", ..cfg(&ONE) };
+        let body = publish2_body(&c, NODE_HEX, DISCO_HEX, 11, None).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["Hostinfo"]["Hostname"], "kitchen-1");
+        assert_eq!(v["Hostinfo"]["Services"],
+                   serde_json::json!([{"Proto": "tcp", "Port": 80, "Description": "tasmolike HTTP"}]));
+    }
+
+    /// headscale replaces Hostinfo from any request, so all four must agree.
+    #[test]
+    fn every_request_carries_the_same_services() {
+        let c = cfg(&ONE);
+        let reg = to_json_buf(&RegisterRequest {
+            version: CAPABILITY_VERSION, node_key: NODE_HEX, old_node_key: None,
+            auth: RegisterAuth { auth_key: "tskey-auth-x" }, hostinfo: host_info(&c, None),
+        }).unwrap();
+        let poll = to_json_buf(&MapRequest {
+            version: CAPABILITY_VERSION, compress: "", keep_alive: true,
+            node_key: NODE_HEX, endpoints: &[], stream: true, disco_key: None,
+            hostinfo: Some(host_info(&c, None)), omit_peers: true,
+        }).unwrap();
+        let pub2 = publish2_body(&c, NODE_HEX, DISCO_HEX, 11, None).unwrap();
+        let svc = |b: &[u8]| serde_json::from_slice::<serde_json::Value>(b).unwrap()["Hostinfo"]["Services"].clone();
+        assert!(!svc(&reg).is_null());
+        assert_eq!(svc(&reg), svc(&poll));
+        assert_eq!(svc(&reg), svc(&pub2));
+    }
+
+    #[test]
+    fn max_services_fit_the_request_cap() {
+        let c = Config { hostname: "a-63-char-label-0123456789-0123456789-0123456789-0123456789", ..cfg(&FOUR) };
+        assert!(check_services(&FOUR).is_ok());
+        let lan = lan_endpoint("192.168.15.20:50000".parse().unwrap(), 41641);
+        let body = publish2_body(&c, NODE_HEX, DISCO_HEX, 11, lan).unwrap();
+        assert!(body.len() <= REQUEST_BODY_CAP);
+        let reg = to_json_buf(&RegisterRequest {
+            version: CAPABILITY_VERSION, node_key: NODE_HEX, old_node_key: Some(NODE_HEX),
+            auth: RegisterAuth { auth_key: &"k".repeat(128) }, hostinfo: host_info(&c, None),
+        }).unwrap();
+        assert!(reg.len() <= REQUEST_BODY_CAP);
+    }
+
+    #[test]
+    fn service_and_hostname_validation() {
+        assert!(check_services(&[Service::tcp(0, "")]).is_err());
+        assert!(check_services(&[Service::tcp(80, "0123456789abcdef0123456789abcdef0")]).is_err());
+        assert!(check_services(&[Service::tcp(80, ""); MAX_SERVICES + 1]).is_err());
+        assert!(valid_hostname("esp32c3") && valid_hostname("a-b"));
+        for bad in ["", "-a", "a-", "A", "a_b", "a.b", &"a".repeat(64)] {
+            assert!(!valid_hostname(bad), "{bad}");
+        }
     }
 }
