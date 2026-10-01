@@ -24,6 +24,7 @@ pub struct Config {
     pub(crate) hostname: &'static str,
     pub(crate) os_version: heapless::String<{ tm_control::MAX_OS_VERSION }>,
     pub(crate) services: &'static [tm_control::Service],
+    pub(crate) magicdns: tm_netstack::names::MagicDns,
 }
 
 impl Config {
@@ -53,6 +54,17 @@ impl Config {
             .map_err(Error::Pin)?;
         self.control_pin = pin;
         Ok(self)
+    }
+
+    /// Choose which tailnet names resolve on this device (see
+    /// [`MagicDns`](tm_netstack::names::MagicDns)). Default
+    /// `MagicDns::Full`: the FQDN, plus short names when the tailnet has
+    /// MagicDNS on, and a tailnet name wins over the WiFi DNS server. The
+    /// table is filled from the netmap, so it holds at most 8 peers and
+    /// refreshes only when the control connection is re-established.
+    pub fn with_magicdns(mut self, mode: tm_netstack::names::MagicDns) -> Self {
+        self.magicdns = mode;
+        self
     }
 
     /// Set the bring-up-only connect deadline (see `connect_timeout` field
@@ -145,6 +157,7 @@ impl Default for Config {
             hostname:     "esp32c3",
             os_version:   heapless::String::new(),
             services:     &[],
+            magicdns:     tm_netstack::names::MagicDns::default(),
         }
     }
 }

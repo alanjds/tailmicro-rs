@@ -606,6 +606,7 @@ mod tests {
                     our_ip: TailnetIp([100, 64, 0, 1]),
                     peers: Default::default(),
                     derp_regions: Default::default(),
+                    names: Default::default(),
                 };
                 map.peers.push(PeerInfo {
                     node_key: b_key,
@@ -613,6 +614,7 @@ mod tests {
                     tailnet_ip: TailnetIp([100, 64, 0, 2]),
                     prefix_len: 32,
                     hostname: heapless::String::new(),
+                    name: Default::default(),
                     derp_region: 1,
                     is_online: true,
                 });

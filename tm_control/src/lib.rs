@@ -84,8 +84,64 @@ pub struct PeerInfo {
     pub tailnet_ip:  TailnetIp,
     pub prefix_len:  u8,
     pub hostname:    heapless::String<64>,
+    /// MagicDNS identity from the peer's `Name` (not its `Hostinfo.Hostname`).
+    pub name:        PeerName,
     pub derp_region: u16,
     pub is_online:   bool,
+}
+
+/// Longest MagicDNS label kept per peer. A longer label (a DNS label may be
+/// 63) leaves the peer routable but not resolvable by name.
+pub const MAX_NAME_LABEL: usize = 32;
+/// Longest tailnet suffix kept (`tailnet-xyz.ts.net` is 18).
+pub const MAX_NAME_SUFFIX: usize = 48;
+
+/// A node's MagicDNS name reduced to what a name table needs: the first label
+/// (lowercased) and a 16-bit hash of the suffix after it. Every node of one
+/// tailnet shares the suffix, so it is stored once, in [`MapNames`], instead
+/// of per peer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PeerName {
+    pub label:       heapless::String<MAX_NAME_LABEL>,
+    pub suffix_hash: u16,
+}
+
+/// Self-node and `DNSConfig` data for MagicDNS.
+#[derive(Clone, Debug, Default)]
+pub struct MapNames {
+    /// Our own label, from `Node.Name`.
+    pub self_label: heapless::String<MAX_NAME_LABEL>,
+    /// The tailnet suffix, no leading or trailing dot. Empty when the control
+    /// server names nodes with a bare label (headscale with no `base_domain`).
+    pub suffix: heapless::String<MAX_NAME_SUFFIX>,
+    pub suffix_hash: u16,
+    /// `DNSConfig.Proxied`: MagicDNS is on, so short names resolve.
+    pub proxied: bool,
+}
+
+/// Split a node `Name` (`host.tailnet.ts.net.`, or just `host`) into its
+/// lowercased first label and the suffix after it, with the trailing dot
+/// dropped. The label is empty if it does not fit [`MAX_NAME_LABEL`].
+pub fn split_node_name(name: &str) -> (heapless::String<MAX_NAME_LABEL>, &str) {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    let (label, suffix) = name.split_once('.').unwrap_or((name, ""));
+    let mut out = heapless::String::new();
+    if label.len() <= MAX_NAME_LABEL {
+        for c in label.chars() {
+            let _ = out.push(c.to_ascii_lowercase());
+        }
+    }
+    (out, suffix)
+}
+
+/// FNV-1a folded to 16 bits, over the lowercased bytes. Only used to tell a
+/// peer in our tailnet's suffix from a node shared in from another tailnet.
+pub fn suffix_hash(suffix: &str) -> u16 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in suffix.bytes() {
+        h = (h ^ u32::from(b.to_ascii_lowercase())).wrapping_mul(0x0100_0193);
+    }
+    ((h >> 16) ^ h) as u16
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +157,7 @@ pub struct MapState<const MAX_PEERS: usize = 8, const MAX_REGIONS: usize = 4> {
     pub our_ip:       TailnetIp,
     pub peers:        ArrayVec<PeerInfo, MAX_PEERS>,
     pub derp_regions: ArrayVec<DerpRegion, MAX_REGIONS>,
+    pub names:        MapNames,
 }
 
 // ── Capability version ────────────────────────────────────────────────────────
@@ -1162,13 +1219,14 @@ mod tests {
             tailnet_ip: TailnetIp([0u8; 4]),
             prefix_len: 32,
             hostname: heapless::String::new(),
+            name: PeerName::default(),
             derp_region,
             is_online,
         }
     }
 
     fn map_of(regions: &[DerpRegion], peers: &[PeerInfo]) -> MapState {
-        let mut m = MapState { our_ip: TailnetIp([100, 64, 0, 1]), peers: ArrayVec::new(), derp_regions: ArrayVec::new() };
+        let mut m = MapState { our_ip: TailnetIp([100, 64, 0, 1]), peers: ArrayVec::new(), derp_regions: ArrayVec::new(), names: MapNames::default() };
         for r in regions { m.derp_regions.push(r.clone()); }
         for p in peers { m.peers.push(p.clone()); }
         m

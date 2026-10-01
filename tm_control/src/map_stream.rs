@@ -24,7 +24,9 @@ use actson::{JsonEvent, JsonParser};
 use arrayvec::ArrayVec;
 
 use crate::map_scalars::{hex_key, parse_derp_region, parse_ipv4, region_id_or};
-use crate::{DerpRegion, MapState, PeerInfo, TailnetIp};
+use crate::{
+    split_node_name, suffix_hash, DerpRegion, MapNames, MapState, PeerInfo, PeerName, TailnetIp,
+};
 
 /// Where we are in the MapResponse document. One is pushed per open
 /// object/array; `Skip` covers any subtree we do not read (PacketFilter,
@@ -38,6 +40,7 @@ enum Ctx {
     Peer,
     PeerAddresses,
     PeerHostinfo,
+    DnsConfig,
     DerpMap,
     Regions,
     Region,
@@ -55,6 +58,7 @@ struct PeerScratch {
     derp_region: u16,
     online: Option<bool>,
     hostname: heapless::String<64>,
+    name: PeerName,
 }
 
 /// Fields of the DERP region currently being read, committed on `EndObject`.
@@ -111,6 +115,7 @@ impl<const MAX_PEERS: usize, const MAX_REGIONS: usize> MapStreamParser<MAX_PEERS
                 our_ip: TailnetIp([0; 4]),
                 peers: ArrayVec::new(),
                 derp_regions: ArrayVec::new(),
+                names: MapNames::default(),
             },
             peer: PeerScratch::default(),
             region: None,
@@ -270,6 +275,8 @@ impl<const MAX_PEERS: usize, const MAX_REGIONS: usize> MapStreamParser<MAX_PEERS
             JsonEvent::ValueTrue | JsonEvent::ValueFalse => {
                 if self.top() == Ctx::Peer && self.name_is("Online") {
                     self.peer.online = Some(ev == JsonEvent::ValueTrue);
+                } else if self.top() == Ctx::DnsConfig && self.name_is("Proxied") {
+                    self.out.names.proxied = ev == JsonEvent::ValueTrue;
                 }
                 self.have_pending = false;
             }
@@ -298,6 +305,7 @@ impl<const MAX_PEERS: usize, const MAX_REGIONS: usize> MapStreamParser<MAX_PEERS
             (Ctx::Root, Some("Node"), true) => Ctx::Node,
             (Ctx::Root, Some("Peers"), false) => Ctx::Peers,
             (Ctx::Root, Some("DERPMap"), true) => Ctx::DerpMap,
+            (Ctx::Root, Some("DNSConfig"), true) => Ctx::DnsConfig,
 
             (Ctx::Node, Some("Addresses"), false) => Ctx::NodeAddresses,
 
@@ -325,6 +333,19 @@ impl<const MAX_PEERS: usize, const MAX_REGIONS: usize> MapStreamParser<MAX_PEERS
                     }
                 }
             }
+            Ctx::Node => {
+                if self.name_is("Name") {
+                    let (label, suffix) = split_node_name(val);
+                    self.out.names.self_label = label;
+                    self.out.names.suffix.clear();
+                    // An over-long suffix is dropped whole (names stay unresolvable
+                    // by FQDN) rather than kept truncated, which would mismatch.
+                    if self.out.names.suffix.push_str(suffix).is_err() {
+                        self.out.names.suffix.clear();
+                    }
+                    self.out.names.suffix_hash = suffix_hash(suffix);
+                }
+            }
             Ctx::PeerAddresses => {
                 if self.peer.ip.is_none() {
                     if let Some(ip) = parse_ipv4(val) {
@@ -339,6 +360,9 @@ impl<const MAX_PEERS: usize, const MAX_REGIONS: usize> MapStreamParser<MAX_PEERS
                     self.peer.disco = hex_key(val).unwrap_or([0; 32]);
                 } else if self.name_is("DERP") {
                     self.peer.derp_region = parse_derp_region(val).unwrap_or(0);
+                } else if self.name_is("Name") {
+                    let (label, suffix) = split_node_name(val);
+                    self.peer.name = PeerName { label, suffix_hash: suffix_hash(suffix) };
                 }
             }
             Ctx::PeerHostinfo => {
@@ -387,6 +411,7 @@ impl<const MAX_PEERS: usize, const MAX_REGIONS: usize> MapStreamParser<MAX_PEERS
             tailnet_ip: TailnetIp(ip),
             prefix_len: 32,
             hostname: p.hostname,
+            name: p.name,
             derp_region: p.derp_region,
             is_online: true,
         });
@@ -512,5 +537,58 @@ mod tests {
         let m = parse_chunked::<1, 1>(JSON.as_bytes(), 8);
         assert_eq!(m.peers.len(), 1);
         assert_eq!(m.derp_regions.len(), 1);
+    }
+
+    const JSON_NAMES: &str = r#"{
+        "Node": {"Name":"Me.Tailnet-XYZ.ts.net.","Addresses": ["100.64.0.1/32"],
+                 "Hostinfo": {"Hostname": "me", "Name": "decoy"}},
+        "DNSConfig": {"Proxied": true, "Domains": ["tailnet-xyz.ts.net"],
+                      "Resolvers": [{"Addr": "100.100.100.100"}], "Proxied2": false},
+        "Peers": [
+            {"Key":"nodekey:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+             "Name":"bospill.tailnet-xyz.ts.net.",
+             "Addresses":["100.64.0.2/32"],"DERP":"127.3.3.40:7","Online":true,
+             "Hostinfo":{"Hostname":"BosPill-host","Name":"decoy"}},
+            {"Key":"nodekey:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+             "Name":"shared.other.ts.net.",
+             "Addresses":["100.64.0.3/32"],"DERP":"127.3.3.40:2","Online":true},
+            {"Key":"nodekey:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+             "Name":"a-label-that-is-far-too-long-for-the-table.tailnet-xyz.ts.net.",
+             "Addresses":["100.64.0.4/32"],"DERP":"127.3.3.40:2","Online":true}
+        ]
+    }"#;
+
+    #[test]
+    fn captures_magicdns_names() {
+        for chunk in [1usize, 3, 64, 4096] {
+            let m = parse_chunked::<8, 4>(JSON_NAMES.as_bytes(), chunk);
+            assert_eq!(m.names.self_label.as_str(), "me", "chunk={}", chunk);
+            assert_eq!(m.names.suffix.as_str(), "Tailnet-XYZ.ts.net", "chunk={}", chunk);
+            assert!(m.names.proxied, "chunk={}", chunk);
+            assert_eq!(m.peers.len(), 3, "chunk={}", chunk);
+            assert_eq!(m.peers[0].name.label.as_str(), "bospill", "chunk={}", chunk);
+            assert_eq!(m.peers[0].name.suffix_hash, m.names.suffix_hash, "chunk={}", chunk);
+            assert_eq!(m.peers[1].name.label.as_str(), "shared", "chunk={}", chunk);
+            assert_ne!(m.peers[1].name.suffix_hash, m.names.suffix_hash, "chunk={}", chunk);
+            assert_eq!(m.peers[2].name.label.as_str(), "", "chunk={}: over-long label dropped", chunk);
+            assert_eq!(m.peers[0].hostname.as_str(), "BosPill-host", "chunk={}", chunk);
+        }
+    }
+
+    #[test]
+    fn bare_label_name_has_empty_suffix() {
+        let json = r#"{"Node":{"Name":"solo","Addresses":["100.64.0.1/32"]},"DNSConfig":{"Proxied":false}}"#;
+        let m = parse_chunked::<8, 4>(json.as_bytes(), 5);
+        assert_eq!(m.names.self_label.as_str(), "solo");
+        assert_eq!(m.names.suffix.as_str(), "");
+        assert!(!m.names.proxied);
+    }
+
+    #[test]
+    fn split_and_hash_normalise_case_and_dot() {
+        let (l, s) = crate::split_node_name("Host.Tail.ts.net.");
+        assert_eq!((l.as_str(), s), ("host", "Tail.ts.net"));
+        assert_eq!(crate::suffix_hash("Tail.ts.net"), crate::suffix_hash("tail.TS.net"));
+        assert_ne!(crate::suffix_hash("a.ts.net"), crate::suffix_hash("b.ts.net"));
     }
 }

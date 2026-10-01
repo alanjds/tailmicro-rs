@@ -760,6 +760,27 @@ static ROUTER_DROPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 /// piece that actually keeps its large `tokio::select!` body -- four branches
 /// each with heapless::Vec construction and multi-field `info!` calls -- out
 /// of `join`'s frame.
+/// Rebuild the MagicDNS name table from a netmap. Out of the router's frame so
+/// its table temporary does not grow `event_router_task`'s poll state.
+#[inline(never)]
+fn install_map_names(map: &tm_control::MapState) {
+    use tm_netstack::names::NameTable;
+    let n = &map.names;
+    let mut table = NameTable::new();
+    table.set_domain(n.suffix.as_str(), n.proxied);
+    table.insert(n.self_label.as_str(), map.our_ip.0);
+    for p in map.peers.iter() {
+        // A node shared in from another tailnet has a different suffix and is
+        // not answerable under ours.
+        if p.name.suffix_hash == n.suffix_hash {
+            table.insert(p.name.label.as_str(), p.tailnet_ip.0);
+        }
+    }
+    info!("Runtime::join() - MagicDNS table: {} names, suffix '{}', proxied={}",
+        table.len(), n.suffix.as_str(), n.proxied);
+    tm_netstack::names::install(table);
+}
+
 async fn event_router_task(
     ctrl_ev_rx: async_channel::Receiver<ControlEvent>,
     derp_ev_rx: async_channel::Receiver<DerpEvent>,
@@ -824,6 +845,7 @@ async fn event_router_task(
                             info!("Runtime::join() - MapUpdate: {} peers, {} DERP regions, our_ip={}.{}.{}.{}",
                                 map.peers.len(), map.derp_regions.len(),
                                 map.our_ip.0[0], map.our_ip.0[1], map.our_ip.0[2], map.our_ip.0[3]);
+                            install_map_names(map.as_ref());
                             for r in map.derp_regions.iter() {
                                 info!("Runtime::join()   DERP region {} ({}) host={}", r.region_id, r.region_code.as_str(), r.host.as_str());
                             }

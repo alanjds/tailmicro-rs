@@ -51,6 +51,7 @@ use std::time::Duration;
 
 pub use config::Config;
 pub use error::Error;
+pub use tm_netstack::names::MagicDns;
 pub use tm_control::{Service, ServiceProto, MAX_SERVICES, MAX_SERVICE_DESC};
 pub use tm_keys::NodeState;
 pub use tm_runtime::{tokio_freertos_yield, OurIpReceiver, OurIpSender};
@@ -113,6 +114,7 @@ impl Device {
     ) -> Result<(Self, tm_runtime::Driver), Error> {
         tracing::debug!("Device::connect() - starting device initialization");
 
+        tm_netstack::names::set_mode(config.magicdns);
         let node_state = config.load_or_generate_keys().await?;
         tracing::debug!("Device::connect() - keys loaded, node_state generated");
 
@@ -147,6 +149,16 @@ impl Device {
     /// exists once the control plane has assigned one.
     pub fn ipv4_addr(&self) -> Ipv4Addr {
         self.our_ip
+    }
+
+    /// Resolve a tailnet name (`bospill` or `bospill.<tailnet>.ts.net`) to
+    /// its tailnet IPv4, from the netmap snapshot taken at the last control
+    /// connect. `None` means the name is not a known tailnet name under the
+    /// configured [`MagicDns`] mode; use your normal resolver for it. On the
+    /// ESP32 the same table is consulted by lwIP's `getaddrinfo`, so
+    /// `TcpStream::connect("bospill:8080")` needs no call to this.
+    pub fn resolve(&self, name: &str) -> Option<Ipv4Addr> {
+        tm_netstack::names::resolve(name)
     }
 
     /// Whether this device is connected to the tailnet.

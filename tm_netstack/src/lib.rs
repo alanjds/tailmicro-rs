@@ -20,6 +20,9 @@ use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 /// becomes reachable there with no application change.
 pub mod tailnet;
 
+/// MagicDNS name table and the lwIP resolver hook.
+pub mod names;
+
 // ── Error ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
