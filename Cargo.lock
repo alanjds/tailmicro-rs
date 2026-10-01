@@ -2037,22 +2037,13 @@ dependencies = [
 name = "tailmicro"
 version = "0.1.0"
 dependencies = [
- "async-channel",
- "embedded-svc",
- "esp-idf-hal",
- "esp-idf-svc",
  "heapless 0.9.3",
- "log",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
  "tm_control",
  "tm_keys",
  "tm_netstack",
  "tm_runtime",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -2139,7 +2130,6 @@ dependencies = [
  "serde",
  "serde_json",
  "snow",
- "thiserror 1.0.69",
  "tm_h2",
  "tm_keys",
  "tokio",
@@ -2151,7 +2141,6 @@ dependencies = [
 name = "tm_derp"
 version = "0.1.0"
 dependencies = [
- "arrayvec",
  "async-channel",
  "chacha20poly1305",
  "crypto_box",
@@ -2164,7 +2153,6 @@ dependencies = [
  "rand",
  "rand_core",
  "sha2",
- "thiserror 1.0.69",
  "tm_buf",
  "tm_keys",
  "tokio",

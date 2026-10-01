@@ -53,9 +53,6 @@ heapless  = { version = "0.9", default-features = false, features = ["portable-a
 # Minimal HTTP parsing (no full http crate needed)
 httparse = { version = "1", default-features = false }
 
-# Error handling
-thiserror = { version = "1", default-features = false }
-
 # Tracing — same interface as tailscale-rs
 # Use 'std' and 'log' features to enable log compatibility and stdlib support
 tracing = { version = "0.1", default-features = false, features = ["std", "log"] }
@@ -103,21 +100,11 @@ tm_runtime.workspace   = true
 tm_keys.workspace      = true
 tm_netstack.workspace  = true
 tm_control.workspace   = true
-thiserror.workspace    = true
-tokio   = { workspace = true, features = ["sync", "rt"] }
 tracing.workspace      = true
-log.workspace          = true
-serde.workspace        = true
-serde_json.workspace   = true
 heapless.workspace     = true
-esp-idf-svc = { workspace = true }
-esp-idf-hal = { workspace = true }
-embedded-svc = { workspace = true }
-async-channel = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time", "net"] }
-tracing-subscriber = "0.3"
 
 # ── Build profiles ────────────────────────────────────────────────────────────
 [profile.release]
