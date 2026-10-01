@@ -34,35 +34,58 @@ use async_channel;
 /// `vTaskDelay` blocks the whole FreeRTOS task, and with it every actor on
 /// this `current_thread` runtime, for 50 ticks (50 ms at this project's
 /// `CONFIG_FREERTOS_HZ=1000`). Fine at boot (`Runtime::build`); never on a
-/// per-packet path, see [`router_yield`].
+/// per-packet path, see [`RouterYield`].
 #[cfg(target_os = "espidf")]
 pub async fn tokio_freertos_yield() {
     freertos_yield_ticks(50).await;
 }
 
-/// Ticks the event router gives FreeRTOS per loop iteration and after each
-/// forwarded packet.
+/// How long the event router may run without a gap before it hands the CPU
+/// to FreeRTOS for one tick.
 ///
-/// It was 50 (via `tokio_freertos_yield`), and that was the dominant cost
-/// of every LAN round trip (ALLOCATIONS.md Step 9): the router handles one
-/// event per iteration and blocked the entire runtime for 50 ms before each
-/// one, plus another 50 ms after most packet forwards, so a ping echo, which
-/// crosses the router three times, spent 150-300 ms asleep, and any other
-/// queued event (DERP, keepalives, disco) added 50-100 ms more.
-///
-/// One tick is enough for what the yield is for. The task watchdog only
-/// needs the idle task to run once per `CONFIG_ESP_TASK_WDT_TIMEOUT_S`
-/// (30 s), and it also runs whenever the runtime parks in its reactor.
-/// lwIP's tcpip thread (priority 18) and the WiFi task (23) preempt this
-/// task (priority 1) regardless and never needed it.
+/// A `vTaskDelay` blocks the whole `current_thread` runtime, so doing it on
+/// every router iteration (it was 50 ticks, then 1) put a floor of about one
+/// tick under every hop: a ping echo crosses the router three times
+/// (ALLOCATIONS.md Step 9). The yield exists only so the idle task and the
+/// task watchdog (`CONFIG_ESP_TASK_WDT_TIMEOUT_S`, 30 s) get CPU during a
+/// sustained burst; whenever the runtime parks in its reactor they already
+/// do. lwIP's tcpip thread (priority 18) and the WiFi task (23) preempt this
+/// task (priority 1) regardless.
 #[cfg(target_os = "espidf")]
-const ROUTER_YIELD_TICKS: u32 = 1;
+const ROUTER_BUSY_LIMIT: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// The event router's yield: [`ROUTER_YIELD_TICKS`] of FreeRTOS delay, then
-/// one tokio `yield_now` so sibling actors get a turn during a burst.
+/// Yield policy for the event router: a tokio `yield_now` on every call so
+/// sibling actors get a turn, plus one tick of FreeRTOS delay once the router
+/// has gone [`ROUTER_BUSY_LIMIT`] without a gap longer than that limit
+/// between calls (a longer gap means it was waiting, i.e. the runtime parked).
 #[cfg(target_os = "espidf")]
-async fn router_yield() {
-    freertos_yield_ticks(ROUTER_YIELD_TICKS).await;
+struct RouterYield {
+    last_call: std::time::Instant,
+    busy_since: std::time::Instant,
+}
+
+#[cfg(target_os = "espidf")]
+impl RouterYield {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self { last_call: now, busy_since: now }
+    }
+
+    async fn tick(&mut self) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_call) > ROUTER_BUSY_LIMIT {
+            self.busy_since = now;
+        }
+        self.last_call = now;
+        if now.duration_since(self.busy_since) >= ROUTER_BUSY_LIMIT {
+            freertos_yield_ticks(1).await;
+            let after = std::time::Instant::now();
+            self.busy_since = after;
+            self.last_call = after;
+        } else {
+            tokio::task::yield_now().await;
+        }
+    }
 }
 
 #[cfg(target_os = "espidf")]
@@ -777,9 +800,11 @@ async fn event_router_task(
     let mut disco_ev_rx = core::pin::pin!(disco_ev_rx);
     let mut wg_ev_rx = core::pin::pin!(wg_ev_rx);
     let mut netif_out_rx = core::pin::pin!(netif_out_rx);
+    #[cfg(target_os = "espidf")]
+    let mut ry = RouterYield::new();
     loop {
         #[cfg(target_os = "espidf")]
-        router_yield().await;
+        ry.tick().await;
         #[cfg(feature = "latency-trace")]
         lat.on_iter();
         tokio::select! {
@@ -839,7 +864,7 @@ async fn event_router_task(
                                         cert_fingerprint: None,
                                     }).await;
                                     #[cfg(target_os = "espidf")]
-                                    router_yield().await;
+                                    ry.tick().await;
                                 }
                                 // Bug 2 fix: keep tm_disco's peer allowlist in
                                 // sync with the netmap. Without this, every
@@ -853,7 +878,7 @@ async fn event_router_task(
                                 // convention) with something meaningful.
                                 let _ = disco_tx2.send(DiscoCmd::SetHomeRegion(rid)).await;
                                 #[cfg(target_os = "espidf")]
-                                router_yield().await;
+                                ry.tick().await;
                             }
                             for p in map.peers.iter() {
                                 // Step 1 (LAN-direct-path plan): AllowPeer now
@@ -867,7 +892,7 @@ async fn event_router_task(
                                     node_key: p.node_key,
                                 }).await;
                                 #[cfg(target_os = "espidf")]
-                                router_yield().await;
+                                ry.tick().await;
                             }
                             // Capture addressing for rung-6a and the tailnet
                             // netif's outbound routing BEFORE the map is
@@ -895,14 +920,14 @@ async fn event_router_task(
                             apply_tailnet_address(ip.0, &mut netif_applied_ip, &mut netif_out_tx);
                             if let Some(ref tx) = our_ip_tx {
                                 #[cfg(target_os = "espidf")]
-                                router_yield().await;
+                                ry.tick().await;
                                 let _ = tx.send(ip.to_ipv4()).await;
                             }
                         }
                         ControlEvent::KeyExpiry => {
                             let _ = ctrl_tx3.send(ControlCmd::Reauth).await;
                             #[cfg(target_os = "espidf")]
-                            router_yield().await;
+                            ry.tick().await;
                         }
                         ControlEvent::Error(e) => {
                             log_control_error(&e);
@@ -947,14 +972,14 @@ async fn event_router_task(
                                     data: payload,
                                 }, "DiscoCmd::MaybeDisco");
                                 #[cfg(target_os = "espidf")]
-                                router_yield().await;
+                                ry.tick().await;
                             } else {
                                 forward_or_drop(&wg_tx2, WgCmd::InboundPacket {
                                     via: tm_wg::Via::Derp { src_key: *src_key.as_bytes() },
                                     payload,
                                 }, "WgCmd::InboundPacket");
                                 #[cfg(target_os = "espidf")]
-                                router_yield().await;
+                                ry.tick().await;
                             }
                         }
                         DerpEvent::Connected => {
@@ -1032,7 +1057,7 @@ async fn event_router_task(
                             }, "DerpCmd::SendPacket");
                         }
                         #[cfg(target_os = "espidf")]
-                        router_yield().await;
+                        ry.tick().await;
                     }
                     Ok(WgEvent::InboundDecrypted { src_key, payload }) => {
                         // Decrypted inbound app data destined for the local
@@ -1091,7 +1116,7 @@ async fn event_router_task(
                                         payload: buf,
                                     }, "WgCmd::SendData");
                                     #[cfg(target_os = "espidf")]
-                                    router_yield().await;
+                                    ry.tick().await;
                                 }
                             } else {
                                 info!("Runtime::join() - rung6a: our tailnet IP not yet known; skipping echo");
@@ -1125,7 +1150,7 @@ async fn event_router_task(
                                 payload: buf,
                             }, "DerpCmd::SendPacket");
                             #[cfg(target_os = "espidf")]
-                            router_yield().await;
+                            ry.tick().await;
                         } else {
                             warn!("Runtime::join() - sealed PONG ({} bytes) did not fit tm_buf::PktBuf; dropped", payload.len());
                         }
@@ -1185,7 +1210,7 @@ async fn event_router_task(
                                 payload: data,
                             }, "WgCmd::SendData");
                             #[cfg(target_os = "espidf")]
-                            router_yield().await;
+                            ry.tick().await;
                         } else {
                             log_unknown_netif_dest(dst_ip, &mut last_unknown_dst);
                         }
