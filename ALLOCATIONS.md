@@ -1693,14 +1693,108 @@ waits over 200 connects, against 4-6 for F, so with the smaller pool the
 UDP path is regularly up to a few ms later. Requests 3 s apart are
 unaffected (gap connect p50 115-128 ms against Step 11's 122-124).
 
-**Open**:
-- The netif queue still drops under parallel load (G: 292 over 80
-  parallel requests, all recovered by TCP).
-- The router's one-event-per-iteration loop with a 1-tick yield after
-  each forward is the underlying rate limit. Draining the netif channel
-  in batches would address it more directly than a deeper queue, but it
-  was not tried.
-- The boot dip from Step 11 remains unexplained.
+**Open**: see "Possible future improvements" below. The user accepted
+this state (about 170 ms over DERP, about 100 ms direct), so none of it
+is being pursued now.
+
+## Possible future improvements
+
+Options recorded for later, after Step 12. None is implemented, and none
+is needed for the current state. Each lists what is known, what is not,
+and what it would cost.
+
+**1. Netif outbound queue drops under heavy parallel load.**
+- Known: with the 8-slot queue and the pool-only rule (Step 12), the
+  back-to-back case no longer drops. With 4 parallel clients it still
+  does: 292 drops over 80 requests on the committed build. TCP recovers
+  all of them, and every request succeeded.
+- Cost of the drops: the 4x20 parallel run takes about 155 s, against
+  67 s for the unrestricted 8-deep queue, which did not drop.
+- Not an option: just making the queue deeper or lifting the pool-only
+  rule. Step 12's variant C did that and cost about 5 KB of minimum
+  largest free block (7680 B), because queued packets took heap-fallback
+  buffers.
+- Only worth doing if parallel throughput starts to matter. The likely
+  route is item 2, not a bigger queue.
+
+**2. Batched draining of the netif channel in the router (not tried).**
+- The underlying rate limit is the router's loop shape. It takes one
+  event per iteration and yields one FreeRTOS tick after each forward
+  (`router_yield`, Step 9). Meanwhile lwIP's tcpip thread, at priority 18,
+  produces a connection's segments in a burst.
+- Idea: when the router wakes for a netif packet, it forwards everything
+  already queued (`try_recv` in a loop, bounded to a few packets), then
+  yields once.
+- Expected effect: the queue empties at the rate lwIP fills it, so fewer
+  slots and fewer pool buffers are needed.
+- Risks to check:
+  - the WG actor's `WgCmd` channel then fills faster, so `forward_or_drop`
+    drops move there;
+  - the router must still never await a full channel (Step 7 deadlock);
+  - the per-burst yield has to keep the idle task and the watchdog fed.
+- Measure with the same multi/soak harness, watching `netif_out_drop`,
+  the router "channel full" counters, and the heap minima.
+
+**3. Fragmentation after a control-plane reconnect.**
+- Seen once in Step 12 (variant E soak, 76 s). The control server closed
+  its long poll ("early eof"). The reconnect's Noise handshake allocated
+  its 2 x 4114 B buffers, and for the rest of that run the largest free
+  block stayed at 7680 B with about 34 KB free.
+- Interpretation: a long-lived allocation landed in the middle of the
+  big free block. That is inferred from the shape; the heapdiag map at
+  that moment was not examined.
+- Not specific to Step 12; any build can hit it when control reconnects
+  under load.
+- Options:
+  - allocate the Noise channel buffers once at boot and reuse them across
+    reconnects, following the "Design principle going forward" below;
+  - or take them from a static `.bss` region, as Step 5 did for the TLS
+    buffers.
+- Either removes a recurring 8 KB pair from the heap; the static option
+  costs that 8 KB of DRAM permanently.
+
+**4. The unreproduced boot-time heap dip.**
+- Step 11 saw `min_ever_free=2592` with a 7936 B largest block at 22 s of
+  uptime, during the first multi-peer handshakes, DERP connect and disco.
+  Step 12 saw a milder dip of the same timing once: largest free 7680 B
+  at 25 s on the F multi boot.
+- Neither recurred on the other boots: about 6 in Step 11 and 10 in
+  Step 12.
+- What it is, from the Step 11 heapdiag map, is inferred only from block
+  sizes: about 35 KB in 1664/1728 B blocks, most likely WiFi/lwIP receive
+  buffers.
+- Next step if it matters: capture several fresh boots with heapdiag
+  tracing enabled around the first 30 s, to find what holds those blocks.
+  Possible levers, unmeasured:
+  - stagger the first WG handshakes to several peers;
+  - delay disco until DERP is up;
+  - lower the WiFi dynamic RX buffer count in sdkconfig.
+- No reset or allocation failure has followed either dip.
+
+**5. WiFi modem sleep: latency and jitter against power.**
+- Known from Step 9: ESP-IDF's default `WIFI_PS_MIN_MODEM` (nothing calls
+  `esp_wifi_set_ps`) adds about 100 ms to an idle round trip. Plain LAN
+  ICMP, with no tailmicro code involved, measured p50 58-71 ms and max
+  112-122 ms, which matches waiting for DTIM beacons.
+- An uncommitted experiment called `esp_wifi_set_ps(WIFI_PS_NONE)` after
+  `wifi.start()`. It brought plain LAN ICMP to p50 3 ms and idle ICMP over
+  WireGuard to p50 46 ms.
+- User observation after Step 12: about 100 ms direct and about 170 ms
+  over DERP, with DERP the less variable of the two.
+  - Plausible explanation, not measured: the DERP path is a TCP
+    connection that is active continuously, so the radio is awake more
+    often.
+  - Direct-path UDP is bursty and more often waits for a beacon after
+    the radio has dozed.
+  - A test would compare jitter on both paths with `WIFI_PS_NONE`.
+- Trade-off:
+  - `WIFI_PS_NONE` keeps the radio receiving all the time, which costs
+    significantly more power. The cost was not measured here. It matters
+    on battery, much less on a mains-powered plug.
+  - A middle option is `WIFI_PS_MAX_MODEM` with a lower listen interval,
+    or switching power save off only while there is tailnet traffic.
+- This is an application choice (tasmolike-rs's WiFi setup), not a
+  tailmicro change.
 
 ## Design principle going forward
 
