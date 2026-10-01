@@ -68,19 +68,21 @@ use heapless::pool::object::{Object, ObjectBlock};
 /// (1500 + 32), `tm_wg`'s 1500 and `tm_disco`'s 256.
 pub const PKT_CAP: usize = 1500 + 32;
 
-/// Number of pooled buffers (1544 B each with the pool node, ~9 KB of
+/// Number of pooled buffers (1544 B each with the pool node, ~6 KB of
 /// static RAM, which comes out of the same DRAM as the heap).
 /// Realistic steady-state in-flight count is 2-4 (one packet per hop being
 /// processed plus a couple queued); bursts beyond this fall back to heap
 /// allocation and show up in [`PoolStats::allocs`]. Tune from that counter
 /// rather than guessing.
 ///
-/// 6, not 4: with 4, the UDP receive path's 2-free-buffer floor dropped the
-/// SYN of a back-to-back TCP connection while the previous connection's
-/// tail still held buffers, costing a ~1 s SYN retransmit per connect
-/// (ALLOCATIONS.md Steps 9-11). Only helps together with the wider WgCmd
-/// channel in tm_runtime (`WG_CMD_CHAN_CAP`).
-pub const POOL_N: usize = 6;
+/// 4. Step 11 of ALLOCATIONS.md raised it to 6 for the ~1 s back-to-back
+/// TCP connect stall; Step 12 found the stall's causes (UDP receive
+/// dropping instead of waiting, and the 2-slot tailnet netif outbound
+/// channel) and fixed them. After that, 6 against 4 made about no
+/// difference to the stall (0 against 1 slow connect in 240) and left a
+/// smaller minimum largest free block under parallel load, so it went back
+/// to 4, which also saves about 3 KB of DRAM.
+pub const POOL_N: usize = 4;
 
 /// The storage behind a packet buffer.
 pub type PktInner = heapless::Vec<u8, PKT_CAP>;

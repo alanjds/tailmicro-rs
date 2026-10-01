@@ -1277,15 +1277,15 @@ fn spawn_event_router(
 /// Reduced from 4 to 2 to save memory on ESP32-C3.
 const CHAN_CAP: usize = 2;
 
-/// Capacity of the `WgCmd` channel (router -> WG actor), wider than
-/// `CHAN_CAP`. Every inbound WireGuard packet (UDP and DERP) crosses it, and
-/// the router `try_send`s into it (`forward_or_drop`), so a full channel is
-/// a dropped packet. At 2, a client's closing ACK/FIN and its next SYN
-/// arriving together overflowed it while the actor decrypted, and each
-/// back-to-back TCP connect paid a ~1 s SYN retransmit (ALLOCATIONS.md
-/// Steps 10-11). The slots hold `WgCmd` by value and the packet bytes stay
-/// in `tm_buf`, so 2 more slots cost little heap.
-const WG_CMD_CHAN_CAP: usize = 4;
+/// Capacity of the `WgCmd` channel (router -> WG actor). Step 11 of
+/// ALLOCATIONS.md widened it to 4 because the router's `forward_or_drop`
+/// lost inbound packets when it was full. Since Step 12 the UDP receive
+/// task, which carries most inbound WireGuard packets, waits for room
+/// instead of going through a drop (`lan_udp::forward_backpressured`), and
+/// at 2 the back-to-back connect stall stayed fixed, so it is back to
+/// `CHAN_CAP`. Kept as its own constant to tune from the router's
+/// "channel full" drop counters.
+const WG_CMD_CHAN_CAP: usize = 2;
 
 /// Capacity of the tailnet netif outbound channel (lwIP tcpip thread ->
 /// router), wider than `CHAN_CAP`. The producer is lwIP's `output` callback,
