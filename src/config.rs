@@ -21,6 +21,9 @@ pub struct Config {
     /// keepalive poll that follows runs unbounded regardless of this value
     /// — see `tm_control::Config::connect_timeout`.
     pub(crate) connect_timeout: Option<std::time::Duration>,
+    /// How often the control connection re-fetches the full netmap while it
+    /// is open. See `tm_control::Config::refresh_interval`.
+    pub(crate) refresh_interval: Option<std::time::Duration>,
     pub(crate) hostname: &'static str,
     pub(crate) os_version: heapless::String<{ tm_control::MAX_OS_VERSION }>,
     pub(crate) services: &'static [tm_control::Service],
@@ -80,6 +83,16 @@ impl Config {
         self
     }
 
+    /// Set how often the full netmap is re-fetched on the open control
+    /// connection (default 10 minutes), so peers that joined, left or moved
+    /// are picked up without a reconnect. `None` turns the timer off; a lookup
+    /// of an unknown tailnet address still triggers a re-fetch, at most once
+    /// every 2 minutes. Each re-fetch receives about 30-48 KB.
+    pub fn with_refresh_interval(mut self, interval: Option<std::time::Duration>) -> Self {
+        self.refresh_interval = interval;
+        self
+    }
+
     /// Node name announced to the control server, which derives the MagicDNS
     /// name from it (default `esp32c3`). A single lowercase DNS label.
     pub fn with_hostname(mut self, hostname: &'static str) -> Result<Self, Error> {
@@ -136,6 +149,7 @@ impl Config {
             control_port: self.control_port,
             control_pin:  self.control_pin,
             connect_timeout: self.connect_timeout,
+            refresh_interval: self.refresh_interval,
             // Filled in by tm_runtime once (and if) its lan-direct UDP
             // socket is bound; the app config has no say in it.
             lan_udp_port: None,
@@ -154,6 +168,7 @@ impl Default for Config {
             key_file:     None,
             control_pin:  [0u8; 32],
             connect_timeout: None,
+            refresh_interval: Some(tm_control::DEFAULT_REFRESH_INTERVAL),
             hostname:     "esp32c3",
             os_version:   heapless::String::new(),
             services:     &[],

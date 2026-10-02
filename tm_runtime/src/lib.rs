@@ -592,6 +592,32 @@ fn log_unknown_netif_dest(dst_ip: [u8; 4], last: &mut Option<[u8; 4]>) {
     warn!("Runtime::join() - tailnet netif output: no peer known for destination {}.{}.{}.{}, dropping", dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
 }
 
+/// Minimum spacing between router-initiated netmap refreshes. tm_control
+/// applies its own gap too; this one keeps a flood of unroutable packets from
+/// even queueing commands.
+const MISS_REFRESH_GAP: core::time::Duration = core::time::Duration::from_secs(120);
+
+/// Ask control for a fresh netmap because a packet had no route: the peer may
+/// have joined after the last snapshot. `try_send`, never `send().await`:
+/// the router must not stall its data plane on a full control queue, and a
+/// dropped request is repeated by the next miss after the gap.
+/// Returns whether a request was queued.
+#[inline(never)]
+fn request_refresh_on_miss(tx: &async_channel::Sender<ControlCmd>,
+                           last: &mut Option<std::time::Instant>,
+                           now: std::time::Instant) -> bool {
+    if last.is_some_and(|t| now.saturating_duration_since(t) < MISS_REFRESH_GAP) {
+        return false;
+    }
+    if tx.try_send(ControlCmd::Refresh).is_ok() {
+        *last = Some(now);
+        info!("Runtime::join() - unknown tailnet destination, asking control for a fresh netmap");
+        true
+    } else {
+        false
+    }
+}
+
 /// Internet checksum (RFC 1071): ones-complement sum of 16-bit words.
 fn inet_checksum(bytes: &[u8]) -> u16 {
     let mut sum: u32 = 0;
@@ -812,6 +838,7 @@ async fn event_router_task(
     // see `apply_tailnet_address`/`log_unknown_netif_dest`.
     let mut netif_applied_ip: Option<[u8; 4]> = None;
     let mut last_unknown_dst: Option<[u8; 4]> = None;
+    let mut last_miss_refresh: Option<std::time::Instant> = None;
     // Belt-and-suspenders for the DERP reconnect fix (2026-09): DerpActor now
     // redials its own last target with backoff on a connection error, but
     // keeping the last-known-good target here too costs nothing and gives a
@@ -1244,6 +1271,7 @@ async fn event_router_task(
                             ry.tick().await;
                         } else {
                             log_unknown_netif_dest(dst_ip, &mut last_unknown_dst);
+                            request_refresh_on_miss(&ctrl_tx3, &mut last_miss_refresh, std::time::Instant::now());
                         }
                     }
                     Err(_) => {
@@ -1590,6 +1618,25 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::pin::Pin;
+
+    /// A miss queues one `Refresh`, further misses inside the gap queue
+    /// nothing, and a full control queue is not an error and does not start
+    /// the gap (the next miss may retry).
+    #[test]
+    fn miss_refresh_is_rate_limited_and_never_blocks() {
+        let (tx, rx) = async_channel::bounded::<ControlCmd>(1);
+        let t0 = std::time::Instant::now();
+        let mut last = None;
+        assert!(request_refresh_on_miss(&tx, &mut last, t0));
+        assert!(matches!(rx.try_recv(), Ok(ControlCmd::Refresh)));
+        assert!(!request_refresh_on_miss(&tx, &mut last, t0 + core::time::Duration::from_secs(119)));
+        assert!(rx.try_recv().is_err());
+        assert!(request_refresh_on_miss(&tx, &mut last, t0 + MISS_REFRESH_GAP));
+        // Queue full (the Refresh above was not drained): dropped, gap not restarted.
+        let gap_start = last;
+        assert!(!request_refresh_on_miss(&tx, &mut last, t0 + MISS_REFRESH_GAP * 2));
+        assert_eq!(last, gap_start);
+    }
 
     fn pending_forever() -> Pin<Box<dyn Future<Output = ()>>> {
         Box::pin(std::future::pending())

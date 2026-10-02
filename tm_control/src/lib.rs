@@ -226,6 +226,13 @@ pub struct Config {
     /// idle-read watchdog `POLL_IDLE_TIMEOUT`. See docs/wg-dataplane-notes.md
     /// "Bring-up timeout".
     pub connect_timeout: Option<core::time::Duration>,
+    /// How often to re-fetch the full netmap on the live connection (a
+    /// non-streaming `OmitPeers=false` MapRequest on a fresh stream, parsed
+    /// like the bring-up publish) so peers that joined, left or moved while
+    /// the long poll is open are picked up. `None` disables the timer; the
+    /// router's on-miss `ControlCmd::Refresh` still works. See
+    /// [`DEFAULT_REFRESH_INTERVAL`].
+    pub refresh_interval: Option<core::time::Duration>,
     /// Port of the runtime's bound LAN UDP socket (`lan-direct` feature),
     /// or `None` when there is none. With `Some`, bring-up derives the LAN
     /// endpoint `<control-socket local IPv4>:<port>` (plan D1). It is only
@@ -248,6 +255,18 @@ pub struct Config {
 /// Services are re-sent in each of the four Hostinfos, so their size is
 /// bounded to keep the bodies inside [`REQUEST_BODY_CAP`].
 pub const MAX_SERVICES: usize = 4;
+
+/// Default for [`Config::refresh_interval`]. Each re-poll costs one full
+/// netmap (about 30-48 KB received on the real tailnet), so 10 minutes is
+/// roughly 4-7 MB/day: a safety net, not the primary update path.
+pub const DEFAULT_REFRESH_INTERVAL: core::time::Duration = core::time::Duration::from_secs(600);
+/// Minimum spacing between two re-polls, whatever triggered them. Bounds the
+/// radio and heap cost of a router that keeps missing (a misconfigured peer
+/// or a stray packet to an unknown tailnet address) and the load on control.
+pub const MIN_REFRESH_GAP: core::time::Duration = core::time::Duration::from_secs(120);
+/// A re-poll whose response has not finished this long after the request was
+/// sent is abandoned, so one lost response cannot block every later re-poll.
+const REFRESH_RESPONSE_DEADLINE: core::time::Duration = core::time::Duration::from_secs(60);
 pub const MAX_SERVICE_DESC: usize = 32;
 pub const MAX_OS_VERSION: usize = 48;
 
@@ -327,7 +346,17 @@ impl From<H2Error> for ControlError { fn from(e: H2Error) -> Self { Self::H2(e) 
 
 // ── Actor messages ────────────────────────────────────────────────────────────
 
-pub enum ControlCmd  { Start { auth_key: heapless::String<128> }, Reauth, Shutdown }
+pub enum ControlCmd  {
+    Start { auth_key: heapless::String<128> },
+    Reauth,
+    Shutdown,
+    /// Ask for a fresh full netmap soon (a re-poll on the live connection).
+    /// Sent by the router when it cannot route to an address, in case a peer
+    /// joined after the last map. Advisory: requests that arrive inside
+    /// `MIN_REFRESH_GAP` of the previous re-poll collapse into one re-poll sent
+    /// when the gap has passed.
+    Refresh,
+}
 pub enum ControlEvent {
     // Boxed: async_channel's ring buffer (concurrent-queue) reserves 31 slots
     // per block and returns each block by value, so an unboxed MapState here
@@ -444,6 +473,30 @@ pub fn lan_endpoint(local: std::net::SocketAddr, port: u16) -> Option<std::net::
 /// tests can pin it against ts_control.py's write_map and against the
 /// DERP-only body. `lan_ep` goes first: tailscaled tries endpoints in
 /// order, and the DERP magic entry is the fallback.
+fn publish1_body(config: &Config, node_key_hex: &str, disco_key_hex: &str)
+    -> Result<heapless::Vec<u8, REQUEST_BODY_CAP>, JsonError>
+{
+    to_json_buf(&MapRequest {
+        version: CAPABILITY_VERSION, compress: "", keep_alive: false,
+        node_key: node_key_hex, endpoints: &[], stream: false,
+        disco_key: Some(disco_key_hex),
+        hostinfo: Some(host_info(config, None)),
+        omit_peers: false,
+    })
+}
+
+/// What a re-poll must repeat from bring-up so it does not overwrite what we
+/// published. A non-streaming `OmitPeers=false` MapRequest is a WRITE (the
+/// server applies Hostinfo/DiscoKey/Endpoints from it; `ReadOnly` is
+/// deprecated and always false at cap >= 68), so a re-poll that carried no
+/// endpoints would erase our DERP-home hint at control. It therefore sends the
+/// same body as publish #2 (or #1 when no DERP region was known).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PublishCtx {
+    region: Option<u16>,
+    lan:    Option<std::net::SocketAddrV4>,
+}
+
 fn publish2_body(config: &Config, node_key_hex: &str, disco_key_hex: &str, region: u16,
                  lan_ep: Option<std::net::SocketAddrV4>)
     -> Result<heapless::Vec<u8, REQUEST_BODY_CAP>, JsonError>
@@ -592,12 +645,12 @@ impl ControlActor {
         self
     }
 
-    pub async fn run(mut self, mut cmds: async_channel::Receiver<ControlCmd>,
+    pub async fn run(mut self, cmds: async_channel::Receiver<ControlCmd>,
                      events: async_channel::Sender<ControlEvent>) {
         loop {
             match cmds.recv().await {
                 Ok(ControlCmd::Start { ref auth_key }) => {
-                    if let Err(e) = self.connect_and_poll(auth_key.as_str(), &events).await {
+                    if let Err(e) = self.connect_and_poll(auth_key.as_str(), &events, &cmds).await {
                         tracing::error!("Control error: {:?}", e);
                         let _ = events.send(ControlEvent::Error(e)).await;
                         // No retry (v2 follow-up, see docs/wg-dataplane-notes.md
@@ -611,6 +664,8 @@ impl ControlActor {
                         // another command.
                         break;
                     }
+                    // Ok means a Shutdown was received while polling.
+                    break;
                 }
                 Ok(ControlCmd::Shutdown) | Err(_) => break,
                 Ok(_) => {}
@@ -619,7 +674,8 @@ impl ControlActor {
     }
 
     async fn connect_and_poll(&mut self, auth_key: &str,
-                               events: &async_channel::Sender<ControlEvent>)
+                               events: &async_channel::Sender<ControlEvent>,
+                               cmds: &async_channel::Receiver<ControlCmd>)
         -> Result<(), ControlError>
     {
         // Bring-up (TCP + Noise + register + non-streaming publish, up to
@@ -633,7 +689,7 @@ impl ControlActor {
         // reconnect. See docs/wg-dataplane-notes.md "Bring-up timeout".
         let connect_timeout = self.config.connect_timeout;
         let bring_up = self.bring_up(auth_key, events);
-        let (mut main_conn, mut noise, mut h2, node_key_hex) = match connect_timeout {
+        let (mut main_conn, mut noise, mut h2, node_key_hex, mut publish_ctx) = match connect_timeout {
             Some(dur) => tokio::time::timeout(dur, bring_up).await.map_err(|_| {
                 tracing::error!("Control bring-up exceeded connect_timeout ({:?})", dur);
                 ControlError::Timeout
@@ -665,6 +721,7 @@ impl ControlActor {
             // DiscoKey/Endpoints are read-only on a Stream=true request
             // (cap >= 68) so they stay None; the authoritative values were
             // already published non-streaming during bring-up.
+            let mut shutdown = false;
             let poll_res = async {
                 let map_body = to_json_buf(&MapRequest {
                     version: CAPABILITY_VERSION, compress: "", keep_alive: true,
@@ -675,9 +732,20 @@ impl ControlActor {
                 }).map_err(ControlError::Json)?;
                 let map_req = build_h2_post("/machine/map", self.config.control_host, MAP_STREAM_ID, &map_body);
                 noise.write_all(&mut main_conn, &map_req).await?;
-                self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_STREAM_ID, true,
-                    Some(self.poll_idle_timeout)).await
+                // One re-poll controller per connection: the re-poll stream IDs
+                // restart at 9 with the fresh h2 state, and the clock starts
+                // now because bring-up just delivered a full netmap.
+                let mut ctl = PollCtl::new(cmds, node_key_hex.as_str(), &publish_ctx,
+                                           self.config.refresh_interval);
+                let r = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_STREAM_ID, true,
+                    Some(self.poll_idle_timeout), Some(&mut ctl)).await;
+                shutdown = ctl.shutdown;
+                r
             }.await;
+            if shutdown {
+                info!("Tailscale control: shutdown requested, closing the poll");
+                return Ok(());
+            }
 
             match poll_res {
                 Ok(_) => tracing::warn!("Tailscale keepalive stream closed by server; reconnecting"),
@@ -693,8 +761,8 @@ impl ControlActor {
             tokio::time::sleep(backoff).await;
             backoff = core::cmp::min(backoff.saturating_mul(2), core::time::Duration::from_secs(30));
             match self.bring_up(auth_key, events).await {
-                Ok((c, n, h, _)) => {
-                    main_conn = c; noise = n; h2 = h;
+                Ok((c, n, h, _, pc)) => {
+                    main_conn = c; noise = n; h2 = h; publish_ctx = pc;
                     backoff = core::time::Duration::from_secs(1);
                     info!("Tailscale keepalive reconnected (bring-up ok)");
                 }
@@ -710,7 +778,7 @@ impl ControlActor {
     /// `tokio::time::timeout` when `connect_timeout` is set.
     async fn bring_up(&mut self, auth_key: &str,
                        events: &async_channel::Sender<ControlEvent>)
-        -> Result<(TokioStream, NoiseChannel, H2State, heapless::String<80>), ControlError>
+        -> Result<(TokioStream, NoiseChannel, H2State, heapless::String<80>, PublishCtx), ControlError>
     {
         info!("Tailscale connect_and_poll starting");
         let host = self.config.control_host;
@@ -801,13 +869,8 @@ impl ControlActor {
             // register the disco key and fetch the netmap. select_home_region
             // then runs on the parsed response and publish #2 (below) advertises
             // the chosen home. This is the standard Tailscale cold-boot order.
-            let publish_body = to_json_buf(&MapRequest {
-                version: CAPABILITY_VERSION, compress: "", keep_alive: false,
-                node_key: node_key_hex.as_str(), endpoints: &[], stream: false,
-                disco_key: Some(disco_key_hex.as_str()),
-                hostinfo: Some(host_info(&self.config, None)),
-                omit_peers: false,
-            }).map_err(ControlError::Json)?;
+            let publish_body = publish1_body(&self.config, node_key_hex.as_str(), disco_key_hex.as_str())
+                .map_err(ControlError::Json)?;
 
             let publish_req = build_h2_post("/machine/map", host, MAP_PUBLISH_STREAM_ID, &publish_body);
             noise.write_all(&mut main_conn, &publish_req).await?;
@@ -821,7 +884,7 @@ impl ControlActor {
         // a raw JSON body with an END_STREAM, so stream_map_response parses it
         // and returns at end_stream, emitting MapUpdate + OurIpAssigned.
         info!("Tailscale Step 7.5: reading + parsing publish MapResponse");
-        let home_region = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_PUBLISH_STREAM_ID, true, None).await?;
+        let home_region = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_PUBLISH_STREAM_ID, true, None, None).await?;
 
         // Step 7.6 (new): re-publish with our DERP home so peers get a stable
         // relay path to us. Encoded two ways, together, per the confirmed
@@ -833,6 +896,7 @@ impl ControlActor {
         // its DERP session there, so advertised == actual. Without this,
         // peers have no durable path to us and inbound dies once their disco
         // caches go stale (e.g. after we reboot on a now-stable tailnet IP).
+        let mut publish_ctx = PublishCtx::default();
         if let Some(region) = home_region {
             let disco_key_hex = self.node_state.disco_key.public().to_hex();
             let lan_ep = self.config.lan_udp_port.and_then(|port| {
@@ -845,6 +909,7 @@ impl ControlActor {
                 ep
             });
             let published_lan = if PUBLISH_LAN_ENDPOINT { lan_ep } else { None };
+            publish_ctx = PublishCtx { region: Some(region), lan: published_lan };
             info!("Tailscale Step 7.6: re-publishing with PreferredDERP={} endpoint={}:{}", region, DERP_MAGIC_IP, region);
             let republish_body = publish2_body(
                 &self.config, node_key_hex.as_str(), disco_key_hex.as_str(), region, published_lan,
@@ -854,7 +919,7 @@ impl ControlActor {
             // Drain + parse the response (re-emits the authoritative netmap,
             // which is idempotent for the runtime: same IP -> netif no-op,
             // repeat DERP Connect ignored). Its own return value is unused.
-            let _ = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_REPUBLISH_STREAM_ID, false, None).await?;
+            let _ = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_REPUBLISH_STREAM_ID, false, None, None).await?;
         } else {
             tracing::warn!("Tailscale Step 7.6: no reachable DERP region in netmap; skipping home advertisement (inbound may be unreliable)");
         }
@@ -863,7 +928,32 @@ impl ControlActor {
         // connection state back to `connect_and_poll`, which continues with
         // the UNBOUNDED streaming poll (Step 8 & 9) — no timeout applies
         // past this point.
-        Ok((main_conn, noise, h2, node_key_hex))
+        Ok((main_conn, noise, h2, node_key_hex, publish_ctx))
+    }
+
+    /// Send the re-poll request on a fresh stream of the open connection.
+    /// The body repeats what bring-up published (see `PublishCtx`), with
+    /// `OmitPeers=false`, so the response is a full map for the same parser
+    /// as bring-up's.
+    #[inline(never)]
+    async fn send_refresh<S: embedded_io_async::Read + embedded_io_async::Write>(
+        &self, ctl: &mut PollCtl<'_>, stream: &mut S, noise: &mut NoiseChannel,
+    ) -> Result<(), ControlError> {
+        let id = ctl.next_stream_id;
+        let disco_hex = self.node_state.disco_key.public().to_hex();
+        let body = match ctl.publish.region {
+            Some(region) => publish2_body(&self.config, ctl.node_key_hex, disco_hex.as_str(), region, ctl.publish.lan),
+            None => publish1_body(&self.config, ctl.node_key_hex, disco_hex.as_str()),
+        }.map_err(ControlError::Json)?;
+        let req = build_h2_post("/machine/map", self.config.control_host, id, &body);
+        info!("Tailscale re-poll: requesting a fresh netmap on stream {}", id);
+        noise.write_all(stream, &req).await?;
+        let now = tokio::time::Instant::now();
+        ctl.next_stream_id += 2;
+        ctl.last_refresh = now;
+        ctl.inflight = Some((id, now));
+        ctl.cmd_pending = false;
+        Ok(())
     }
 
     /// Returns the DERP home region selected from the parsed netmap (via
@@ -876,6 +966,7 @@ impl ControlActor {
         h2: &mut H2State, events: &async_channel::Sender<ControlEvent>,
         expected_stream: u32, emit_events: bool,
         idle_timeout: Option<core::time::Duration>,
+        mut poll: Option<&mut PollCtl<'_>>,
     ) -> Result<Option<u16>, ControlError> {
         info!("Tailscale stream_map_response starting on stream {} (emit_events={})", expected_stream, emit_events);
         // Home region selected from the parsed netmap; returned to the caller.
@@ -919,7 +1010,9 @@ impl ControlActor {
         let mut prefix = [0u8; 4];
         let mut prefix_have = 0usize;
         let mut cur_len: Option<usize> = None;
-        let mut our_ip_sent = false;
+        // The poll connection already announced our IP during bring-up; a
+        // re-poll must not announce it again.
+        let mut our_ip_sent = poll.is_some();
         // The streaming keepalive poll (MAP_STREAM_ID) is a live HTTP/2 stream
         // the control server watches: per ts_control.py's start_keepalive_poll,
         // the server only keeps OUR node marked online while we keep draining
@@ -943,11 +1036,37 @@ impl ControlActor {
         // and stay in the read loop so the server keeps us marked online, but
         // allocate nothing. Parsing streaming deltas (to pick up peers that
         // come online after boot) is the deferred v2 of card t_e34afeed.
-        let mut discarding = streaming;
+        //
+        // In poll mode the discard is per stream instead: the long poll's own
+        // payload is skipped by `parse_this` below, and `discarding` only
+        // marks a desynced re-poll stream (reset when that re-poll ends).
+        let mut discarding = streaming && poll.is_none();
+
+        let mut idle_at = idle_timeout.map(|d| tokio::time::Instant::now() + d);
 
         loop {
+            // Poll mode only: between frames, start a due re-poll and, while the
+            // stream is quiet, wait for a trigger instead of a frame. Nothing
+            // here runs mid-frame, and a ready frame always wins over a timer
+            // (see `PollCtl::wait`), so a re-poll can delay the long poll by
+            // one request write at most and can never be starved by it either.
+            if let Some(ctl) = poll.as_deref_mut() {
+                if ctl.refresh_wanted(tokio::time::Instant::now(), h2) {
+                    self.send_refresh(ctl, stream, noise).await?;
+                    // Parse state belongs to the previous re-poll, if any.
+                    parser = None; fed = 0; cur_len = None; prefix_have = 0; discarding = false;
+                }
+                if ctl.shutdown { return Ok(home_region); }
+                if noise.buffered() == 0 {
+                    match ctl.wait(noise, stream, idle_at).await? {
+                        Wake::Readable => {}
+                        Wake::Other => continue,
+                    }
+                }
+            }
             let mut hdr_bytes = [0u8; 9];
             read_exact_idle(noise, stream, &mut hdr_bytes, idle_timeout).await?;
+            idle_at = idle_timeout.map(|d| tokio::time::Instant::now() + d);
             let hdr = FrameHeader::from_bytes(&hdr_bytes);
 
             if hdr.length > MAX_FRAME_SIZE {
@@ -966,20 +1085,46 @@ impl ControlActor {
             read_exact_idle(noise, stream, &mut frame_buf[..blen], idle_timeout).await?;
             debug!("Tailscale frame received: length={}, type={}", hdr.length, hdr.frame_type);
 
-            match tm_h2::parse_frame(&hdr, &frame_buf[..blen], expected_stream, h2)? {
+            // Poll mode multiplexes the long poll with at most one re-poll (and
+            // may still see a late frame of an abandoned one), so any DATA
+            // stream is acceptable there and is routed below. Everything else
+            // reads exactly one stream and rejects frames for any other.
+            let data_stream = if poll.is_some() { hdr.stream_id } else { expected_stream };
+
+            // A re-poll that ends without DATA (an error status answered with
+            // HEADERS+END_STREAM, or a reset) would otherwise stay in flight
+            // until the deadline.
+            if let Some(ctl) = poll.as_deref_mut() {
+                let ends = (hdr.frame_type == FRAME_TYPE_HEADERS && hdr.is_end_stream())
+                    || hdr.frame_type == FRAME_TYPE_RST_STREAM;
+                if ends && ctl.finish_refresh(hdr.stream_id, h2) {
+                    info!("Tailscale re-poll stream {} ended without a body (type {})", hdr.stream_id, hdr.frame_type);
+                    parser = None; fed = 0; cur_len = None; prefix_have = 0; discarding = false;
+                    continue;
+                }
+            }
+
+            match tm_h2::parse_frame(&hdr, &frame_buf[..blen], data_stream, h2)? {
                 FrameAction::Data { payload, end_stream } => {
-                    debug!("Tailscale Data frame: payload_len={}, end_stream={}", payload.len(), end_stream);
+                    debug!("Tailscale Data frame: stream={}, payload_len={}, end_stream={}", data_stream, payload.len(), end_stream);
 
                     // Proactive WINDOW_UPDATE (MicroLink technique). Stream-level
                     // update must target the stream the data arrived on.
-                    let (cwu, swu) = h2.consumed(payload.len() as u32);
+                    let (cwu, swu) = h2.consumed(data_stream, payload.len() as u32);
                     if cwu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,0,cwu); noise.write_all(stream,&b).await?; }
-                    if swu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,expected_stream,swu); noise.write_all(stream,&b).await?; }
+                    if swu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,data_stream,swu); noise.write_all(stream,&b).await?; }
 
                     // Feed the payload through the prefix -> body state machine.
                     // A single frame may finish one message and begin the next
                     // (streaming poll), so drive it with a cursor.
-                    let mut pos = if discarding { payload.len() } else { 0usize };
+                    // In poll mode only the re-poll's stream is parsed; the long
+                    // poll's own payload is still skipped, and so is anything on
+                    // a stream we no longer track.
+                    let parse_this = match poll.as_deref() {
+                        Some(ctl) => ctl.is_refresh_stream(data_stream),
+                        None => true,
+                    };
+                    let mut pos = if discarding || !parse_this { payload.len() } else { 0usize };
                     while pos < payload.len() {
                         // Phase 1: collect the 4-byte LE length prefix.
                         if cur_len.is_none() {
@@ -1079,7 +1224,24 @@ impl ControlActor {
                         prefix_have = 0;
                     }
 
-                    if end_stream { info!("Tailscale stream ended"); return Ok(home_region); }
+                    if end_stream {
+                        match poll.as_deref_mut() {
+                            Some(ctl) if data_stream != MAP_STREAM_ID => {
+                                // A re-poll (or a stray stream) finished; the long
+                                // poll carries on.
+                                h2.stream_done(data_stream);
+                                if ctl.finish_refresh(data_stream, h2) {
+                                    parser = None; fed = 0; cur_len = None; prefix_have = 0; discarding = false;
+                                }
+                                info!("Tailscale re-poll stream {} complete", data_stream);
+                            }
+                            _ => {
+                                info!("Tailscale stream ended");
+                                h2.stream_done(data_stream);
+                                return Ok(home_region);
+                            }
+                        }
+                    }
                 }
                 FrameAction::SendSettingsAck => {
                     let mut a=[0u8;9]; write_settings_ack(&mut a); noise.write_all(stream,&a).await?;
@@ -1091,6 +1253,149 @@ impl ControlActor {
                 FrameAction::Ignore => {}
             }
         }
+    }
+}
+
+const FRAME_TYPE_HEADERS: u8 = 0x1;
+const FRAME_TYPE_RST_STREAM: u8 = 0x3;
+
+/// What woke the poll loop while it was waiting for the next frame.
+enum Wake {
+    /// A record is buffered; read the frame.
+    Readable,
+    /// A command or timer fired; loop to re-evaluate (`refresh_wanted`).
+    Other,
+}
+
+/// Re-poll controller for one poll connection: decides when to fetch a fresh
+/// full netmap on a new stream of the same HTTP/2 connection, and tracks that
+/// one request until it finishes.
+///
+/// Why a second stream rather than a reconnect: a reconnect re-runs TCP,
+/// Noise, register and two maps (the heavy phase ALLOCATIONS.md flags for the
+/// fragmented heap), and control marks the node offline in between. A request
+/// on the open connection costs one map and no handshake.
+///
+/// Head-of-line/window design: the re-poll's response is 30-48 KB behind a
+/// 4096-byte stream window, so it arrives as 8-12 DATA frames, each released
+/// by our per-stream WINDOW_UPDATE (`H2State` keeps one credit counter per
+/// stream). The frame loop handles every frame the moment it is read,
+/// whichever stream it belongs to, so long-poll keepalives interleave with the
+/// re-poll's frames instead of queueing behind it, and the per-frame idle
+/// watchdog keeps running. Only one re-poll is ever in flight.
+pub(crate) struct PollCtl<'a> {
+    cmds: &'a async_channel::Receiver<ControlCmd>,
+    node_key_hex: &'a str,
+    publish: &'a PublishCtx,
+    interval: Option<core::time::Duration>,
+    /// Rate limit and response deadline; fields (not constants) so tests can
+    /// shrink them to milliseconds.
+    min_gap: core::time::Duration,
+    response_deadline: core::time::Duration,
+    /// Next odd client stream ID (the poll is 7, so re-polls start at 9).
+    next_stream_id: u32,
+    /// When the last re-poll was sent, or when the connection came up (its
+    /// bring-up just delivered a full map). Both the timer and the rate limit
+    /// count from here.
+    last_refresh: tokio::time::Instant,
+    /// `(stream id, when sent)` of the re-poll awaiting its response.
+    inflight: Option<(u32, tokio::time::Instant)>,
+    /// A `ControlCmd::Refresh` arrived and has not been served yet. It is
+    /// served as soon as the rate limit allows rather than dropped, so a miss
+    /// shortly after boot still leads to a refresh.
+    cmd_pending: bool,
+    /// A `Shutdown` arrived (or the command channel closed).
+    pub(crate) shutdown: bool,
+}
+
+impl<'a> PollCtl<'a> {
+    pub(crate) fn new(cmds: &'a async_channel::Receiver<ControlCmd>, node_key_hex: &'a str,
+                      publish: &'a PublishCtx, interval: Option<core::time::Duration>) -> Self {
+        Self {
+            cmds, node_key_hex, publish, interval,
+            min_gap: MIN_REFRESH_GAP, response_deadline: REFRESH_RESPONSE_DEADLINE,
+            next_stream_id: MAP_STREAM_ID + 2,
+            last_refresh: tokio::time::Instant::now(),
+            inflight: None, cmd_pending: false, shutdown: false,
+        }
+    }
+
+    fn is_refresh_stream(&self, id: u32) -> bool {
+        matches!(self.inflight, Some((i, _)) if i == id)
+    }
+
+    /// The earliest instant a time-based decision is due.
+    fn next_timer(&self) -> Option<tokio::time::Instant> {
+        match self.inflight {
+            Some((_, sent)) => Some(sent + self.response_deadline),
+            None => {
+                let periodic = self.interval.map(|i| self.last_refresh + i);
+                let on_cmd = self.cmd_pending.then(|| self.last_refresh + self.min_gap);
+                match (periodic, on_cmd) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                }
+            }
+        }
+    }
+
+    /// Abandon an overdue in-flight re-poll, then say whether a new one should
+    /// be sent now.
+    fn refresh_wanted(&mut self, now: tokio::time::Instant, h2: &mut H2State) -> bool {
+        if let Some((id, sent)) = self.inflight {
+            if now >= sent + self.response_deadline {
+                tracing::warn!("Tailscale re-poll on stream {} got no complete response in {:?}; abandoning it", id, self.response_deadline);
+                self.inflight = None;
+                h2.stream_done(id);
+            }
+        }
+        if self.inflight.is_some() { return false; }
+        let gap_ok = now >= self.last_refresh + self.min_gap;
+        let periodic = self.interval.is_some_and(|i| now >= self.last_refresh + i);
+        (self.cmd_pending && gap_ok) || periodic
+    }
+
+    /// `true` if `id` was the in-flight re-poll (now finished).
+    fn finish_refresh(&mut self, id: u32, h2: &mut H2State) -> bool {
+        match self.inflight {
+            Some((i, _)) if i == id => { self.inflight = None; h2.stream_done(id); true }
+            _ => false,
+        }
+    }
+
+    /// Wait for the next record, a command, a timer, or the idle deadline.
+    /// `biased`: a record that is already readable always wins, so timers and
+    /// commands are looked at only while the stream is quiet (and
+    /// `refresh_wanted` covers a busy stream at the top of every frame).
+    #[inline(never)]
+    async fn wait<S: embedded_io_async::Read + embedded_io_async::Write>(
+        &mut self, noise: &mut NoiseChannel, stream: &mut S,
+        idle_at: Option<tokio::time::Instant>,
+    ) -> Result<Wake, ControlError> {
+        let timer_at = self.next_timer();
+        tokio::select! {
+            biased;
+            r = noise.wait_readable(stream) => { r?; Ok(Wake::Readable) }
+            cmd = self.cmds.recv() => {
+                match cmd {
+                    Ok(ControlCmd::Refresh) => self.cmd_pending = true,
+                    Ok(ControlCmd::Shutdown) | Err(_) => self.shutdown = true,
+                    // Start/Reauth have nothing to do on a live poll; they used
+                    // to sit unread in the queue, now they are consumed.
+                    Ok(_) => {}
+                }
+                Ok(Wake::Other)
+            }
+            _ = sleep_until_opt(timer_at) => Ok(Wake::Other),
+            _ = sleep_until_opt(idle_at) => Err(ControlError::PollIdle),
+        }
+    }
+}
+
+async fn sleep_until_opt(t: Option<tokio::time::Instant>) {
+    match t {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => core::future::pending::<()>().await,
     }
 }
 
@@ -1216,10 +1521,10 @@ async fn read_one_h2_body<S: embedded_io_async::Read + embedded_io_async::Write>
                 // and hung here. Same accounting stream_map_response already
                 // does. Stream-level update must target `expected_stream`
                 // (this drains stream 1 for register, 3 for the publish).
-                let (cwu, swu) = h2.consumed(payload.len() as u32);
+                let (cwu, swu) = h2.consumed(expected_stream, payload.len() as u32);
                 if cwu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,0,cwu); noise.write_all(stream,&b).await?; debug!("read_one_h2_body[{}]: sent conn WINDOW_UPDATE +{}", expected_stream, cwu); }
                 if swu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,expected_stream,swu); noise.write_all(stream,&b).await?; debug!("read_one_h2_body[{}]: sent stream WINDOW_UPDATE +{}", expected_stream, swu); }
-                if end_stream { info!("read_one_h2_body[{}]: END_STREAM, total {} B", expected_stream, body.len()); return Ok(body); }
+                if end_stream { info!("read_one_h2_body[{}]: END_STREAM, total {} B", expected_stream, body.len()); h2.stream_done(expected_stream); return Ok(body); }
             }
             FrameAction::SendSettingsAck => { debug!("read_one_h2_body[{}]: SETTINGS -> ack", expected_stream); let mut a=[0u8;9]; write_settings_ack(&mut a); noise.write_all(stream,&a).await?; }
             FrameAction::SendPingAck(p) => { debug!("read_one_h2_body[{}]: PING -> ack", expected_stream); let mut a=[0u8;17]; write_ping_ack(&mut a,&p); noise.write_all(stream,&a).await?; }
@@ -1354,6 +1659,7 @@ mod tests {
             control_port: addr.port(),
             control_pin: [0u8; 32],
             connect_timeout: Some(Duration::from_millis(50)),
+            refresh_interval: None,
             lan_udp_port: None,
             hostname: "esp32c3",
             os_version: heapless::String::new(),
@@ -1385,6 +1691,7 @@ mod tests {
             control_port: addr.port(),
             control_pin: [0u8; 32],
             connect_timeout: None,
+            refresh_interval: None,
             lan_udp_port: None,
             hostname: "esp32c3",
             os_version: heapless::String::new(),
@@ -1405,7 +1712,7 @@ mod tests {
     fn cfg(services: &'static [Service]) -> Config {
         Config {
             control_host: "localhost", control_port: 80, control_pin: [0u8; 32],
-            connect_timeout: None, lan_udp_port: None, hostname: "esp32c3",
+            connect_timeout: None, refresh_interval: None, lan_udp_port: None, hostname: "esp32c3",
             os_version: heapless::String::new(), services,
         }
     }
@@ -1620,7 +1927,7 @@ mod tests {
         let r = tokio::time::timeout(
             Duration::from_secs(5),
             actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_STREAM_ID, true,
-                                      Some(Duration::from_millis(80))),
+                                      Some(Duration::from_millis(80)), None),
         ).await.expect("the watchdog must fire, not hang");
         assert!(matches!(r, Err(ControlError::PollIdle)), "got {:?}", r.map(|_| ()));
         assert!(t0.elapsed() >= Duration::from_millis(80));
@@ -1645,7 +1952,7 @@ mod tests {
         };
         let t0 = std::time::Instant::now();
         let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_STREAM_ID, true,
-                                             Some(Duration::from_millis(100)));
+                                             Some(Duration::from_millis(100)), None);
         let r = tokio::select! {
             r = poll => r,
             _ = feeder => unreachable!(),
@@ -1666,8 +1973,244 @@ mod tests {
         let mut h2 = H2State::new();
         let r = tokio::time::timeout(
             Duration::from_millis(200),
-            actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_PUBLISH_STREAM_ID, true, None),
+            actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_PUBLISH_STREAM_ID, true, None, None),
         ).await;
         assert!(r.is_err(), "no watchdog: the read must still be pending");
+    }
+
+    // ── Re-poll on the open poll connection ───────────────────────────────────
+
+    impl MockServer {
+        /// Next client frame: (type, flags, stream, body).
+        async fn read_frame(&mut self) -> (u8, u8, u32, Vec<u8>) {
+            let mut h = [0u8; 9];
+            self.noise.read_exact(&mut self.io, &mut h).await.unwrap();
+            let len = u32::from_be_bytes([0, h[0], h[1], h[2]]) as usize;
+            let mut body = vec![0u8; len];
+            self.noise.read_exact(&mut self.io, &mut body).await.unwrap();
+            (h[3], h[4], u32::from_be_bytes([h[5] & 0x7f, h[6], h[7], h[8]]), body)
+        }
+
+        /// Read client frames until the request on `stream` arrives (HEADERS
+        /// then DATA); returns the parsed JSON body. WINDOW_UPDATEs and other
+        /// frames on the way are skipped.
+        async fn read_request(&mut self, stream: u32) -> serde_json::Value {
+            let mut saw_headers = false;
+            loop {
+                let (ty, _flags, sid, body) = self.read_frame().await;
+                if sid != stream { continue; }
+                match ty {
+                    1 => saw_headers = true,
+                    0 => {
+                        assert!(saw_headers, "request body before its HEADERS");
+                        return serde_json::from_slice(&body).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    const PEER_A: &str = r#"{"Key":"nodekey:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20","DiscoKey":"discokey:2021222324252627282920212223242526272829202122232425262728293031","Addresses":["100.64.0.2/32"],"DERP":"127.3.3.40:7","Online":true,"Hostinfo":{"Hostname":"peer-a"}}"#;
+    const PEER_B: &str = r#"{"Key":"nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","DiscoKey":"discokey:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","Addresses":["100.64.0.3/32"],"DERP":"127.3.3.40:2","Online":true,"Hostinfo":{"Hostname":"peer-b"}}"#;
+
+    fn map_json(peers: &[&str]) -> String {
+        format!(r#"{{"Node":{{"Addresses":["100.64.0.1/32"]}},"Peers":[{}]}}"#, peers.join(","))
+    }
+
+    struct PollRig {
+        cn: NoiseChannel, cio: MockStream, server: MockServer,
+        ev_tx: async_channel::Sender<ControlEvent>, ev_rx: async_channel::Receiver<ControlEvent>,
+        cmd_tx: async_channel::Sender<ControlCmd>, cmd_rx: async_channel::Receiver<ControlCmd>,
+        actor: ControlActor, publish: PublishCtx,
+    }
+
+    impl PollRig {
+        fn new() -> Self {
+            let (cn, cio, server) = MockServer::pair();
+            let (ev_tx, ev_rx) = async_channel::bounded(8);
+            let (cmd_tx, cmd_rx) = async_channel::bounded(8);
+            Self { cn, cio, server, ev_tx, ev_rx, cmd_tx, cmd_rx, actor: actor_for_tests(),
+                   publish: PublishCtx { region: Some(7), lan: None } }
+        }
+    }
+
+    /// The timer sends a re-poll on stream 9 with the publish #2 body and
+    /// `OmitPeers=false`; a response split across frames, with long-poll
+    /// keepalives interleaved between them, is parsed into a MapUpdate; the
+    /// next re-poll goes out on stream 11 and its different response changes
+    /// the emitted MapUpdate; Shutdown then ends the poll cleanly.
+    #[tokio::test]
+    async fn timer_repoll_emits_each_new_map_and_interleaves_with_the_long_poll() {
+        let PollRig { mut cn, mut cio, mut server, ev_tx, ev_rx, cmd_tx, cmd_rx, actor, publish } = PollRig::new();
+        let mut h2 = H2State::new();
+        let mut ctl = PollCtl::new(&cmd_rx, NODE_HEX, &publish, Some(Duration::from_millis(40)));
+        ctl.min_gap = Duration::from_millis(10);
+        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_STREAM_ID, true,
+                                             Some(Duration::from_secs(5)), Some(&mut ctl));
+        let script = async {
+            let req = server.read_request(9).await;
+            // `false` fields are omitted from the JSON.
+            assert!(req.get("OmitPeers").is_none_or(|v| v == false), "a re-poll must ask for peers");
+            assert!(req.get("Stream").is_none_or(|v| v == false), "a re-poll is not streaming");
+            assert!(req["DiscoKey"].as_str().unwrap().starts_with("discokey:"), "a re-poll is a write: it must repeat the DiscoKey");
+            assert!(req["Endpoints"].as_array().is_some_and(|e| !e.is_empty()), "and the published DERP-home endpoint");
+            // Response in two DATA frames with a long-poll keepalive between.
+            let json = map_json(&[PEER_A]);
+            let mut msg = (json.len() as u32).to_le_bytes().to_vec();
+            msg.extend_from_slice(json.as_bytes());
+            let (a, b) = msg.split_at(msg.len() / 2);
+            server.frame(0, 0, 9, a).await;
+            server.map_msg(MAP_STREAM_ID, r#"{"KeepAlive":true}"#, false).await;
+            server.frame(0, 1, 9, b).await;
+            let ev = ev_rx.recv().await.unwrap();
+            match ev {
+                ControlEvent::MapUpdate(m) => {
+                    assert_eq!(m.peers.len(), 1);
+                    assert_eq!(m.peers[0].hostname.as_str(), "peer-a");
+                }
+                _ => panic!("expected MapUpdate"),
+            }
+            // Second re-poll: a new stream, and a different map.
+            let _ = server.read_request(11).await;
+            server.map_msg(11, &map_json(&[PEER_A, PEER_B]), true).await;
+            match ev_rx.recv().await.unwrap() {
+                ControlEvent::MapUpdate(m) => assert_eq!(m.peers.len(), 2, "the second MapResponse must change the update"),
+                _ => panic!("expected MapUpdate"),
+            }
+            cmd_tx.send(ControlCmd::Shutdown).await.unwrap();
+        };
+        let (r, ()) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(poll, script) })
+            .await.expect("poll hung");
+        assert!(r.is_ok(), "{:?}", r.map(|_| ()));
+        assert!(ctl.shutdown);
+    }
+
+    /// A Refresh command inside the gap is deferred, not dropped, and two of
+    /// them collapse into one re-poll sent only after the gap.
+    #[tokio::test]
+    async fn refresh_command_is_rate_limited_and_collapsed() {
+        let PollRig { mut cn, mut cio, mut server, ev_tx, ev_rx: _ev_rx, cmd_tx, cmd_rx, actor, publish } = PollRig::new();
+        let mut h2 = H2State::new();
+        let mut ctl = PollCtl::new(&cmd_rx, NODE_HEX, &publish, None);
+        ctl.min_gap = Duration::from_millis(150);
+        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_STREAM_ID, true,
+                                             Some(Duration::from_secs(5)), Some(&mut ctl));
+        let script = async {
+            let t0 = std::time::Instant::now();
+            cmd_tx.send(ControlCmd::Refresh).await.unwrap();
+            cmd_tx.send(ControlCmd::Refresh).await.unwrap();
+            let _ = server.read_request(9).await;
+            assert!(t0.elapsed() >= Duration::from_millis(140), "sent {:?} after the command; the gap was ignored", t0.elapsed());
+            server.map_msg(9, &map_json(&[PEER_A]), true).await;
+            // Both commands were consumed by the first re-poll: no second one.
+            let none = tokio::time::timeout(Duration::from_millis(400), server.read_request(11)).await;
+            assert!(none.is_err(), "two Refresh commands must collapse into one re-poll");
+            cmd_tx.send(ControlCmd::Shutdown).await.unwrap();
+        };
+        let (r, ()) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(poll, script) })
+            .await.expect("poll hung");
+        assert!(r.is_ok());
+    }
+
+    /// A re-poll whose response never completes is abandoned after the
+    /// deadline, and a stray late frame from it is skipped without breaking the
+    /// next one.
+    #[tokio::test]
+    async fn stuck_repoll_is_abandoned_and_the_next_one_works() {
+        let PollRig { mut cn, mut cio, mut server, ev_tx, ev_rx, cmd_tx, cmd_rx, actor, publish } = PollRig::new();
+        let mut h2 = H2State::new();
+        let mut ctl = PollCtl::new(&cmd_rx, NODE_HEX, &publish, Some(Duration::from_millis(30)));
+        ctl.min_gap = Duration::from_millis(10);
+        ctl.response_deadline = Duration::from_millis(80);
+        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_STREAM_ID, true,
+                                             Some(Duration::from_secs(5)), Some(&mut ctl));
+        let script = async {
+            let _ = server.read_request(9).await;
+            // Half a message, then silence on stream 9.
+            server.frame(0, 0, 9, &[200, 0, 0, 0, b'{']).await;
+            let _ = server.read_request(11).await;
+            // The abandoned stream's late tail must be ignored.
+            server.frame(0, 1, 9, b"garbage").await;
+            server.map_msg(11, &map_json(&[PEER_B]), true).await;
+            match ev_rx.recv().await.unwrap() {
+                ControlEvent::MapUpdate(m) => {
+                    assert_eq!(m.peers.len(), 1);
+                    assert_eq!(m.peers[0].hostname.as_str(), "peer-b");
+                }
+                _ => panic!("expected MapUpdate"),
+            }
+            cmd_tx.send(ControlCmd::Shutdown).await.unwrap();
+        };
+        let (r, ()) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(poll, script) })
+            .await.expect("poll hung");
+        assert!(r.is_ok());
+    }
+
+    /// An error answer to the re-poll (HEADERS+END_STREAM, no body) frees the
+    /// slot at once instead of holding it until the deadline.
+    #[tokio::test]
+    async fn repoll_rejected_without_body_frees_the_slot() {
+        let PollRig { mut cn, mut cio, mut server, ev_tx, ev_rx: _ev_rx, cmd_tx, cmd_rx, actor, publish } = PollRig::new();
+        let mut h2 = H2State::new();
+        let mut ctl = PollCtl::new(&cmd_rx, NODE_HEX, &publish, Some(Duration::from_millis(30)));
+        ctl.min_gap = Duration::from_millis(10);
+        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_STREAM_ID, true,
+                                             Some(Duration::from_secs(5)), Some(&mut ctl));
+        let script = async {
+            let _ = server.read_request(9).await;
+            server.frame(1, 0x5, 9, &[0x88]).await; // HEADERS, END_STREAM|END_HEADERS
+            // Well inside the 60 s default deadline: only the early free can explain this.
+            let _ = server.read_request(11).await;
+            cmd_tx.send(ControlCmd::Shutdown).await.unwrap();
+        };
+        let (r, ()) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(poll, script) })
+            .await.expect("poll hung");
+        assert!(r.is_ok());
+    }
+
+    /// With the timer off and no command, the long poll just waits (and the
+    /// watchdog still applies) rather than re-polling.
+    #[tokio::test]
+    async fn no_timer_no_repoll_but_watchdog_still_applies() {
+        let PollRig { mut cn, mut cio, mut server, ev_tx, ev_rx: _ev_rx, cmd_tx: _cmd_tx, cmd_rx, actor, publish } = PollRig::new();
+        let mut h2 = H2State::new();
+        let mut ctl = PollCtl::new(&cmd_rx, NODE_HEX, &publish, None);
+        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_STREAM_ID, true,
+                                             Some(Duration::from_millis(150)), Some(&mut ctl));
+        let script = async {
+            let quiet = tokio::time::timeout(Duration::from_millis(100), server.read_frame()).await;
+            assert!(quiet.is_err(), "nothing may be sent without a trigger");
+            std::future::pending::<()>().await
+        };
+        let r = tokio::select! { r = poll => r, _ = script => unreachable!() };
+        assert!(matches!(r, Err(ControlError::PollIdle)));
+    }
+
+    /// A timer or command wake-up while a record is half-received must not
+    /// lose Noise framing (the cancel-safe wait is what the poll loop relies on).
+    #[tokio::test]
+    async fn wait_readable_survives_cancellation_mid_record() {
+        let (mut cn, mut sn) = NoiseChannel::test_pair();
+        let plain: Vec<u8> = (0..200u8).collect();
+        // Capture the wire bytes of one record.
+        let (w, r) = tokio::io::duplex(4096);
+        let mut wio = MockStream::new(w);
+        sn.write_all(&mut wio, &plain).await.unwrap();
+        drop(wio);
+        let mut wire = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut { r }, &mut wire).await.unwrap();
+        // Feed it in small slices, cancelling wait_readable after each one.
+        let (mut tx, rx) = tokio::io::duplex(4096);
+        let mut crx = MockStream::new(rx);
+        for chunk in wire.chunks(7) {
+            tokio::io::AsyncWriteExt::write_all(&mut tx, chunk).await.unwrap();
+            // Completes on the last slice, is cancelled mid-record before it.
+            let _ = tokio::time::timeout(Duration::from_millis(5), cn.wait_readable(&mut crx)).await;
+        }
+        cn.wait_readable(&mut crx).await.unwrap();
+        let mut got = vec![0u8; plain.len()];
+        cn.read_exact(&mut crx, &mut got).await.unwrap();
+        assert_eq!(got, plain);
     }
 }

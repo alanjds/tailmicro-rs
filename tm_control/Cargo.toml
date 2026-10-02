@@ -26,7 +26,7 @@ serde_json = { workspace = true, features = ["std"] }
 actson = "2.1.0"
 snow      = { workspace = true, features = ["risky-raw-split"] }
 chacha20poly1305 = { workspace = true }
-tokio     = { workspace = true, features = ["sync", "io-util", "net", "time"] }
+tokio     = { workspace = true, features = ["sync", "io-util", "net", "time", "macros"] }
 async-channel = { workspace = true }
 embedded-io-async = { workspace = true }
 embedded-io-adapters = { workspace = true }

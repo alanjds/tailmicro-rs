@@ -215,6 +215,13 @@ pub struct NoiseChannel {
     /// How many decrypted bytes are available in read_buf, starting at read_pos.
     read_avail: usize,
     read_pos:   usize,
+    /// Progress of the record currently being read off the wire, kept in the
+    /// struct (not in `fill_read_buf`'s future) so that future can be dropped
+    /// at any await and resumed by the next call without losing a byte. See
+    /// `wait_readable`.
+    rec_hdr:       [u8; FRAME_HEADER_LEN],
+    rec_hdr_have:  usize,
+    rec_body_have: usize,
 }
 
 impl NoiseChannel {
@@ -234,6 +241,7 @@ impl NoiseChannel {
             read_buf:   Box::new([0u8; 4114]),
             read_avail: 0,
             read_pos:   0,
+            rec_hdr: [0; FRAME_HEADER_LEN], rec_hdr_have: 0, rec_body_have: 0,
         };
         (mk(&k1, &k2), mk(&k2, &k1))
     }
@@ -308,21 +316,70 @@ impl NoiseChannel {
         Ok(())
     }
 
+    /// Decrypted bytes buffered and ready for `read_exact` without touching
+    /// the stream.
+    pub fn buffered(&self) -> usize {
+        self.read_avail
+    }
+
+    /// Wait until at least one decrypted byte is buffered. Unlike
+    /// `read_exact`, this is cancel-safe: the future may be dropped at any
+    /// await (typically by a `select!` against a timer or a command) and a
+    /// later call resumes mid-record, because the only awaits are plain
+    /// `stream.read` calls and all progress is stored in `self`. That lets
+    /// the poll loop react to a timer without a read in progress and without
+    /// losing framing.
+    pub async fn wait_readable<S: Read + Write>(
+        &mut self,
+        stream: &mut S,
+    ) -> Result<(), ControlError> {
+        if self.read_avail == 0 {
+            self.fill_read_buf(stream).await?;
+        }
+        Ok(())
+    }
+
+    /// One cancel-safe `stream.read`; EOF is an error (a record is never
+    /// legitimately cut short).
+    async fn read_some<S: Read + Write>(stream: &mut S, buf: &mut [u8]) -> Result<usize, ControlError> {
+        match stream.read(buf).await {
+            Ok(0) => {
+                tracing::error!("read failed: unexpected EOF (wanted up to {} bytes)", buf.len());
+                Err(ControlError::Io)
+            }
+            Ok(n) => Ok(n),
+            Err(e) => {
+                tracing::error!("read failed: {:?} (wanted up to {} bytes)", e, buf.len());
+                Err(ControlError::Io)
+            }
+        }
+    }
+
+    /// Read one whole record into `read_buf` and decrypt it. Resumable (see
+    /// `wait_readable`).
     async fn fill_read_buf<S: Read + Write>(
         &mut self,
         stream: &mut S,
     ) -> Result<(), ControlError> {
-        // Read the 3-byte frame header (type + big-endian length).
-        let mut hdr = [0u8; FRAME_HEADER_LEN];
-        crate::io::read_exact(stream, &mut hdr).await?;
-        let msg_type = hdr[0];
-        let ciphertext_len = u16::from_be_bytes([hdr[1], hdr[2]]) as usize;
+        // Record header: type + big-endian ciphertext length.
+        while self.rec_hdr_have < FRAME_HEADER_LEN {
+            let n = Self::read_some(stream, &mut self.rec_hdr[self.rec_hdr_have..]).await?;
+            self.rec_hdr_have += n;
+        }
+        let msg_type = self.rec_hdr[0];
+        let ciphertext_len = u16::from_be_bytes([self.rec_hdr[1], self.rec_hdr[2]]) as usize;
 
         if ciphertext_len > self.read_buf.len() || ciphertext_len < TAG_LEN {
+            self.rec_hdr_have = 0;
             return Err(ControlError::Noise(NoiseError::Decrypt));
         }
 
-        crate::io::read_exact(stream, &mut self.read_buf[..ciphertext_len]).await?;
+        while self.rec_body_have < ciphertext_len {
+            let n = Self::read_some(stream, &mut self.read_buf[self.rec_body_have..ciphertext_len]).await?;
+            self.rec_body_have += n;
+        }
+        self.rec_hdr_have = 0;
+        self.rec_body_have = 0;
 
         match msg_type {
             MSG_TYPE_RECORD => {
@@ -582,6 +639,7 @@ fn be_nonce(counter: u64) -> [u8; 12] {
         read_buf:   Box::new([0u8; 4114]),
         read_avail: 0,
         read_pos:   0,
+        rec_hdr: [0; FRAME_HEADER_LEN], rec_hdr_have: 0, rec_body_have: 0,
     };
 
     // The server may send an optional post-handshake "challenge packet" as
