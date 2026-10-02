@@ -8,7 +8,7 @@
 //!   * `ts_packet::PacketMut` → `super::packet::Packet`.
 //!   * `TransmitSession::new` takes an `is_initiator` flag.
 
-use std::time::Instant;
+use tm_time::Instant;
 
 use aead::AeadInPlace;
 use blake2::{Blake2s256, Digest};

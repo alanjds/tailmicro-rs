@@ -8,10 +8,9 @@
 //! `PacketMut` is replaced with `super::packet::Packet`.
 
 use core::fmt::{Debug, Formatter};
-use std::{
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use std::{sync::Mutex, time::Duration};
+
+use tm_time::Instant;
 
 use aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit};

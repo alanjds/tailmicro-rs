@@ -46,10 +46,7 @@ impl Config {
     /// Noise public key. This is the only way to produce a `Config`
     /// capable of actually connecting to the control plane.
     pub fn with_control_pin_hex(mut self, blob_hex: &str) -> Result<Self, Error> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs());
+        let now = tm_time::unix_secs();
         // pre-2023 => ESP-IDF boot clock, SNTP not done yet; skip expiry check until synced
         let now = now.filter(|&s| s > 1_700_000_000);
 

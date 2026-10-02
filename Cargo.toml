@@ -106,6 +106,7 @@ tm_runtime.workspace   = true
 tm_keys.workspace      = true
 tm_netstack.workspace  = true
 tm_control.workspace   = true
+tm_time.workspace      = true
 tracing.workspace      = true
 heapless.workspace     = true
 

@@ -7,9 +7,11 @@ description = "Shared fixed-capacity packet buffer for tailmicro's cross-actor c
 [features]
 # Per-hop round-trip latency stamps (src/lat.rs). Off by default; diagnostic
 # builds only. Enabled through `tm_runtime/latency-trace`.
-latency-trace = []
+latency-trace = ["dep:tm_time"]
 
 [dependencies]
+# Only for the latency-trace stamps (src/lat.rs).
+tm_time = { workspace = true, optional = true }
 heapless = { workspace = true }
 async-channel = { workspace = true }
 futures-core = { workspace = true }

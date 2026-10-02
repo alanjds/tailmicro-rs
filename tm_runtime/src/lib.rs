@@ -68,26 +68,26 @@ const ROUTER_BUSY_LIMIT: std::time::Duration = std::time::Duration::from_millis(
 /// between calls (a longer gap means it was waiting, i.e. the runtime parked).
 #[cfg(target_os = "espidf")]
 struct RouterYield {
-    last_call: std::time::Instant,
-    busy_since: std::time::Instant,
+    last_call: tm_time::Instant,
+    busy_since: tm_time::Instant,
 }
 
 #[cfg(target_os = "espidf")]
 impl RouterYield {
     fn new() -> Self {
-        let now = std::time::Instant::now();
+        let now = tm_time::Instant::now();
         Self { last_call: now, busy_since: now }
     }
 
     async fn tick(&mut self) {
-        let now = std::time::Instant::now();
+        let now = tm_time::Instant::now();
         if now.duration_since(self.last_call) > ROUTER_BUSY_LIMIT {
             self.busy_since = now;
         }
         self.last_call = now;
         if now.duration_since(self.busy_since) >= ROUTER_BUSY_LIMIT {
             freertos_yield_ticks(1).await;
-            let after = std::time::Instant::now();
+            let after = tm_time::Instant::now();
             self.busy_since = after;
             self.last_call = after;
         } else {
@@ -414,9 +414,9 @@ fn fault_tx_blocked() -> bool {
     const CYCLE: u64 = 300;
     const BLOCK_FROM: u64 = 150;
     const BLOCK_TO: u64 = 210;
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static START: std::sync::OnceLock<tm_time::Instant> = std::sync::OnceLock::new();
     static LAST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    let t = START.get_or_init(std::time::Instant::now).elapsed().as_secs() % CYCLE;
+    let t = START.get_or_init(tm_time::Instant::now).elapsed().as_secs() % CYCLE;
     let blocked = (BLOCK_FROM..BLOCK_TO).contains(&t);
     if LAST.swap(blocked, core::sync::atomic::Ordering::Relaxed) != blocked {
         warn!("lan-direct FAULT TEST: direct UDP transmits now {}", if blocked { "DROPPED" } else { "restored" });
@@ -604,8 +604,8 @@ const MISS_REFRESH_GAP: core::time::Duration = core::time::Duration::from_secs(1
 /// Returns whether a request was queued.
 #[inline(never)]
 fn request_refresh_on_miss(tx: &async_channel::Sender<ControlCmd>,
-                           last: &mut Option<std::time::Instant>,
-                           now: std::time::Instant) -> bool {
+                           last: &mut Option<tm_time::Instant>,
+                           now: tm_time::Instant) -> bool {
     if last.is_some_and(|t| now.saturating_duration_since(t) < MISS_REFRESH_GAP) {
         return false;
     }
@@ -885,7 +885,7 @@ async fn event_router_task(
     let mut last_unknown_dst: Option<[u8; 4]> = None;
     // Peers of the previous snapshot, to diff the next one against.
     let mut known_peers: heapless::Vec<PeerSnap, 8> = heapless::Vec::new();
-    let mut last_miss_refresh: Option<std::time::Instant> = None;
+    let mut last_miss_refresh: Option<tm_time::Instant> = None;
     // Belt-and-suspenders for the DERP reconnect fix (2026-09): DerpActor now
     // redials its own last target with backoff on a connection error, but
     // keeping the last-known-good target here too costs nothing and gives a
@@ -1314,7 +1314,7 @@ async fn event_router_task(
                             ry.tick().await;
                         } else {
                             log_unknown_netif_dest(dst_ip, &mut last_unknown_dst);
-                            request_refresh_on_miss(&ctrl_tx3, &mut last_miss_refresh, std::time::Instant::now());
+                            request_refresh_on_miss(&ctrl_tx3, &mut last_miss_refresh, tm_time::Instant::now());
                         }
                     }
                     Err(_) => {
@@ -1668,7 +1668,7 @@ mod tests {
     #[test]
     fn miss_refresh_is_rate_limited_and_never_blocks() {
         let (tx, rx) = async_channel::bounded::<ControlCmd>(1);
-        let t0 = std::time::Instant::now();
+        let t0 = tm_time::Instant::now();
         let mut last = None;
         assert!(request_refresh_on_miss(&tx, &mut last, t0));
         assert!(matches!(rx.try_recv(), Ok(ControlCmd::Refresh)));

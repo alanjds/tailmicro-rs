@@ -27,7 +27,8 @@ use vendor::keys::{NodeKeyPair, NodePrivateKey, NodePublicKey};
 use vendor::packet::Packet;
 
 use std::net::SocketAddrV4;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use tm_time::Instant;
 
 /// Actor tick period. Mirrors MicroLink's `wireguardif_periodic()` ~400ms
 /// discipline; drives handshake retry, rekey, and keepalive off the latency
@@ -511,11 +512,7 @@ fn pkt_to_buf(pkt: &Packet) -> tm_buf::PktBuf {
 /// (> 1_700_000_000 == pre-SNTP boot clock filtered out), matching the
 /// control-key-pinning discipline in `src/config.rs`.
 fn now_unix() -> Option<u64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs())
-        .filter(|&s| s > 1_700_000_000)
+    tm_time::unix_secs().filter(|&s| s > 1_700_000_000)
 }
 
 fn endpoint_for(peer: &PeerInfo) -> Endpoint {

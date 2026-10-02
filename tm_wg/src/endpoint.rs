@@ -17,7 +17,7 @@
 
 use core::net::{SocketAddr, SocketAddrV4};
 use core::time::Duration;
-use std::time::Instant;
+use tm_time::Instant;
 
 use arrayvec::ArrayVec;
 use zerocopy::{IntoBytes, TryFromBytes};

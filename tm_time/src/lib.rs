@@ -37,6 +37,12 @@ impl Instant {
         Duration::from_micros(self.0.saturating_sub(earlier.0))
     }
 
+    /// Same as [`duration_since`](Self::duration_since); the std spelling,
+    /// kept so code ported from `std::time::Instant` needs no change.
+    pub fn saturating_duration_since(self, earlier: Self) -> Duration {
+        self.duration_since(earlier)
+    }
+
     /// Time since `self`, per the installed clock.
     pub fn elapsed(self) -> Duration {
         Instant::now().duration_since(self)

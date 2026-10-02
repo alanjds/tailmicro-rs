@@ -61,13 +61,10 @@ const N: usize = Hop::UdpTxPong as usize + 1;
 mod imp {
     use super::N;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::OnceLock;
-    use std::time::Instant;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const Z: AtomicU32 = AtomicU32::new(0);
     pub static STAMPS: [AtomicU32; N] = [Z; N];
-    static BASE: OnceLock<Instant> = OnceLock::new();
 
     /// Router loop accounting: iterations, and total / max microseconds the
     /// executor spent blocked in the FreeRTOS yield. No 64-bit atomics on
@@ -78,7 +75,7 @@ mod imp {
 
     pub fn now_us() -> u32 {
         // Wraps after ~71 minutes; only differences are ever used.
-        BASE.get_or_init(Instant::now).elapsed().as_micros() as u32
+        tm_time::Instant::now().as_micros() as u32
     }
 
     pub fn store(i: usize) {

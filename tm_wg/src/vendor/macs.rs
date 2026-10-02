@@ -1,10 +1,9 @@
 //! WireGuard MAC1/MAC2 (cookie) machinery. Vendored from ts_tunnel; only the
 //! import paths changed (`ts_keys` → `super::keys`, `crate::` → `super::`).
 
-use std::{
-    ops::Add,
-    time::{Duration, Instant},
-};
+use std::{ops::Add, time::Duration};
+
+use tm_time::Instant;
 
 use aead::{Aead, Payload, consts::U16};
 use blake2::{Blake2s256, Blake2sMac, Digest, digest::FixedOutput};

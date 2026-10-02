@@ -12,7 +12,7 @@
 //!
 //! Run: `cargo run -p tm_wg --example wg_emit_vectors`
 
-use std::time::Instant;
+use tm_time::Instant;
 
 use tm_wg::vendor::config::Psk;
 use tm_wg::vendor::handshake::{ReceivedHandshake, initiate_handshake_with_ephemeral};

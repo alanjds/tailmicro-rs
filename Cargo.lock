@@ -1652,6 +1652,7 @@ dependencies = [
  "tm_keys",
  "tm_netstack",
  "tm_runtime",
+ "tm_time",
  "tokio",
  "tracing",
 ]
@@ -1726,6 +1727,7 @@ dependencies = [
  "critical-section",
  "futures-core",
  "heapless",
+ "tm_time",
 ]
 
 [[package]]
@@ -1834,6 +1836,7 @@ dependencies = [
  "tm_disco",
  "tm_keys",
  "tm_netstack",
+ "tm_time",
  "tm_wg",
  "tokio",
  "tracing",
@@ -1859,6 +1862,7 @@ dependencies = [
  "tm_buf",
  "tm_control",
  "tm_keys",
+ "tm_time",
  "tokio",
  "tracing",
  "x25519-dalek",
