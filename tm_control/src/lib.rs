@@ -189,6 +189,17 @@ const MAP_PUBLISH_STREAM_ID: u32 = 3;
 /// write again with endpoints). Its own odd, incrementing HTTP/2 stream id.
 const MAP_REPUBLISH_STREAM_ID: u32 = 5;
 const MAP_STREAM_ID: u32 = 7;
+/// Read watchdog on the streaming poll: if no frame of any kind arrives for
+/// this long, the connection is treated as dead and re-established.
+///
+/// The server sends a keepalive MapResponse about every 50-59 s (headscale:
+/// 50 s plus jitter; Tailscale control similar), so a healthy stream is never
+/// silent for more than a minute. 90 s is that interval plus ~50% margin: a
+/// single late keepalive does not cause a reconnect, while a half-open TCP
+/// connection (AP dropped us, NAT mapping expired) is noticed within a
+/// minute and a half instead of never. Without it the poll could sit on a
+/// dead stream forever, and control would learn nothing about the tailnet.
+const POLL_IDLE_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(90);
 /// Upper bound on a single length-prefixed MapResponse message. The real
 /// non-streaming netmap for this device is tens of KB; a value larger than
 /// this means the stream is desynced (seen live: a ~1.95 GB garbage prefix on
@@ -210,9 +221,10 @@ pub struct Config {
     /// Deadline for the bring-up phase only (TCP + Noise + register + the
     /// non-streaming publish MapRequest, i.e. everything up to and including
     /// `OurIpAssigned`). `None` disables the deadline. The streaming poll
-    /// that follows bring-up NEVER gets a deadline — it must run unbounded
-    /// (drain-and-discard, see `stream_map_response`) so the ephemeral node
-    /// stays online. See docs/wg-dataplane-notes.md "Bring-up timeout".
+    /// that follows bring-up gets no overall deadline — it must run
+    /// unbounded so the ephemeral node stays online — only the
+    /// idle-read watchdog `POLL_IDLE_TIMEOUT`. See docs/wg-dataplane-notes.md
+    /// "Bring-up timeout".
     pub connect_timeout: Option<core::time::Duration>,
     /// Port of the runtime's bound LAN UDP socket (`lan-direct` feature),
     /// or `None` when there is none. With `Some`, bring-up derives the LAN
@@ -299,8 +311,13 @@ pub enum ControlError { Tls, Noise(NoiseError), Http, H2(H2Error), Json(JsonErro
                         /// to `OurIpAssigned`) did not complete within
                         /// `Config::connect_timeout`. Never returned once bring-up
                         /// has succeeded — the streaming poll after it has no
-                        /// deadline. See `ControlActor::connect_and_poll`.
-                        Timeout }
+                        /// overall deadline (see `PollIdle` for its watchdog). See `ControlActor::connect_and_poll`.
+                        Timeout,
+                        /// The streaming poll received nothing at all (no DATA,
+                        /// PING, WINDOW_UPDATE...) for `POLL_IDLE_TIMEOUT`: the
+                        /// server's keepalives stopped, so the connection is
+                        /// presumed half-open. The poll loop reconnects.
+                        PollIdle }
 #[derive(Debug)]
 pub enum NoiseError { Handshake, Decrypt, Encrypt }
 #[derive(Debug)]
@@ -559,11 +576,20 @@ fn is_false(b: &bool) -> bool { !*b }
 pub struct ControlActor {
     config: Config,
     node_state: NodeState,
+    /// Read watchdog for the streaming poll (see `POLL_IDLE_TIMEOUT`).
+    /// Overridable so tests need not wait 90 s.
+    poll_idle_timeout: core::time::Duration,
 }
 
 impl ControlActor {
     pub fn new(config: Config, node_state: NodeState) -> Self {
-        Self { config, node_state }
+        Self { config, node_state, poll_idle_timeout: POLL_IDLE_TIMEOUT }
+    }
+
+    #[cfg(test)]
+    fn with_poll_idle_timeout(mut self, d: core::time::Duration) -> Self {
+        self.poll_idle_timeout = d;
+        self
     }
 
     pub async fn run(mut self, mut cmds: async_channel::Receiver<ControlCmd>,
@@ -600,10 +626,11 @@ impl ControlActor {
         // and including OurIpAssigned) is the ONLY phase bounded by
         // `connect_timeout`. It is wrapped in `tokio::time::timeout` below
         // when a deadline is configured. The streaming poll that follows
-        // (Step 8 & 9, further down this function) gets NO deadline: it
-        // must run unbounded (drain-and-discard, already implemented in
-        // `stream_map_response`) so the ephemeral node stays online. See
-        // docs/wg-dataplane-notes.md "Bring-up timeout".
+        // (Step 8 & 9, further down this function) gets no overall deadline:
+        // it runs unbounded so the ephemeral node stays online. It does get a
+        // read watchdog (`POLL_IDLE_TIMEOUT`): silence longer than the
+        // server's keepalive interval means a dead connection and triggers a
+        // reconnect. See docs/wg-dataplane-notes.md "Bring-up timeout".
         let connect_timeout = self.config.connect_timeout;
         let bring_up = self.bring_up(auth_key, events);
         let (mut main_conn, mut noise, mut h2, node_key_hex) = match connect_timeout {
@@ -648,7 +675,8 @@ impl ControlActor {
                 }).map_err(ControlError::Json)?;
                 let map_req = build_h2_post("/machine/map", self.config.control_host, MAP_STREAM_ID, &map_body);
                 noise.write_all(&mut main_conn, &map_req).await?;
-                self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_STREAM_ID, true).await
+                self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_STREAM_ID, true,
+                    Some(self.poll_idle_timeout)).await
             }.await;
 
             match poll_res {
@@ -793,7 +821,7 @@ impl ControlActor {
         // a raw JSON body with an END_STREAM, so stream_map_response parses it
         // and returns at end_stream, emitting MapUpdate + OurIpAssigned.
         info!("Tailscale Step 7.5: reading + parsing publish MapResponse");
-        let home_region = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_PUBLISH_STREAM_ID, true).await?;
+        let home_region = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_PUBLISH_STREAM_ID, true, None).await?;
 
         // Step 7.6 (new): re-publish with our DERP home so peers get a stable
         // relay path to us. Encoded two ways, together, per the confirmed
@@ -826,7 +854,7 @@ impl ControlActor {
             // Drain + parse the response (re-emits the authoritative netmap,
             // which is idempotent for the runtime: same IP -> netif no-op,
             // repeat DERP Connect ignored). Its own return value is unused.
-            let _ = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_REPUBLISH_STREAM_ID, false).await?;
+            let _ = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_REPUBLISH_STREAM_ID, false, None).await?;
         } else {
             tracing::warn!("Tailscale Step 7.6: no reachable DERP region in netmap; skipping home advertisement (inbound may be unreliable)");
         }
@@ -847,6 +875,7 @@ impl ControlActor {
         &self, stream: &mut S, noise: &mut NoiseChannel,
         h2: &mut H2State, events: &async_channel::Sender<ControlEvent>,
         expected_stream: u32, emit_events: bool,
+        idle_timeout: Option<core::time::Duration>,
     ) -> Result<Option<u16>, ControlError> {
         info!("Tailscale stream_map_response starting on stream {} (emit_events={})", expected_stream, emit_events);
         // Home region selected from the parsed netmap; returned to the caller.
@@ -918,7 +947,7 @@ impl ControlActor {
 
         loop {
             let mut hdr_bytes = [0u8; 9];
-            noise.read_exact(stream, &mut hdr_bytes).await?;
+            read_exact_idle(noise, stream, &mut hdr_bytes, idle_timeout).await?;
             let hdr = FrameHeader::from_bytes(&hdr_bytes);
 
             if hdr.length > MAX_FRAME_SIZE {
@@ -934,7 +963,7 @@ impl ControlActor {
             }
             // blen <= FRAME_BUF_CAP guaranteed above, so this never fails.
             let _ = frame_buf.resize(blen, 0);
-            noise.read_exact(stream, &mut frame_buf[..blen]).await?;
+            read_exact_idle(noise, stream, &mut frame_buf[..blen], idle_timeout).await?;
             debug!("Tailscale frame received: length={}, type={}", hdr.length, hdr.frame_type);
 
             match tm_h2::parse_frame(&hdr, &frame_buf[..blen], expected_stream, h2)? {
@@ -1062,6 +1091,21 @@ impl ControlActor {
                 FrameAction::Ignore => {}
             }
         }
+    }
+}
+
+/// `noise.read_exact`, bounded by `idle` when set. On expiry the read is
+/// cancelled mid-record, which leaves the Noise channel unusable; that is fine
+/// because the only caller reacts to `PollIdle` by dropping the connection.
+async fn read_exact_idle<S: embedded_io_async::Read + embedded_io_async::Write>(
+    noise: &mut NoiseChannel, stream: &mut S, out: &mut [u8],
+    idle: Option<core::time::Duration>,
+) -> Result<(), ControlError> {
+    match idle {
+        Some(d) => tokio::time::timeout(d, noise.read_exact(stream, out))
+            .await
+            .map_err(|_| ControlError::PollIdle)?,
+        None => noise.read_exact(stream, out).await,
     }
 }
 
@@ -1521,5 +1565,109 @@ mod tests {
         for bad in ["", "-a", "a-", "A", "a_b", "a.b", &"a".repeat(64)] {
             assert!(!valid_hostname(bad), "{bad}");
         }
+    }
+
+    // ── Mock control server over an in-memory Noise channel ───────────────────
+    //
+    // `NoiseChannel::test_pair` gives matching client/server channels, so the
+    // real `stream_map_response` can be driven by hand-written H2 frames with
+    // no handshake and no sockets.
+
+    type MockStream = embedded_io_adapters::tokio_1::FromTokio<tokio::io::DuplexStream>;
+
+    struct MockServer { noise: NoiseChannel, io: MockStream }
+
+    impl MockServer {
+        /// (client noise, client io, server)
+        fn pair() -> (NoiseChannel, MockStream, MockServer) {
+            let (cn, sn) = NoiseChannel::test_pair();
+            let (c, s) = tokio::io::duplex(64 * 1024);
+            (cn, MockStream::new(c), MockServer { noise: sn, io: MockStream::new(s) })
+        }
+
+        async fn frame(&mut self, ty: u8, flags: u8, stream: u32, body: &[u8]) {
+            let mut f = Vec::with_capacity(9 + body.len());
+            f.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+            f.push(ty);
+            f.push(flags);
+            f.extend_from_slice(&stream.to_be_bytes());
+            f.extend_from_slice(body);
+            self.noise.write_all(&mut self.io, &f).await.unwrap();
+        }
+
+        /// One length-prefixed MapResponse as a single DATA frame.
+        async fn map_msg(&mut self, stream: u32, json: &str, end_stream: bool) {
+            let mut body = (json.len() as u32).to_le_bytes().to_vec();
+            body.extend_from_slice(json.as_bytes());
+            self.frame(0, if end_stream { 1 } else { 0 }, stream, &body).await;
+        }
+    }
+
+    fn actor_for_tests() -> ControlActor {
+        ControlActor::new(cfg(&[]), NodeState::generate())
+    }
+
+    /// A poll that receives nothing at all must end with `PollIdle` once the
+    /// watchdog expires, instead of waiting forever on a half-open
+    /// connection.
+    #[tokio::test]
+    async fn silent_poll_stream_trips_the_read_watchdog() {
+        let (mut cn, mut cio, _server) = MockServer::pair();
+        let (ev_tx, _ev_rx) = async_channel::bounded::<ControlEvent>(4);
+        let actor = actor_for_tests();
+        let mut h2 = H2State::new();
+        let t0 = std::time::Instant::now();
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_STREAM_ID, true,
+                                      Some(Duration::from_millis(80))),
+        ).await.expect("the watchdog must fire, not hang");
+        assert!(matches!(r, Err(ControlError::PollIdle)), "got {:?}", r.map(|_| ()));
+        assert!(t0.elapsed() >= Duration::from_millis(80));
+    }
+
+    /// Any frame (a keepalive here) restarts the deadline: three keepalives
+    /// spaced inside the window keep the poll alive for longer than one
+    /// window, and only the silence after them ends it.
+    #[tokio::test]
+    async fn keepalives_defer_the_watchdog() {
+        let (mut cn, mut cio, mut server) = MockServer::pair();
+        let (ev_tx, ev_rx) = async_channel::bounded::<ControlEvent>(4);
+        let actor = actor_for_tests();
+        let mut h2 = H2State::new();
+        let feeder = async move {
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                server.map_msg(MAP_STREAM_ID, r#"{"KeepAlive":true}"#, false).await;
+            }
+            // Hold the server side open and silent: dropping it would be EOF.
+            std::future::pending::<()>().await
+        };
+        let t0 = std::time::Instant::now();
+        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_STREAM_ID, true,
+                                             Some(Duration::from_millis(100)));
+        let r = tokio::select! {
+            r = poll => r,
+            _ = feeder => unreachable!(),
+        };
+        assert!(matches!(r, Err(ControlError::PollIdle)));
+        // 3 keepalives at 60 ms each, then a 100 ms silence.
+        assert!(t0.elapsed() >= Duration::from_millis(270), "elapsed {:?}", t0.elapsed());
+        assert!(ev_rx.try_recv().is_err(), "an empty keepalive must not emit a MapUpdate");
+    }
+
+    /// Without a watchdog (publishes) an idle stream is not an error: only
+    /// the explicit outer timeout ends this read.
+    #[tokio::test]
+    async fn no_idle_timeout_means_no_watchdog() {
+        let (mut cn, mut cio, _server) = MockServer::pair();
+        let (ev_tx, _ev_rx) = async_channel::bounded::<ControlEvent>(4);
+        let actor = actor_for_tests();
+        let mut h2 = H2State::new();
+        let r = tokio::time::timeout(
+            Duration::from_millis(200),
+            actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_PUBLISH_STREAM_ID, true, None),
+        ).await;
+        assert!(r.is_err(), "no watchdog: the read must still be pending");
     }
 }

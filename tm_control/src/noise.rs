@@ -218,6 +218,26 @@ pub struct NoiseChannel {
 }
 
 impl NoiseChannel {
+    /// Test-only: a connected (client, server) channel pair with fixed keys,
+    /// so host tests can run a mock control server over an in-memory stream
+    /// without a Noise handshake. The server side is the client's mirror
+    /// (its tx key is the client's rx key and vice versa).
+    #[cfg(test)]
+    pub(crate) fn test_pair() -> (NoiseChannel, NoiseChannel) {
+        let (k1, k2) = ([0x11u8; 32], [0x22u8; 32]);
+        let mk = |tx: &[u8; 32], rx: &[u8; 32]| NoiseChannel {
+            tx_cipher:  ChaCha20Poly1305::new(Key::from_slice(tx)),
+            tx_nonce:   0,
+            rx_cipher:  ChaCha20Poly1305::new(Key::from_slice(rx)),
+            rx_nonce:   0,
+            write_buf:  Box::new([0u8; 4114]),
+            read_buf:   Box::new([0u8; 4114]),
+            read_avail: 0,
+            read_pos:   0,
+        };
+        (mk(&k1, &k2), mk(&k2, &k1))
+    }
+
     /// Read exactly `n` bytes from the Noise channel into `out`.
     ///
     /// Handles message boundaries transparently — a single Noise message
