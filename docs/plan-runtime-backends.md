@@ -309,7 +309,7 @@ Phases 0-3 are committed on `simplification-survey` (49c3cb2, d467386, a4f43ff, 
 ## Risks
 
 - **Phase 4 frame shapes.** ALLOCATIONS records frames overflowing the 32 KB main stack after innocuous refactors (MIR inlining at `opt-level="z"` + LTO). Keep `#[inline(never)]` + `Box::pin` boundaries and measure the HWM per phase.
-- **Router fairness change.** Random start becomes round-robin. It is deterministic and starvation-free, but it changes latency distribution: re-measure Step 9 RTT.
+- **Router fairness differs per backend.** Tokio keeps its random start, so the device is unchanged. Embassy and `tm_testnet` use the round-robin `Rotor`, which is deterministic and starvation-free, but its latency distribution differs: re-measure Step 9 RTT on the Embassy side, and keep the shared example app on both backends as the divergence check. A bug seen under overload on one backend may not reproduce on the other; reproduce it under `tm_testnet` first.
 - **`yield_now` semantics differ.** Tokio defers the wake until after I/O polling; Embassy does not, though its net runner is a separate task. Equivalent only by argument; the e2e test under load is the check.
 - **Generic `async fn` in traits** has no `Send` bounds. Fine for single-thread, but it forbids a multi-thread Tokio host backend later; that is acceptable by design.
 - **Timer state.** `Interval<R>` puts a ~100 B sleep inline in the WG and lan_udp frames instead of on the heap.
@@ -323,7 +323,7 @@ Phases 0-3 are committed on `simplification-survey` (49c3cb2, d467386, a4f43ff, 
 1. ~~Rename `Runtime`~~ Decided: keep `Runtime`; the trait is `Reactor`, the bundle stays `Backend`.
 2. Crate names: `tm_platform`, `tm_backend_tokio`, `tm_backend_embassy`, `tm_time`, `tm_testnet` (or fold `tm_time` into `tm_platform`)?
 3. Is `tokio` a default feature of `tailmicro` (zero firmware change), or explicit?
-4. Router fairness: round-robin `Rotor`, or keep random start (adds a PRNG)?
+4. ~~Router fairness~~ Decided: fairness is per reactor. The contract is "no ready arm starves". The Tokio backend keeps tokio's `select!` (random start), so the device behaviour does not change. The Embassy backend and `tm_testnet` use the deterministic `Rotor` (embassy-futures `select` polls arms strictly in order and `no_std` has no RNG; the testnet needs reproducible runs). The shared example app runs on both backends to catch divergence under overload. How the router reaches the backend's primitive (a `Reactor` method or associated type) is a phase 4 detail; it must not grow the router future on the Tokio path.
 5. Pin embassy-net 0.9.1 (smoltcp) now, or wait for a xarxa release?
 6. Embassy target after host: esp-hal C3 (accepts no_std work + new netif + leaving lwIP/axum), another chip, or host only?
 7. How much to invest in the fake control server (phase 8), versus actor-level suites only plus a manual tuntap run against the real tailnet?
