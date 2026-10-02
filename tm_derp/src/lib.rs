@@ -219,6 +219,9 @@ pub enum DerpError {
 
 /// Poll period while parked waiting for the link to come back.
 const LINK_POLL_MS: u64 = 1_000;
+/// Poll period while waiting for the heavy-dial exclusion
+/// (`tm_buf::link::try_dial`) held by the control actor's bring-up.
+const DIAL_POLL_MS: u64 = 100;
 
 fn is_no_network(e: &std::io::Error) -> bool {
     use std::io::ErrorKind::{HostUnreachable, NetworkDown, NetworkUnreachable};
@@ -334,9 +337,37 @@ impl DerpActor {
                 backoff_ms = RECONNECT_INITIAL_MS;
             }
 
+            // One heavy dial at a time (see `tm_buf::link`): never overlap
+            // control's bring-up. Polled like the park loop so Connect /
+            // Disconnect / Shutdown stay live while we wait.
+            let dial_guard = match tm_buf::link::try_dial() {
+                Some(g) => g,
+                None => {
+                    tracing::info!("DerpActor: another actor is dialing; deferring");
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(core::time::Duration::from_millis(DIAL_POLL_MS)) => {
+                                if let Some(g) = tm_buf::link::try_dial() { break g; }
+                            }
+                            cmd = tm_buf::chan::recv_next(cmds.as_mut()) => match cmd {
+                                Ok(DerpCmd::Connect { host, port, cert_fingerprint }) => {
+                                    target = Some((host, port, cert_fingerprint));
+                                }
+                                Ok(DerpCmd::Disconnect) => {
+                                    target = None;
+                                    continue 'outer;
+                                }
+                                Ok(DerpCmd::Shutdown) | Err(_) => break 'outer,
+                                Ok(DerpCmd::SendPacket { .. }) => {}
+                            }
+                        }
+                    }
+                }
+            };
+
             let (host, port, cert_fingerprint) = target.clone().expect("checked above");
             let result = self.run_connection(
-                &host, port, cert_fingerprint, &mut cmds, &events,
+                &host, port, cert_fingerprint, dial_guard, &mut cmds, &events,
             ).await;
             // Raised from debug to info (2026-09 DERP-reconnect fix): a DERP
             // drop used to be visible only in debug builds, which hid the
@@ -410,6 +441,13 @@ impl DerpActor {
 
     /// Real DERP connection over embedded-tls (feature `etls`).
     ///
+    /// `dial_guard` (the process-wide heavy-dial exclusion, see
+    /// `tm_buf::link`) is held through connect + TLS handshake only and
+    /// dropped before `Connected`; any `?` or a cancelled future drops it too.
+    /// Connect/handshake have no timeout of their own (pre-existing), so a
+    /// hung handshake holds it until the peer or OS gives up; control bounds
+    /// its own wait for that reason.
+    ///
     /// Dials plain TCP via tokio, wraps it in the embedded-io adapter, runs the
     /// TLS 1.3 + DERP handshake ([`tls::DerpTls::connect`]), then services the
     /// send/receive loop. The loop uses `tokio::select!` only to *decide* what
@@ -424,6 +462,7 @@ impl DerpActor {
         host:             &str,
         port:             u16,
         _fingerprint:     Option<[u8; 32]>,
+        dial_guard:       tm_buf::link::DialGuard,
         cmds:             &mut core::pin::Pin<&mut async_channel::Receiver<DerpCmd>>,
         events:           &async_channel::Sender<DerpEvent>,
     ) -> Result<StopReason, DerpError> {
@@ -456,6 +495,9 @@ impl DerpActor {
             rand_core::OsRng,
         )
         .await?;
+        // Handshake done: control may dial now. The session itself keeps its
+        // buffers, but the big contiguous request has been served.
+        drop(dial_guard);
         heap_probe("after DerpTls::connect");
         tracing::info!("DerpActor: DERP handshake complete with {}", host);
 
@@ -542,9 +584,12 @@ impl DerpActor {
         _host:            &str,
         _port:            u16,
         _fingerprint:     Option<[u8; 32]>,
+        dial_guard:       tm_buf::link::DialGuard,
         cmds:             &mut core::pin::Pin<&mut async_channel::Receiver<DerpCmd>>,
         _events:          &async_channel::Sender<DerpEvent>,
     ) -> Result<StopReason, DerpError> {
+        // The stub dials nothing: release the exclusion at once.
+        drop(dial_guard);
         loop {
             match cmds.recv().await {
                 Ok(DerpCmd::Disconnect) => return Ok(StopReason::Disconnected),
@@ -646,6 +691,9 @@ mod link_down_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static LINK_UP: AtomicBool = AtomicBool::new(true);
+    /// The link predicate and the dial exclusion are both process-wide:
+    /// tests in this module take turns.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     fn link() -> bool {
         LINK_UP.load(Ordering::SeqCst)
     }
@@ -662,6 +710,7 @@ mod link_down_tests {
     /// this up would let parallel tests see each other's link state.
     #[tokio::test]
     async fn parks_while_link_down_and_backoff_survives_same_target_nudges() {
+        let _serial = SERIAL.lock().await;
         tm_buf::link::set_check(Some(link));
         // A port that nothing listens on: every dial is refused at once.
         let port = {
@@ -699,5 +748,72 @@ mod link_down_tests {
         tokio::time::timeout(Duration::from_secs(5), run_task).await
             .expect("actor must end after Shutdown").unwrap();
         }).await;
+    }
+
+    /// The actor must not start its heavy dial while another actor holds the
+    /// exclusion, must stay responsive to `Disconnect` meanwhile, must dial
+    /// as soon as it is released, and must release it again after a failed
+    /// handshake / when the actor ends.
+    #[tokio::test]
+    async fn defers_dial_while_exclusion_held_then_releases() {
+        let _serial = SERIAL.lock().await;
+        tm_buf::link::set_check(Some(link));
+        LINK_UP.store(true, Ordering::SeqCst);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let actor = DerpActor::new(NodePublicKey::from_bytes([0x11; 32]), [0x22; 32]);
+        let (cmd_tx, cmd_rx) = async_channel::bounded::<DerpCmd>(64);
+        let (ev_tx, ev_rx) = async_channel::bounded::<DerpEvent>(64);
+
+        let local = tokio::task::LocalSet::new();
+        let run_task = local.spawn_local(actor.run(cmd_rx, ev_tx));
+        local.run_until(async {
+            // Another actor (control) is mid-bring-up.
+            let guard = tm_buf::link::try_dial().expect("exclusion free at start");
+            cmd_tx.send(connect_cmd(port)).await.unwrap();
+
+            // A dial would sit in the listen backlog and accept at once.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await.is_err(),
+                "must not dial while the exclusion is held"
+            );
+
+            // Still responsive: Disconnect while deferred ends the wait.
+            cmd_tx.send(DerpCmd::Disconnect).await.unwrap();
+            // (Like the link-down park, this goes idle without an event.)
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), listener.accept()).await.is_err(),
+                "Disconnect must cancel the pending dial"
+            );
+
+            // Released with the actor idle: no dial; a fresh Connect now dials.
+            drop(guard);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), listener.accept()).await.is_err(),
+                "idle actor must not dial after release"
+            );
+            cmd_tx.send(connect_cmd(port)).await.unwrap();
+            let (peer, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
+                .expect("must dial once the exclusion is released").unwrap();
+
+            // The silent peer leaves the TLS handshake pending: DERP holds
+            // the exclusion for exactly that phase.
+            assert!(tm_buf::link::try_dial().is_none(), "held during the handshake");
+
+            // Handshake fails -> guard released, actor in redial backoff.
+            drop(peer);
+            let ev = tokio::time::timeout(Duration::from_secs(5), ev_rx.recv()).await
+                .expect("failed handshake must surface").unwrap();
+            assert!(matches!(ev, DerpEvent::Disconnected));
+
+            cmd_tx.send(DerpCmd::Shutdown).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), run_task).await
+                .expect("actor must end after Shutdown").unwrap();
+            let g = tm_buf::link::try_dial().expect("exclusion must be free once the actor ends");
+            drop(g);
+        }).await;
+        tm_buf::link::set_check(None);
     }
 }
