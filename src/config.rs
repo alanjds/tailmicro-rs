@@ -28,6 +28,8 @@ pub struct Config {
     pub(crate) os_version: heapless::String<{ tm_control::MAX_OS_VERSION }>,
     pub(crate) services: &'static [tm_control::Service],
     pub(crate) magicdns: tm_netstack::names::MagicDns,
+    pub(crate) dns_resolver: Option<tm_netstack::names::Resolver>,
+    pub(crate) link_check: Option<fn() -> bool>,
 }
 
 impl Config {
@@ -65,6 +67,29 @@ impl Config {
     /// or on-miss re-fetch, see `with_refresh_interval`).
     pub fn with_magicdns(mut self, mode: tm_netstack::names::MagicDns) -> Self {
         self.magicdns = mode;
+        self
+    }
+
+    /// Add an app resolver to the name lookup chain: MagicDNS first, then this,
+    /// then the normal DNS server. It returns a
+    /// [`Resolution`](tm_netstack::names::Resolution): an address, `NotFound`
+    /// (the name is its own, so the lookup fails without asking the WiFi DNS
+    /// server, as for an unanswered `.local` name), or `Pass`. It runs in the
+    /// thread that called `getaddrinfo`, so it may block (keep a timeout) but
+    /// cannot `.await`. Default: none.
+    pub fn with_dns_resolver(mut self, resolver: tm_netstack::names::Resolver) -> Self {
+        self.dns_resolver = Some(resolver);
+        self
+    }
+
+    /// Tell tailmicro whether the network link is up. While `check` returns
+    /// `false`, DERP and control park instead of redialing, which saves heap
+    /// and CPU on a device whose WiFi is down, and they resume (with a fresh
+    /// backoff) when it returns `true`. It runs about once a second while
+    /// parked, so keep it cheap and non-blocking. Default: the link is
+    /// assumed up.
+    pub fn with_link_check(mut self, check: fn() -> bool) -> Self {
+        self.link_check = Some(check);
         self
     }
 
@@ -171,6 +196,23 @@ impl Default for Config {
             os_version:   heapless::String::new(),
             services:     &[],
             magicdns:     tm_netstack::names::MagicDns::default(),
+            dns_resolver: None,
+            link_check:   None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tm_netstack::names::Resolution;
+
+    #[test]
+    fn link_check_and_dns_resolver_default_to_none_and_are_stored() {
+        let c = Config::default();
+        assert!(c.link_check.is_none() && c.dns_resolver.is_none());
+        let c = c.with_link_check(|| false).with_dns_resolver(|_| Resolution::Pass);
+        assert_eq!(c.link_check.map(|f| f()), Some(false));
+        assert_eq!(c.dns_resolver.map(|f| f("x")), Some(Resolution::Pass));
     }
 }

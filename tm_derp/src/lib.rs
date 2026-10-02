@@ -662,7 +662,7 @@ mod link_down_tests {
     /// this up would let parallel tests see each other's link state.
     #[tokio::test]
     async fn parks_while_link_down_and_backoff_survives_same_target_nudges() {
-        tm_buf::link::set_check(link);
+        tm_buf::link::set_check(Some(link));
         // A port that nothing listens on: every dial is refused at once.
         let port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

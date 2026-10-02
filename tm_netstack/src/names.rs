@@ -10,6 +10,8 @@
 //! `CONFIG_LWIP_HOOK_NETCONN_EXT_RESOLVE_CUSTOM=y`, see [`install`]), before any
 //! DNS request leaves the device: a hit never touches the WiFi DNS server, a
 //! miss falls through to it untouched, and no name is ever sent to the tailnet.
+//! An app resolver ([`set_resolver`]) sits between the two: it can answer a name
+//! MagicDNS did not know, claim it as not found, or pass it on.
 
 use core::net::Ipv4Addr;
 use std::sync::Mutex;
@@ -133,12 +135,31 @@ impl Default for NameTable {
     }
 }
 
+/// What an app resolver ([`Resolver`]) decides about a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolution {
+    /// The name resolves to this address.
+    Found(Ipv4Addr),
+    /// The resolver owns the name but has no answer (for example a `.local`
+    /// name nobody replied to). The lookup fails at once and the name is never
+    /// sent to the WiFi DNS server.
+    NotFound,
+    /// Not the resolver's name; carry on with the normal DNS server.
+    Pass,
+}
+
+/// An app-supplied resolver. Called from the lookup path after MagicDNS and
+/// before lwIP's DNS client, in the thread that called `getaddrinfo`, so it
+/// may block (bound it with a timeout) but must not `.await`.
+pub type Resolver = fn(&str) -> Resolution;
+
 struct Shared {
     mode: MagicDns,
     table: NameTable,
+    resolver: Option<Resolver>,
 }
 
-static SHARED: Mutex<Shared> = Mutex::new(Shared { mode: MagicDns::Full, table: NameTable::new() });
+static SHARED: Mutex<Shared> = Mutex::new(Shared { mode: MagicDns::Full, table: NameTable::new(), resolver: None });
 
 fn shared() -> std::sync::MutexGuard<'static, Shared> {
     SHARED.lock().unwrap_or_else(|e| e.into_inner())
@@ -148,6 +169,11 @@ fn shared() -> std::sync::MutexGuard<'static, Shared> {
 /// netmap arrives.
 pub fn set_mode(mode: MagicDns) {
     shared().mode = mode;
+}
+
+/// Set (or clear) the app resolver consulted after MagicDNS misses.
+pub fn set_resolver(resolver: Option<Resolver>) {
+    shared().resolver = resolver;
 }
 
 /// Replace the process-wide table, typically on every netmap.
@@ -165,6 +191,20 @@ pub fn install(table: NameTable) {
 pub fn resolve(name: &str) -> Option<Ipv4Addr> {
     let s = shared();
     s.table.lookup(name, s.mode).map(Ipv4Addr::from)
+}
+
+/// The full lookup chain: MagicDNS first, then the app resolver, else
+/// [`Resolution::Pass`] to the normal DNS server.
+pub fn answer(name: &str) -> Resolution {
+    let (found, resolver) = {
+        let s = shared();
+        (s.table.lookup(name, s.mode), s.resolver)
+    };
+    if let Some(ip) = found {
+        return Resolution::Found(Ipv4Addr::from(ip));
+    }
+    // The lock is released: the resolver may block.
+    resolver.map_or(Resolution::Pass, |resolve| resolve(name))
 }
 
 /// lwIP `LWIP_HOOK_NETCONN_EXTERNAL_RESOLVE`. Runs in the thread that called
@@ -188,19 +228,47 @@ pub unsafe extern "C" fn lwip_hook_netconn_external_resolve(
     let Ok(name) = core::ffi::CStr::from_ptr(name).to_str() else {
         return 0;
     };
-    let Some(ip) = resolve(name) else {
-        return 0;
-    };
-    // `ip4_addr_t::addr` is in network byte order.
-    (*addr).u_addr.ip4.addr = u32::from_ne_bytes(ip.octets());
-    (*addr).type_ = 0; // IPADDR_TYPE_V4
-    *err = esp_idf_sys::err_enum_t_ERR_OK as esp_idf_sys::err_t;
-    1
+    match answer(name) {
+        Resolution::Found(ip) => {
+            // `ip4_addr_t::addr` is in network byte order.
+            (*addr).u_addr.ip4.addr = u32::from_ne_bytes(ip.octets());
+            (*addr).type_ = 0; // IPADDR_TYPE_V4
+            *err = esp_idf_sys::err_enum_t_ERR_OK as esp_idf_sys::err_t;
+            1
+        }
+        Resolution::NotFound => {
+            *err = esp_idf_sys::err_enum_t_ERR_VAL as esp_idf_sys::err_t;
+            1
+        }
+        Resolution::Pass => 0,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answer_chains_magicdns_then_the_app_resolver_then_passes() {
+        fn app(name: &str) -> Resolution {
+            match name {
+                "printer.local" => Resolution::Found(Ipv4Addr::new(192, 168, 1, 9)),
+                n if n.ends_with(".local") => Resolution::NotFound,
+                _ => Resolution::Pass,
+            }
+        }
+        set_resolver(None);
+        assert_eq!(answer("printer.local"), Resolution::Pass, "no resolver: normal DNS");
+        install(table("tailnet-xyz.ts.net", true));
+        set_resolver(Some(app));
+        let tail = Ipv4Addr::new(100, 85, 218, 10);
+        assert_eq!(answer("bospill"), Resolution::Found(tail), "MagicDNS wins");
+        assert_eq!(answer("printer.local"), Resolution::Found(Ipv4Addr::new(192, 168, 1, 9)));
+        assert_eq!(answer("ghost.local"), Resolution::NotFound);
+        assert_eq!(answer("example.com"), Resolution::Pass);
+        set_resolver(None);
+        install(NameTable::new());
+    }
 
     fn table(suffix: &str, proxied: bool) -> NameTable {
         let mut t = NameTable::new();
