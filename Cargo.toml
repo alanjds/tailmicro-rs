@@ -11,6 +11,7 @@ members = [
     "tm_runtime",
     "tm_netstack",
     "tm_buf",
+    "tm_time",
 ]
 
 [workspace.package]
@@ -84,6 +85,7 @@ tm_wg        = { path = "tm_wg" }
 tm_runtime   = { path = "tm_runtime" }
 tm_netstack  = { path = "tm_netstack" }
 tm_buf       = { path = "tm_buf" }
+tm_time      = { path = "tm_time" }
 
 # ── Root crate (mirrors tailscale crate in tailscale-rs) ──────────────────────
 [package]

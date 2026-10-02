@@ -33,7 +33,8 @@ use arrayvec::ArrayVec;
 use crypto_box::aead::Aead;
 use rand_core::{OsRng, RngCore};
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tm_time::Instant;
 use tm_keys::DiscoPrivateKey;
 
 // ── TEMPORARY instrumentation (round 6, ALLOCATIONS.md "Fix plan: DERP TLS
@@ -335,7 +336,7 @@ impl DiscoActor {
                     if udp {
                         tm_buf::lat::stamp(tm_buf::lat::Hop::DiscoIn);
                     }
-                    for evt in self.process(&src, &data) {
+                    for evt in self.process(&src, &data, Instant::now()) {
                         let pong = udp && matches!(evt, DiscoEvent::SendPongUdp { .. });
                         let _ = events.send(evt).await;
                         if pong {
@@ -387,8 +388,7 @@ impl DiscoActor {
     /// 1's DoS mitigation, see `UDP_DECRYPT_RATE_LIMIT`). Returns `true` if
     /// this IP is allowed to proceed to the expensive decrypt path right
     /// now (and records the attempt), `false` if it must be dropped.
-    fn check_udp_ip_rate(&mut self, ip: Ipv4Addr) -> bool {
-        let now = Instant::now();
+    fn check_udp_ip_rate(&mut self, ip: Ipv4Addr, now: Instant) -> bool {
         if let Some(entry) = self.udp_ip_rate.iter_mut().find(|(a, _)| *a == ip) {
             if now.duration_since(entry.1) < UDP_DECRYPT_RATE_LIMIT {
                 return false;
@@ -403,10 +403,13 @@ impl DiscoActor {
         true
     }
 
+    /// `now` is the arrival time, taken once by the caller (the shell reads
+    /// the clock; the core never does, so tests drive time directly).
     fn process(
         &mut self,
         src:  &DiscoSrc,
         data: &[u8],
+        now:  Instant,
     ) -> ArrayVec<DiscoEvent, 2> {
         let mut out = ArrayVec::new();
 
@@ -432,7 +435,7 @@ impl DiscoActor {
         // isn't needed: only already-authenticated tailnet nodes can reach
         // us at all.
         if let DiscoSrc::Udp(addr) = src {
-            if !self.check_udp_ip_rate(*addr.ip()) {
+            if !self.check_udp_ip_rate(*addr.ip(), now) {
                 return out;
             }
         }
@@ -524,14 +527,13 @@ impl DiscoActor {
                 // Rate-limit: max 1 PONG per 100 ms per (peer, path).
                 // Bug 2 fix: `last_pong_ms` used to be a stubbed `now_ms =
                 // 0` clock, so this limiter was a permanent no-op.
-                // `Instant::now()` is a real monotonic source (same
-                // primitive `tm_wg` uses elsewhere in this workspace).
+                // `now` is a real monotonic reading (`tm_time::Instant`,
+                // the same clock `tm_wg` uses), passed in by `run`.
                 // Step 1 bug fix: was keyed per-peer only, so back-to-back
                 // DERP+UDP PINGs from tailscaled's normal direct-path
                 // probing suppressed the second (usually UDP, the one that
                 // matters) PONG. Now keyed per (peer, path) via separate
                 // `last_pong_derp`/`last_pong_udp` fields.
-                let now = Instant::now();
                 let last_pong = match src {
                     DiscoSrc::Derp { .. } => &mut peer_state.last_pong_derp,
                     DiscoSrc::Udp(_) => &mut peer_state.last_pong_udp,
@@ -745,6 +747,10 @@ mod aead_crosscheck {
 // TRUE 12-byte tx_id at plaintext[2..14] (`01..0c`). The pre-fix code — no
 // magic skip, tx_id read at plaintext[1..13] — could not even locate the
 // sender key past the magic, and would have echoed `00 01..0b`.
+/// Virtual time origin for the tests: `process` takes `now`, so no test sleeps.
+#[cfg(test)]
+const T0: Instant = Instant::from_micros(1_000_000);
+
 #[cfg(test)]
 mod framing {
     use super::*;
@@ -788,7 +794,7 @@ mod framing {
         let mut actor = DiscoActor::new(DiscoPrivateKey::from_bytes(receiver_priv));
         actor.add_peer(sender_pub, peer_node_key); // allowlist the sender's disco+node key
 
-        let mut evts = actor.process(&DiscoSrc::Derp { node_key: peer_node_key }, &pkt);
+        let mut evts = actor.process(&DiscoSrc::Derp { node_key: peer_node_key }, &pkt, T0);
         assert_eq!(evts.len(), 1, "a DERP PING should emit exactly one PONG event");
         let evt = evts.pop().expect("process should emit a PONG for a valid PING");
 
@@ -844,7 +850,7 @@ mod framing {
 
         let mut actor = DiscoActor::new(DiscoPrivateKey::from_bytes(receiver_priv));
         actor.add_peer(sender_pub, [0xAA; 32]);
-        assert!(actor.process(&DiscoSrc::Derp { node_key: [0xAA; 32] }, &pkt).is_empty());
+        assert!(actor.process(&DiscoSrc::Derp { node_key: [0xAA; 32] }, &pkt, T0).is_empty());
     }
 }
 
@@ -1049,7 +1055,7 @@ mod udp_security {
         );
 
         let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 41641);
-        let evts = actor.process(&DiscoSrc::Udp(addr), &wire);
+        let evts = actor.process(&DiscoSrc::Udp(addr), &wire, T0);
         assert!(evts.is_empty(),
             "a UDP PING claiming a node key that doesn't match the disco key's \
              netmap pairing must be dropped silently, not answered");
@@ -1076,7 +1082,7 @@ mod udp_security {
             let wire = build_sealed_ping(*receiver.public().as_bytes(), &peer_sk, tx_id, Some(node_key), [i as u8; NONCE_LEN]);
             // A fresh source IP per PING sidesteps the 100 ms pre-decrypt limit.
             let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, *ip), 41641);
-            let evts = actor.process(&DiscoSrc::Udp(addr), &wire);
+            let evts = actor.process(&DiscoSrc::Udp(addr), &wire, T0 + PONG_RATE_LIMIT * 2 * i as u32);
             let pong = match evts.first() {
                 Some(DiscoEvent::SendPongUdp { payload, .. }) => *payload,
                 _ => panic!("PING {} not answered", i),
@@ -1086,7 +1092,6 @@ mod udp_security {
             let pt = peer_box.decrypt(&n, &pong[MAGIC_LEN + PUBKEY_LEN + NONCE_LEN..]).expect("PONG opens under the peer's box");
             assert_eq!(pt[0], MSG_PONG);
             assert_eq!(&pt[2..2 + PING_LEN], &tx_id);
-            std::thread::sleep(std::time::Duration::from_millis(110));
         }
         assert!(actor.allowed[0].shared.is_some());
         // Same claimed disco key, sealed by someone else: must not open.
@@ -1094,7 +1099,7 @@ mod udp_security {
         let mut wire = build_sealed_ping(*receiver.public().as_bytes(), &forger, [9; PING_LEN], Some(node_key), [9; NONCE_LEN]);
         wire[MAGIC_LEN..MAGIC_LEN + PUBKEY_LEN].copy_from_slice(&peer_pub);
         let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 9), 41641);
-        assert!(actor.process(&DiscoSrc::Udp(addr), &wire).is_empty());
+        assert!(actor.process(&DiscoSrc::Udp(addr), &wire, T0 + PONG_RATE_LIMIT * 8).is_empty());
     }
 
     /// The matching-node-key counterpart: a UDP PING whose claimed node key
@@ -1121,7 +1126,7 @@ mod udp_security {
         );
 
         let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 41641);
-        let evts = actor.process(&DiscoSrc::Udp(addr), &wire);
+        let evts = actor.process(&DiscoSrc::Udp(addr), &wire, T0);
         assert_eq!(evts.len(), 2,
             "a correctly-claimed UDP PING must emit SendPongUdp + DirectPathSeen");
         assert!(matches!(evts[0], DiscoEvent::SendPongUdp { dst, .. } if dst == addr));
@@ -1156,7 +1161,7 @@ mod udp_security {
             None,
             derp_nonce,
         );
-        let derp_evts = actor.process(&DiscoSrc::Derp { node_key }, &derp_wire);
+        let derp_evts = actor.process(&DiscoSrc::Derp { node_key }, &derp_wire, T0);
         assert_eq!(derp_evts.len(), 1, "DERP PING should produce one SendPong");
         assert!(matches!(derp_evts[0], DiscoEvent::SendPong { .. }));
 
@@ -1173,10 +1178,28 @@ mod udp_security {
             udp_nonce,
         );
         let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 9), 41641);
-        let udp_evts = actor.process(&DiscoSrc::Udp(addr), &udp_wire);
+        let udp_evts = actor.process(&DiscoSrc::Udp(addr), &udp_wire, T0);
         assert_eq!(udp_evts.len(), 2,
             "a UDP PONG to the same peer within 100ms of a DERP PONG must \
              still go out (per-(peer,path) rate limiting, not per-peer)");
         assert!(matches!(udp_evts[0], DiscoEvent::SendPongUdp { .. }));
+    }
+
+    /// The 100 ms PONG limit per (peer, path), driven by virtual time: a
+    /// second PING from the same peer and path inside the window is
+    /// suppressed, one at +100 ms is answered.
+    #[test]
+    fn pong_rate_limit_follows_the_supplied_clock() {
+        let receiver = receiver_key();
+        let mut actor = DiscoActor::new(receiver.clone());
+        let peer_sk = peer_secret();
+        let peer_pub = *peer_sk.public_key().as_bytes();
+        let node_key = [0x33u8; 32];
+        actor.add_peer(peer_pub, node_key);
+        let wire = build_sealed_ping(*receiver.public().as_bytes(), &peer_sk, [9; PING_LEN], None, [1u8; NONCE_LEN]);
+        let src = DiscoSrc::Derp { node_key };
+        assert_eq!(actor.process(&src, &wire, T0).len(), 1);
+        assert!(actor.process(&src, &wire, T0 + Duration::from_millis(99)).is_empty());
+        assert_eq!(actor.process(&src, &wire, T0 + PONG_RATE_LIMIT).len(), 1);
     }
 }
