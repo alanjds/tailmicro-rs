@@ -55,6 +55,7 @@
 
 pub mod chan;
 pub mod lat;
+pub mod link;
 
 use core::fmt;
 use core::ops::{Deref, DerefMut};
