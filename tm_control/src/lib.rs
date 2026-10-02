@@ -658,6 +658,41 @@ pub struct ControlActor {
     poll_idle_timeout: core::time::Duration,
 }
 
+/// After the link returns, control waits this long before trying to take the
+/// heavy-dial exclusion. DERP notices the link within its 1 s poll and its
+/// TLS handshake needs the largest contiguous heap block; control's ~8 KB
+/// Noise buffers are held for the whole session and would fragment it. The
+/// stagger makes DERP win the race deterministically instead of by luck.
+const LINK_RESUME_STAGGER: core::time::Duration = core::time::Duration::from_secs(2);
+/// Poll period while waiting for the heavy-dial exclusion.
+const DIAL_POLL: core::time::Duration = core::time::Duration::from_millis(100);
+/// Longest control waits for the exclusion before dialing anyway. DERP's
+/// connect/handshake have no timeout of their own, so a hung handshake must
+/// not be able to keep control offline forever.
+const DIAL_WAIT_MAX: core::time::Duration = core::time::Duration::from_secs(20);
+
+/// Take the process-wide heavy-dial exclusion (`tm_buf::link::try_dial`),
+/// polling for at most `max_wait`. Returns `None` after the bound expires
+/// (the caller proceeds unguarded rather than staying offline). Logs once
+/// when it has to defer.
+async fn acquire_dial_guard(max_wait: core::time::Duration) -> Option<tm_buf::link::DialGuard> {
+    if let Some(g) = tm_buf::link::try_dial() {
+        return Some(g);
+    }
+    info!("Tailscale control: another actor is dialing; deferring bring-up");
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        tokio::time::sleep(DIAL_POLL).await;
+        if let Some(g) = tm_buf::link::try_dial() {
+            return Some(g);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!("Tailscale control: dial exclusion still held after {:?}; proceeding anyway", max_wait);
+            return None;
+        }
+    }
+}
+
 impl ControlActor {
     pub fn new(config: Config, node_state: NodeState) -> Self {
         Self { config, node_state, poll_idle_timeout: POLL_IDLE_TIMEOUT }
@@ -784,10 +819,17 @@ impl ControlActor {
                     tokio::time::sleep(core::time::Duration::from_secs(1)).await;
                 }
                 backoff = core::time::Duration::from_secs(1);
+                // Give DERP the first dial (see `LINK_RESUME_STAGGER`).
+                tokio::time::sleep(LINK_RESUME_STAGGER).await;
             }
             tokio::time::sleep(backoff).await;
             backoff = core::cmp::min(backoff.saturating_mul(2), core::time::Duration::from_secs(30));
-            match self.bring_up(auth_key, &mut roster).await {
+            // Held for the bring-up only, never the whole session. Dropped at
+            // the end of the match arm scope, on error, or on cancellation.
+            let dial_guard = acquire_dial_guard(DIAL_WAIT_MAX).await;
+            let bring_up_res = self.bring_up(auth_key, &mut roster).await;
+            drop(dial_guard);
+            match bring_up_res {
                 Ok((c, n, h, _, pc)) => {
                     main_conn = c; noise = n; h2 = h; publish_ctx = pc;
                     backoff = core::time::Duration::from_secs(1);
@@ -1675,6 +1717,22 @@ async fn read_one_h2_body<S: embedded_io_async::Read + embedded_io_async::Write>
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    /// The dial exclusion is process-wide and other tests may briefly hold it
+    /// through a reconnect, so take it first (generous bound), then check the
+    /// bounded wait: held -> `None` after ~max_wait; released -> `Some`.
+    #[tokio::test]
+    async fn dial_guard_wait_is_bounded_and_releases() {
+        let held = acquire_dial_guard(core::time::Duration::from_secs(10)).await
+            .expect("exclusion must free up");
+        let t0 = std::time::Instant::now();
+        let none = acquire_dial_guard(core::time::Duration::from_millis(300)).await;
+        assert!(none.is_none(), "must give up while another holder is alive");
+        assert!(t0.elapsed() >= core::time::Duration::from_millis(300));
+        drop(held);
+        let again = acquire_dial_guard(core::time::Duration::from_secs(10)).await;
+        assert!(again.is_some(), "free after the holder drops");
+    }
     use std::time::Duration;
 
     fn leak_host(addr: std::net::SocketAddr) -> &'static str {
