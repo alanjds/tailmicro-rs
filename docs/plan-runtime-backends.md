@@ -1,6 +1,6 @@
 # Plan: Tokio and Embassy runtime backends
 
-Branch `simplification-survey` at `e72f5cc`, 2026-10-01. Read-only plan; builds on `docs/investigation-runtime-agnostic.md` (called "the investigation"). Line numbers are at `e72f5cc`. "Verified" = read in source (local or GitHub via `gh api`) or measured; "inferred" = reasoned.
+Branch `simplification-survey` at `e72f5cc`, 2026-10-01 (line numbers re-verified against `040d0d1` on 2026-10-02, see "Status" below). Plan; builds on `docs/investigation-runtime-agnostic.md` (called "the investigation"). Line numbers are at `e72f5cc`. "Verified" = read in source (local or GitHub via `gh api`) or measured; "inferred" = reasoned.
 
 ## Summary and recommendation
 
@@ -139,41 +139,45 @@ Randomness and critical sections stay out of the traits: `rand_core::OsRng` (10 
 **Injection: static generics.**
 - `dyn`: async methods need `Box<dyn Future>` per call. The router yields per event and WG ticks every 400 ms, so this means a heap alloc/free on the hot path, against the ALLOCATIONS "design principle". Rejected.
 - Mutually exclusive cfg features: non-additive, and they would forbid the both-backends equivalence build. Rejected.
-- Generics: a single instantiation per binary; the Tokio backend yields exactly today's future types, so frames do not change; the `#[inline(never)] spawn_*` + `Box::pin` boundaries (`tm_runtime/src/lib.rs:159-200`) still erase types to `BoxActorFut`. Measured on host (x86_64, debug, tokio 1.53.1, scratch crate): `Sleep` 96 B, `Interval` 32 B (its `Sleep` is boxed: one heap alloc per interval), a sleep-vs-`recv()` fn using `tokio::select!` 160 B vs `embassy_futures::select` 128 B, `tokio::task::yield_now` 16 B vs embassy's 1 B. So the combinator swap should shrink frames slightly; `Interval<R>` holds the sleep inline (+~64 B per frame on x86_64, minus the box). riscv32 numbers are not measured.
+- Generics: a single instantiation per binary; the Tokio backend yields exactly today's future types, so frames do not change; the `#[inline(never)] spawn_*` + `Box::pin` boundaries (`tm_runtime/src/lib.rs` (the `spawn_*` helpers)) still erase types to `BoxActorFut`. Measured on host (x86_64, debug, tokio 1.53.1, scratch crate): `Sleep` 96 B, `Interval` 32 B (its `Sleep` is boxed: one heap alloc per interval), a sleep-vs-`recv()` fn using `tokio::select!` 160 B vs `embassy_futures::select` 128 B, `tokio::task::yield_now` 16 B vs embassy's 1 B. So the combinator swap should shrink frames slightly; `Interval<R>` holds the sleep inline (+~64 B per frame on x86_64, minus the box). riscv32 numbers are not measured.
 
 ## Call-site mapping
 
 Spot-check corrections to the investigation's catalog (line drift since `11b6970` plus misses):
-- tm_control timeout is at **553** (not 464), sleep at **608** (not 519), `open_tcp` at **1018** (not 929-931); the `TokioStream` alias at 33 is correct.
+- tm_control (at `040d0d1`, after the netmap-refresh series): bring-up is `tokio::time::timeout_at(at, bring_up)` at **721** (a deadline, not a duration), backoff sleep at **781**, `open_tcp` `TcpStream::connect` at **1538**, `TokioStream` alias at **35**. The investigation's 464/519/929-931 and the plan's first-draft 553/608/1018 are both stale.
+- tm_control **new time sites** (d4f126a..040d0d1): the poll loop keeps its deadlines as `tokio::time::Instant` (`PollControl` fields `last_refresh`, `inflight`, `emit_at`, `ready_deadline`, lines 1365-1391, plus 14 call sites at 714-1228), a 4-arm **biased** `tokio::select!` in `PollControl::wait` (1490: `noise.wait_readable`, `cmds.recv`, `sleep_until_opt(timer_at)`, `sleep_until_opt(idle_at)`), `sleep_until_opt` (1509, `tokio::time::sleep_until`) and `read_exact_idle` (1524, `tokio::time::timeout`). All of it moves to `R::now()`/`tm_time::Instant`, `R::sleep_until`, `timeout::<R>` and `select4` (argument order = bias) in phases 4-5. The `timeout`/`sleep_until` conversions need `tm_time::Instant` deadlines, so the `tokio::time::Instant` fields must change type together with the sleeps (phase 5, not phase 3).
 - tm_derp connect is at **388**.
-- **Missed:** `tm_runtime/src/lib.rs:1384-1422` calls `tokio_freertos_yield()` (vTaskDelay(50) + yield) about 10 times in `build`, but it is defined only for `target_os = "espidf"` (39). Together with the unconditional esp-idf-sys/svc deps, that is why `tm_runtime` (and so the root crate) cannot build on host.
+- **Missed:** `tm_runtime/src/lib.rs:1486-1516` (was 1384-1422 in the first draft) calls `tokio_freertos_yield()` (vTaskDelay(50) + yield) about 10 times in `build`, but it is defined only for `target_os = "espidf"` (39). Together with the unconditional esp-idf-sys/svc deps, that is why `tm_runtime` (and so the root crate) cannot build on host.
 - **Missed:** `lan_udp.rs:518`, a test-only sleep.
 - **Stale in ALLOCATIONS.md** ("Scheduling facts"): "`Runtime::spawn` uses `tokio::spawn`" is false; no spawn exists outside tests.
 
 | Site | Today | New |
 |---|---|---|
-| tm_control/src/lib.rs:553 | `tokio::time::timeout(dur, bring_up)` | `tm_platform::timeout::<R>(dur, bring_up)` |
-| tm_control/src/lib.rs:608 | `tokio::time::sleep(backoff)` | `R::sleep(backoff)` |
-| tm_control/src/lib.rs:33, 1018 | `FromTokio<TcpStream>`, `TcpStream::connect((host,port))` | `N::Tcp`, `self.net.connect_host(host, port)` |
+| tm_control/src/lib.rs:721 | `tokio::time::timeout_at(at, bring_up)` (`at` from `ready_deadline`) | `tm_platform::timeout_at::<R>(at, bring_up)` |
+| tm_control/src/lib.rs:781 | `tokio::time::sleep(backoff)` | `R::sleep(backoff)` |
+| tm_control/src/lib.rs:714-1228, 1365-1458 | `tokio::time::Instant` for `ready_deadline`, `emit_at`, `idle_at`, `last_refresh`, `inflight`, `note_change`... | `tm_time::Instant` via `R::now()` (phase 5; tests at 2434, 2450 too) |
+| tm_control/src/lib.rs:1490-1511 | biased `select!` (readable, cmds, `sleep_until_opt` x2) | `select4` in the same order; `sleep_until_opt` = `R::sleep_until` or `pending()` |
+| tm_control/src/lib.rs:1524 | `tokio::time::timeout(d, noise.read_exact)` | `timeout::<R>(d, ..)` |
+| tm_control/src/lib.rs:35, 1538 | `FromTokio<TcpStream>`, `TcpStream::connect((host,port))` | `N::Tcp`, `self.net.connect_host(host, port)` |
 | tm_derp/src/lib.rs:330-334 | `sleep` + `tokio::pin!` + `select!` in a loop | `let mut s = pin!(R::sleep(..)); loop { match select(s.as_mut(), recv_next(..)).await {..} }` |
 | tm_derp/src/lib.rs:384-389 | `TcpStream::connect` + `FromTokio` | `self.net.connect_host(host, port)` |
 | tm_derp/src/lib.rs:427 | `select! { biased; cmd, read_frame_buffered }` | `select(recv_next(..), tls.read_frame_buffered())` (argument order = biased; same drop of the resumable read) |
-| tm_wg/src/lib.rs:242-246 | `interval(TICK)` + `Delay` + `select!` | `Interval::<R>::new(TICK)` + `select(recv_next, ticker.tick())` |
-| tm_wg/src/lib.rs:30, 263, 322, 390, 425, 443, 474, 507, 560; endpoint.rs; vendor macs.rs:86,112, session.rs, tai64n.rs:37 | `std::time::{Instant, SystemTime}` | `tm_time::Instant`, `tm_time::unix_secs()` |
-| tm_disco/src/lib.rs:391, 534 | `Instant::now()` inside `process` | `process(.., now)` |
+| tm_wg/src/lib.rs:243-247 | `interval(TICK)` + `Delay` + `select!` | `Interval::<R>::new(TICK)` + `select(recv_next, ticker.tick())` |
+| ~~tm_wg lib.rs, endpoint.rs, vendor macs/session/handshake/tai64n~~ | `std::time::{Instant, SystemTime}` | **done (phase 3, 6b4fda7)**: `tm_time::Instant`, `tm_time::unix_secs()` |
+| ~~tm_disco/src/lib.rs:391, 534~~ | `Instant::now()` inside `process` | **done (phase 1, d467386)**: `process(.., now)` |
 | tm_netstack/src/lan_udp.rs:301-318 | `tokio::time::Instant`, `sleep(POOL_POLL)`, `timeout_at(d, tx.send)` | `R::now()`, `R::sleep`, `timeout_at::<R>(d, tx.send(msg))` (drop semantics identical: message and PktBuf recycled) |
 | lan_udp.rs:379-405 | `interval` + `select!` + `sleep(50ms)` | `Interval<R>`, `select(sock.recv_from, summary.tick())`, `R::sleep` |
 | tm_netstack/src/lib.rs:53-113 | `UdpSocket` over tokio | moves to `tm_backend_tokio::TokioUdp: UdpTransport`, code unchanged |
 | tm_netstack/src/lib.rs:118-160 | `todo!` host TCP stubs | delete (survey R-01b) |
-| tm_runtime/src/lib.rs:63-96 | `RouterYield` (espidf only), `yield_now`, `vTaskDelay` | `RouterYield<R>` on all targets using `tm_time`; `R::yield_now()`, `R::os_pause(1)` |
-| tm_runtime/src/lib.rs:1384-1422 | `tokio_freertos_yield()` | `B::Reactor::os_pause(50)` |
-| tm_runtime/src/lib.rs:214, 282-287, 430, 457 | `static LAN_SOCK: OnceLock<tm_netstack::UdpSocket>` | `net.bind_udp(..) -> &'static N::Udp`, passed to router and `udp_rx_task` |
-| tm_runtime/src/lib.rs:386 | `sock.writable()` priming | `sock.ready()` |
-| tm_runtime/src/lib.rs:553-554, 1083 | `tailnet::{bring_up, set_address, inject_inbound}` | `B::Tailnet::...` |
-| tm_runtime/src/lib.rs:810 | `tokio::select!` over 5 receivers (random start) | `poll_fn(|cx| rotor.poll(cx, |i, cx| match i { 0 => ctrl.as_mut().poll_next(cx).map(In::Ctrl), .. }))`, then `match` outside the poll |
-| tm_runtime/src/lib.rs:1360 | `select!` driver vs ready | `select(ready_rx.recv(), driver)` (ready first: prefer Ok on a tie) |
-| tm_runtime/src/lib.rs:1490, 1498 | two cfg'd `tokio::join!` | one `join_array([..])`; `udp_task` is `Box::pin(async {})` when off, as already done at 1459 |
-| tm_buf/src/lat.rs:65-81; tm_runtime 411; src/config.rs:45 | std clocks | `tm_time` |
+| tm_runtime/src/lib.rs:63-104 | `RouterYield` (espidf only; clock is `tm_time` since phase 3), `tokio::task::yield_now` (48, 94, 104), `vTaskDelay` (100) | `RouterYield<R>` on all targets; `R::yield_now()`, `R::os_pause(1)` |
+| tm_runtime/src/lib.rs:1486-1516 | `tokio_freertos_yield()` | `B::Reactor::os_pause(50)` |
+| tm_runtime/src/lib.rs:222, 295, 438, 465 | `static LAN_SOCK: OnceLock<tm_netstack::UdpSocket>` | `net.bind_udp(..) -> &'static N::Udp`, passed to router and `udp_rx_task` |
+| tm_runtime/src/lib.rs:397 | `sock.writable()` priming | `sock.ready()` |
+| tm_runtime/src/lib.rs:561-562, 1184 | `tailnet::{bring_up, set_address, inject_inbound}` | `B::Tailnet::...` |
+| tm_runtime/src/lib.rs:913 | `tokio::select!` over 5 receivers (random start) | `poll_fn(|cx| rotor.poll(cx, |i, cx| match i { 0 => ctrl.as_mut().poll_next(cx).map(In::Ctrl), .. }))`, then `match` outside the poll |
+| tm_runtime/src/lib.rs:1462 | `select!` driver vs ready | `select(ready_rx.recv(), driver)` (ready first: prefer Ok on a tie) |
+| tm_runtime/src/lib.rs:1592, 1600 | two cfg'd `tokio::join!` | one `join_array([..])`; `udp_task` is `Box::pin(async {})` when off, as already done at 1459 |
+| ~~tm_buf/src/lat.rs; tm_runtime; src/config.rs~~ | std clocks | **done (phase 3)** |
 
 Tests (`#[tokio::test]`, `LocalSet`, `tokio::spawn`) stay Tokio and become the Tokio half of the conformance suite.
 
@@ -278,9 +282,9 @@ Host check (H): `cargo test --offline -p tm_control -p tm_derp -p tm_wg -p tm_di
 | # | Scope (one commit) | Files | Risk | Effort | Verify |
 |---|---|---|---|---|---|
 | 0 | (Host gating DONE in 49c3cb2: deps gated, host `tokio_freertos_yield` = `yield_now`, workspace builds and tests on host.) Trim Tokio features (investigation phase 0); `tokio::pin!` → `core::pin::pin!`; move tm_runtime's esp-idf deps under `cfg(target_os="espidf")`; add host `tokio_freertos_yield` = `yield_now` | */Cargo.toml, tm_derp lib.rs:331, tm_runtime lib.rs:39 | none on device (espidf deps identical) | S | H + `cargo test -p tm_runtime -p tailmicro` on host for the first time; F |
-| 1 | **Proving step:** `tm_time` + tm_disco `process(.., now)`; tests stop sleeping 110 ms | new tm_time, tm_disco | low | S | H; F |
-| 2 | Re-export `tailmicro::Driver` (no renames: `Runtime` keeps its name) | src/lib.rs | none | S | H; F (tasmolike unchanged) |
-| 3 | `tm_time` everywhere else (tm_wg incl. vendor diff, tm_runtime, tm_buf lat, config.rs) | tm_wg, tm_runtime, tm_buf, src | low | M | H; F; D smoke: handshake + PONG, `size -A` endpoint |
+| 1 | **DONE (d467386).** **Proving step:** `tm_time` + tm_disco `process(.., now)`; tests stop sleeping 110 ms | new tm_time, tm_disco | low | S | H; F |
+| 2 | **DONE (a4f43ff).** Re-export `tailmicro::Driver` (no renames: `Runtime` keeps its name) | src/lib.rs | none | S | H; F (tasmolike unchanged) |
+| 3 | **DONE (6b4fda7).** `tm_time` everywhere else (tm_wg incl. vendor diff, tm_runtime, tm_buf lat, config.rs). tm_control and lan_udp keep `tokio::time::Instant` until phase 5 (they are tied to tokio sleeps) | tm_wg, tm_runtime, tm_buf, src | low | M | H; F; D smoke: handshake + PONG, `size -A` endpoint |
 | 4 | Combinators: `join_array`, `select`, `Rotor` router, `Interval` (still calling tokio sleep inside) | tm_runtime, tm_derp, tm_wg, lan_udp, new tm_platform (combinators only) | **frame shapes change** | M | H; F; **D full** |
 | 5 | `Reactor` trait + `tm_backend_tokio::TokioReactor`; generic `WgActor<R>`, `DerpActor<R>`, `ControlActor<R>`, lan_udp, `RouterYield<R>`; tm_runtime fixes `R = TokioReactor` internally | tm_platform, new tm_backend_tokio, shells | low | M | H (+ conformance suite on Tokio, virtual time); F; D soak + reconnect backoff |
 | 6 | `Net`/`UdpTransport`/`TailnetIf`/`Backend`; `TokioNet` (today's connect + UdpSocket moved verbatim), `LwipTailnet`; `connect::<B>`, `Device::connect_with`; LAN_SOCK into the backend | tm_platform, tm_netstack, tm_runtime, tm_backend_tokio, src | low-medium (static socket ownership) | M | H (+ Net conformance on Tokio); F; D: control + DERP connect, LAN PONG, heap minima |
@@ -293,6 +297,14 @@ Host check (H): `cargo test --offline -p tm_control -p tm_derp -p tm_wg -p tm_di
 - the conformance suites and the e2e scenario pass under `EmbassyBackend` with both `MemNet` and two-stack embassy-net links, with the equivalence criteria (5a, 5b) against the Tokio run;
 - `cargo tree` of tasmolike shows no embassy-time/executor;
 - the ESP32 Tokio soak after phases 4-6 matches the Step-12 baselines.
+
+## Status (2026-10-02)
+
+Phases 0-3 are committed on `simplification-survey` (49c3cb2, d467386, a4f43ff, 6b4fda7).
+- **tm_time as built:** `Instant(u64 us)`, `set_clock`, `unix_secs`, std default (epoch = first use, via `OnceLock`). Additions to the sketch: `checked_sub`, `AddAssign<Duration>`, `saturating_duration_since` (std spelling, used by vendored code). The clock is two `AtomicUsize` function pointers (0 = unset; load/store only). Without the `std` feature and without `set_clock`, `Instant::now()` panics.
+- **`process(.., now)` reads the clock once per datagram in `DiscoActor::run`**, before the decrypt. The PONG rate-limit timestamp is therefore taken up to one X25519 (about 46 ms on the C3) earlier than before; the 100 ms limit is unchanged.
+- **`TAI64N::now()`** (unused on the device path; the endpoint feeds `now_from_unix`) now returns whole seconds from `tm_time::unix_secs()`.
+- **Phase 5 note:** `tokio::time::Instant` and `tm_time::Instant` are different types and clocks. `TokioReactor::sleep_until(deadline)` should be `tokio::time::sleep(deadline.duration_since(Self::now()))` and `TokioReactor::now()` should read the same clock the virtual-time tests advance (`set_clock` to tokio's paused clock in those tests), otherwise `start_paused` conformance tests and the production clock disagree.
 
 ## Risks
 
