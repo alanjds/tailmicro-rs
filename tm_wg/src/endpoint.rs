@@ -539,6 +539,24 @@ impl WgEndpoint {
         true
     }
 
+    /// Ids of all current peers, in table order. Ids are never reused (the
+    /// counter only grows), so callers must not probe a numeric range: after
+    /// enough peer churn live ids exceed any fixed bound.
+    pub fn peer_ids(&self) -> ArrayVec<PeerId, MAX_PEERS> {
+        self.peers.iter().map(|p| p.id).collect()
+    }
+
+    /// Replace the peer's DERP (fallback) route, for when control moves the
+    /// peer's home region. The session, direct path and timers are untouched:
+    /// only where DERP-bound sends are addressed changes. Returns false for an
+    /// unknown peer.
+    pub fn set_derp(&mut self, id: PeerId, derp: Endpoint) -> bool {
+        match self.peer_index(id) {
+            Some(i) => { self.peers[i].derp = derp; true }
+            None => false,
+        }
+    }
+
     pub fn peer_key(&self, id: PeerId) -> Option<NodePublicKey> {
         self.peer_index(id).map(|i| self.peers[i].config.key)
     }

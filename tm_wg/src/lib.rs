@@ -290,70 +290,24 @@ impl WgActor {
             tracing::info!("WgActor: packet-buffer pool ready: {} static buffers ({} B each)", n, tm_buf::PKT_CAP);
         }
 
-        // Remove peers no longer present.
-        let mut to_remove: heapless::Vec<PeerId, MAX_PEERS> = heapless::Vec::new();
-        for i in 0..MAX_PEERS {
-            // Walk current peers by re-querying; collect ids absent from map.
-            if let Some(id) = self.endpoint_peer_ids().get(i).copied() {
-                let key = self.endpoint().peer_key(id).map(|k| k.to_bytes());
-                if let Some(key) = key {
-                    if !map.peers.iter().any(|p| p.node_key == key) {
-                        let _ = to_remove.push(id);
-                    }
-                }
-            }
+        // Diff the snapshot against the live peer table: drop absent peers,
+        // re-route moved ones, add new ones.
+        let sync = sync_peers(self.endpoint(), &map.peers);
+        if sync.removed + sync.rerouted + sync.added.len() > 0 {
+            tracing::info!("WgActor: peers synced: {} added, {} removed, {} re-routed", sync.added.len(), sync.removed, sync.rerouted);
         }
-        for id in to_remove {
-            self.endpoint().remove_peer(id);
+        for hostname in sync.dropped.iter() {
+            tracing::warn!(hostname = %hostname, "peer table full; not adding peer");
         }
-
-        // Add new peers and proactively initiate a handshake to each.
-        for peer in &map.peers {
-            if self.endpoint().peer_id_by_key(&peer.node_key).is_some() {
-                continue;
-            }
-            let cfg = PeerConfig {
-                key: NodePublicKey::from_bytes(peer.node_key),
-                // Tailscale's PSK is 32 zero bytes.
-                psk: Psk::zero(),
-            };
-            let ep = Self::endpoint_for(peer);
-            if let Some(id) = self.endpoint().add_peer(cfg, ep) {
-                let now = Instant::now();
-                if let Some(pkt) = self.endpoint().initiate(id, now, now_unix()) {
-                    self.emit_to_peer(id, pkt, events).await;
-                }
-            } else {
-                tracing::warn!(hostname = %peer.hostname, "peer table full; not adding peer");
+        // Proactively initiate a handshake to each new peer.
+        for id in sync.added {
+            let now = Instant::now();
+            if let Some(pkt) = self.endpoint().initiate(id, now, now_unix()) {
+                self.emit_to_peer(id, pkt, events).await;
             }
         }
     }
 
-    fn endpoint_peer_ids(&self) -> heapless::Vec<PeerId, MAX_PEERS> {
-        // Reconstruct ids by scanning known node keys via public accessors.
-        // (Kept simple; the endpoint owns the authoritative table.)
-        let mut ids: heapless::Vec<PeerId, MAX_PEERS> = heapless::Vec::new();
-        let Some(endpoint) = self.endpoint.as_deref() else {
-            return ids; // no endpoint yet -> no peers
-        };
-        for id in 1..=(MAX_PEERS as u32 * 4) {
-            let pid = PeerId(id);
-            if endpoint.peer_key(pid).is_some() {
-                let _ = ids.push(pid);
-            }
-            if ids.is_full() {
-                break;
-            }
-        }
-        ids
-    }
-
-    fn endpoint_for(peer: &PeerInfo) -> Endpoint {
-        Endpoint::Derp {
-            region_id: peer.derp_region,
-            node_key: peer.node_key,
-        }
-    }
 
     async fn on_inbound(
         &mut self,
@@ -564,6 +518,63 @@ fn now_unix() -> Option<u64> {
         .filter(|&s| s > 1_700_000_000)
 }
 
+fn endpoint_for(peer: &PeerInfo) -> Endpoint {
+    Endpoint::Derp {
+        region_id: peer.derp_region,
+        node_key: peer.node_key,
+    }
+}
+
+/// What [`sync_peers`] changed.
+struct PeerSync {
+    /// Newly added peers (they still need a handshake).
+    added: heapless::Vec<PeerId, MAX_PEERS>,
+    removed: usize,
+    /// Existing peers whose DERP route changed.
+    rerouted: usize,
+    /// Hostnames of peers that did not fit the table.
+    dropped: heapless::Vec<heapless::String<32>, MAX_PEERS>,
+}
+
+/// Make the endpoint's peer table equal to `peers` (the whole current
+/// snapshot). Existing peers keep their sessions; only their DERP route is
+/// refreshed, so a later snapshot can move a peer's home region.
+fn sync_peers(ep: &mut WgEndpoint, peers: &[PeerInfo]) -> PeerSync {
+    let mut out = PeerSync {
+        added: heapless::Vec::new(), removed: 0, rerouted: 0, dropped: heapless::Vec::new(),
+    };
+    for id in ep.peer_ids() {
+        let Some(key) = ep.peer_key(id).map(|k| k.to_bytes()) else { continue };
+        if !peers.iter().any(|p| p.node_key == key) {
+            ep.remove_peer(id);
+            out.removed += 1;
+        }
+    }
+    for peer in peers {
+        let want = endpoint_for(peer);
+        if let Some(id) = ep.peer_id_by_key(&peer.node_key) {
+            if ep.peer_endpoint(id).as_ref() != Some(&want) && ep.set_derp(id, want) {
+                out.rerouted += 1;
+            }
+            continue;
+        }
+        let cfg = PeerConfig {
+            key: NodePublicKey::from_bytes(peer.node_key),
+            // Tailscale's PSK is 32 zero bytes.
+            psk: Psk::zero(),
+        };
+        match ep.add_peer(cfg, want) {
+            Some(id) => { let _ = out.added.push(id); }
+            None => {
+                let mut h = heapless::String::new();
+                for c in peer.hostname.chars() { if h.push(c).is_err() { break; } }
+                let _ = out.dropped.push(h);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,5 +671,88 @@ mod tests {
                 assert!(ev_rx.try_recv().is_err(), "nothing emitted for an unattributable UDP datagram");
             })
             .await;
+    }
+
+    fn peer(seed: u8, region: u16) -> PeerInfo {
+        PeerInfo {
+            node_key: NodeKeyPair::from_private(NodePrivateKey([seed; 32])).public.to_bytes(),
+            disco_key: [seed; 32],
+            tailnet_ip: TailnetIp([100, 64, 0, seed]),
+            prefix_len: 32,
+            hostname: heapless::String::new(),
+            name: Default::default(),
+            derp_region: region,
+            is_online: true,
+        }
+    }
+
+    fn table() -> WgEndpoint {
+        WgEndpoint::new(NodeKeyPair::new())
+    }
+
+    fn keys(ep: &WgEndpoint) -> Vec<[u8; 32]> {
+        ep.peer_ids().into_iter().map(|id| ep.peer_key(id).unwrap().to_bytes()).collect()
+    }
+
+    /// A later snapshot adds the new peer, removes the missing one, and keeps
+    /// the survivor's id (and so its session).
+    #[test]
+    fn sync_adds_removes_and_keeps_survivors() {
+        let mut ep = table();
+        let (a, b, c) = (peer(1, 1), peer(2, 1), peer(3, 1));
+        let s = sync_peers(&mut ep, &[a.clone(), b.clone()]);
+        assert_eq!((s.added.len(), s.removed), (2, 0));
+        let a_id = ep.peer_id_by_key(&a.node_key).unwrap();
+
+        let s = sync_peers(&mut ep, &[a.clone(), c.clone()]);
+        assert_eq!((s.added.len(), s.removed, s.rerouted), (1, 1, 0));
+        assert_eq!(ep.peer_id_by_key(&a.node_key), Some(a_id), "survivor keeps its id");
+        assert!(ep.peer_id_by_key(&b.node_key).is_none(), "removed peer is gone");
+        assert!(ep.peer_id_by_key(&c.node_key).is_some(), "new peer is in");
+        assert_eq!(keys(&ep).len(), 2);
+    }
+
+    /// An existing peer whose home region changed gets the new route, which
+    /// the old code skipped because the key was already present.
+    #[test]
+    fn sync_applies_a_changed_derp_home() {
+        let mut ep = table();
+        let a = peer(1, 1);
+        sync_peers(&mut ep, &[a.clone()]);
+        let id = ep.peer_id_by_key(&a.node_key).unwrap();
+        let moved = peer(1, 9);
+        let s = sync_peers(&mut ep, &[moved.clone()]);
+        assert_eq!((s.added.len(), s.removed, s.rerouted), (0, 0, 1));
+        assert_eq!(ep.peer_endpoint(id), Some(Endpoint::Derp { region_id: 9, node_key: a.node_key }));
+        // Same snapshot again: nothing to do.
+        let s = sync_peers(&mut ep, &[moved]);
+        assert_eq!((s.added.len(), s.removed, s.rerouted), (0, 0, 0));
+    }
+
+    /// Peer ids only grow, so after enough churn live ids are far above the
+    /// range the old removal scan probed (1..=32) and it silently stopped
+    /// removing peers.
+    #[test]
+    fn removal_still_works_after_many_ids_were_issued() {
+        let mut ep = table();
+        for round in 0..40u8 {
+            let p = peer(round + 1, 1);
+            sync_peers(&mut ep, &[p]);
+            assert_eq!(keys(&ep).len(), 1, "round {round}: previous peer must have been removed");
+        }
+        let s = sync_peers(&mut ep, &[]);
+        assert_eq!(s.removed, 1);
+        assert!(keys(&ep).is_empty());
+    }
+
+    /// More peers than the table holds: the first MAX_PEERS win (control's
+    /// order) and the rest are reported, not silently lost.
+    #[test]
+    fn sync_reports_peers_that_do_not_fit() {
+        let mut ep = table();
+        let many: Vec<PeerInfo> = (1..=MAX_PEERS as u8 + 2).map(|i| peer(i, 1)).collect();
+        let s = sync_peers(&mut ep, &many);
+        assert_eq!(s.added.len(), MAX_PEERS);
+        assert_eq!(s.dropped.len(), 2);
     }
 }

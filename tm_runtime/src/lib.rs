@@ -786,6 +786,51 @@ static ROUTER_DROPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 /// piece that actually keeps its large `tokio::select!` body -- four branches
 /// each with heapless::Vec construction and multi-field `info!` calls -- out
 /// of `join`'s frame.
+/// The per-peer facts the router needs to notice that a later snapshot changed
+/// something about a peer it already knew.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PeerSnap {
+    node_key: [u8; 32],
+    disco_key: [u8; 32],
+}
+
+/// Bring tm_disco's allowlist from the previous snapshot (`known`) to `map`,
+/// then record `map` as the new baseline. Only differences are sent: a peer
+/// that is unchanged costs no command, so a periodic re-poll of a stable
+/// tailnet is silent here.
+///
+/// `RemovePeer` is keyed by the old disco key. A peer whose disco key rotated
+/// gets the old one removed first, otherwise the stale key would stay allowed
+/// (and keep passing the node-key pairing check) until evicted by capacity.
+#[inline(never)]
+async fn sync_disco_allowlist(
+    known: &mut heapless::Vec<PeerSnap, 8>,
+    map: &tm_control::MapState,
+    disco_tx: &async_channel::Sender<DiscoCmd>,
+) {
+    for old in known.iter() {
+        if !map.peers.iter().any(|p| p.node_key == old.node_key) {
+            info!("Runtime::join() - peer {:02x}{:02x}.. left the netmap; removing it from the disco allowlist", old.node_key[0], old.node_key[1]);
+            let _ = disco_tx.send(DiscoCmd::RemovePeer(old.disco_key)).await;
+        }
+    }
+    for p in map.peers.iter() {
+        match known.iter().find(|o| o.node_key == p.node_key) {
+            Some(o) if o.disco_key == p.disco_key => continue,
+            Some(o) => {
+                info!("Runtime::join() - peer {:02x}{:02x}.. rotated its disco key", p.node_key[0], p.node_key[1]);
+                let _ = disco_tx.send(DiscoCmd::RemovePeer(o.disco_key)).await;
+            }
+            None => {}
+        }
+        let _ = disco_tx.send(DiscoCmd::AllowPeer { disco_key: p.disco_key, node_key: p.node_key }).await;
+    }
+    known.clear();
+    for p in map.peers.iter() {
+        let _ = known.push(PeerSnap { node_key: p.node_key, disco_key: p.disco_key });
+    }
+}
+
 /// Rebuild the MagicDNS name table from a netmap. Out of the router's frame so
 /// its table temporary does not grow `event_router_task`'s poll state.
 #[inline(never)]
@@ -838,6 +883,8 @@ async fn event_router_task(
     // see `apply_tailnet_address`/`log_unknown_netif_dest`.
     let mut netif_applied_ip: Option<[u8; 4]> = None;
     let mut last_unknown_dst: Option<[u8; 4]> = None;
+    // Peers of the previous snapshot, to diff the next one against.
+    let mut known_peers: heapless::Vec<PeerSnap, 8> = heapless::Vec::new();
     let mut last_miss_refresh: Option<std::time::Instant> = None;
     // Belt-and-suspenders for the DERP reconnect fix (2026-09): DerpActor now
     // redials its own last target with backoff on a connection error, but
@@ -937,20 +984,16 @@ async fn event_router_task(
                                 #[cfg(target_os = "espidf")]
                                 ry.tick().await;
                             }
-                            for p in map.peers.iter() {
-                                // Step 1 (LAN-direct-path plan): AllowPeer now
-                                // carries both keys, so tm_disco can check a
-                                // UDP PING's claimed node key against the
-                                // netmap's real disco-key/node-key pairing
-                                // (DiscoSrc::Udp has no authenticated sender
-                                // identity the way a DERP frame does).
-                                let _ = disco_tx2.send(DiscoCmd::AllowPeer {
-                                    disco_key: p.disco_key,
-                                    node_key: p.node_key,
-                                }).await;
-                                #[cfg(target_os = "espidf")]
-                                ry.tick().await;
-                            }
+                            // Keep tm_disco's allowlist equal to this snapshot:
+                            // AllowPeer for new peers (Step 1 of the LAN-direct
+                            // plan: it carries both keys so a UDP PING's claimed
+                            // node key can be checked against the real pairing),
+                            // RemovePeer for gone ones, both for a re-keyed one.
+                            sync_disco_allowlist(&mut known_peers, map.as_ref(), &disco_tx2).await;
+                            #[cfg(target_os = "espidf")]
+                            ry.tick().await;
+                            #[cfg(feature = "lan-direct")]
+                            last_via.retain(|(k, _)| map.peers.iter().any(|p| p.node_key == *k));
                             // Capture addressing for rung-6a and the tailnet
                             // netif's outbound routing BEFORE the map is
                             // moved into ApplyMap.
@@ -1689,5 +1732,140 @@ mod tests {
 
         let result = race_driver_vs_ready(&mut driver, &rx).await;
         assert_eq!(result, Err(()));
+    }
+
+    // ── Router: later snapshots change routing, allowlist, WG and names ──────
+
+    fn key32(seed: u8) -> [u8; 32] { [seed; 32] }
+
+    fn peer(seed: u8, disco: u8, label: &str, hash: u16) -> tm_control::PeerInfo {
+        let mut name = tm_control::PeerName::default();
+        name.label.push_str(label).unwrap();
+        name.suffix_hash = hash;
+        tm_control::PeerInfo {
+            node_key: key32(seed),
+            disco_key: key32(disco),
+            tailnet_ip: tm_control::TailnetIp([100, 64, 0, seed]),
+            prefix_len: 32,
+            hostname: heapless::String::new(),
+            name,
+            derp_region: 1,
+            is_online: true,
+        }
+    }
+
+    fn snapshot(peers: &[tm_control::PeerInfo], hash: u16) -> ControlEvent {
+        let mut m = tm_control::MapState {
+            our_ip: tm_control::TailnetIp([100, 64, 0, 1]),
+            peers: Default::default(),
+            derp_regions: Default::default(),
+            names: Default::default(),
+        };
+        m.names.self_label.push_str("me").unwrap();
+        m.names.suffix.push_str("tn.ts.net").unwrap();
+        m.names.suffix_hash = hash;
+        m.names.proxied = true;
+        for p in peers { m.peers.push(p.clone()); }
+        ControlEvent::MapUpdate(Box::new(m))
+    }
+
+    async fn within<T>(f: impl Future<Output = T>) -> T {
+        tokio::time::timeout(core::time::Duration::from_secs(5), f).await.expect("router did not respond")
+    }
+
+    /// A MapUpdate after the first one must: allow and route a peer that
+    /// joined late (allowlist, `ip_to_key`, WG snapshot, MagicDNS), and for a
+    /// peer that left, send `RemovePeer` with its disco key, stop routing its
+    /// address (a lookup miss asks control for a refresh) and drop its name.
+    /// A re-keyed peer swaps its disco key; an unchanged snapshot sends no
+    /// disco command at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_snapshots_add_remove_and_rekey_peers() {
+        let hash = tm_control::suffix_hash("tn.ts.net");
+        let (ctrl_ev_tx, ctrl_ev_rx) = async_channel::bounded::<ControlEvent>(2);
+        let (_derp_ev_tx, derp_ev_rx) = async_channel::bounded::<DerpEvent>(2);
+        let (_disco_ev_tx, disco_ev_rx) = async_channel::bounded::<DiscoEvent>(2);
+        let (_wg_ev_tx, wg_ev_rx) = async_channel::bounded::<WgEvent>(2);
+        let (netif_tx, netif_rx) = async_channel::bounded::<tailnet::OutboundPacket>(8);
+        let (ctrl_tx, ctrl_rx) = async_channel::bounded::<ControlCmd>(4);
+        let (derp_tx, _derp_rx) = async_channel::bounded::<DerpCmd>(8);
+        let (wg_tx, wg_rx) = async_channel::bounded::<WgCmd>(16);
+        let (disco_tx, disco_rx) = async_channel::bounded::<DiscoCmd>(16);
+
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async move {
+            let router = tokio::task::spawn_local(event_router_task(
+                ctrl_ev_rx, derp_ev_rx, disco_ev_rx, wg_ev_rx, netif_rx,
+                ctrl_tx, derp_tx, wg_tx, disco_tx, None, None,
+            ));
+
+            // The WG ApplyMap is sent after every disco command of a snapshot,
+            // so once it arrives the disco queue holds that snapshot's commands.
+            async fn applied(wg_rx: &async_channel::Receiver<WgCmd>) -> Vec<[u8; 32]> {
+                match within(wg_rx.recv()).await.unwrap() {
+                    WgCmd::ApplyMap(m) => m.peers.iter().map(|p| p.node_key).collect(),
+                    _ => panic!("expected ApplyMap"),
+                }
+            }
+            fn disco_cmds(rx: &async_channel::Receiver<DiscoCmd>) -> Vec<(&'static str, [u8; 32])> {
+                let mut v = Vec::new();
+                while let Ok(c) = rx.try_recv() {
+                    match c {
+                        DiscoCmd::AllowPeer { disco_key, .. } => v.push(("allow", disco_key)),
+                        DiscoCmd::RemovePeer(k) => v.push(("remove", k)),
+                        DiscoCmd::SetHomeRegion(_) => {}
+                        _ => panic!("unexpected disco command"),
+                    }
+                }
+                v
+            }
+            async fn send_to(tx: &async_channel::Sender<tailnet::OutboundPacket>, ip: u8) {
+                tx.send(tailnet::OutboundPacket { dst_ip: [100, 64, 0, ip], data: tm_buf::PktBuf::from_slice(&[0u8; 20]).unwrap() }).await.unwrap();
+            }
+            async fn routed_to(wg_rx: &async_channel::Receiver<WgCmd>) -> [u8; 32] {
+                match within(wg_rx.recv()).await.unwrap() {
+                    WgCmd::SendData { dst_key, .. } => dst_key,
+                    _ => panic!("expected SendData"),
+                }
+            }
+
+            let a = peer(2, 12, "alpha", hash);
+            let b = peer(3, 13, "bravo", hash);
+            let c = peer(4, 14, "charlie", hash);
+
+            // 1. First snapshot: A and B.
+            ctrl_ev_tx.send(snapshot(&[a.clone(), b.clone()], hash)).await.unwrap();
+            assert_eq!(applied(&wg_rx).await, vec![key32(2), key32(3)]);
+            assert_eq!(disco_cmds(&disco_rx), vec![("allow", key32(12)), ("allow", key32(13))]);
+            send_to(&netif_tx, 3).await;
+            assert_eq!(routed_to(&wg_rx).await, key32(3));
+            assert_eq!(tm_netstack::names::resolve("bravo.tn.ts.net"), Some([100, 64, 0, 3].into()));
+
+            // 2. B left, C joined late.
+            ctrl_ev_tx.send(snapshot(&[a.clone(), c.clone()], hash)).await.unwrap();
+            assert_eq!(applied(&wg_rx).await, vec![key32(2), key32(4)]);
+            assert_eq!(disco_cmds(&disco_rx), vec![("remove", key32(13)), ("allow", key32(14))],
+                "RemovePeer carries the removed peer's disco key; only the new peer is allowed");
+            send_to(&netif_tx, 3).await; // B's old address: no route any more
+            send_to(&netif_tx, 4).await; // C: routable
+            assert_eq!(routed_to(&wg_rx).await, key32(4), "B's address must not route; C's must");
+            assert!(matches!(ctrl_rx.try_recv(), Ok(ControlCmd::Refresh)), "a miss asks control for a refresh");
+            assert_eq!(tm_netstack::names::resolve("bravo.tn.ts.net"), None, "removed peer's name is gone");
+            assert_eq!(tm_netstack::names::resolve("charlie.tn.ts.net"), Some([100, 64, 0, 4].into()), "new peer resolves");
+
+            // 3. A rotates its disco key: old removed, new allowed.
+            let a2 = peer(2, 22, "alpha", hash);
+            ctrl_ev_tx.send(snapshot(&[a2.clone(), c.clone()], hash)).await.unwrap();
+            applied(&wg_rx).await;
+            assert_eq!(disco_cmds(&disco_rx), vec![("remove", key32(12)), ("allow", key32(22))]);
+
+            // 4. Nothing changed: the allowlist is not touched.
+            ctrl_ev_tx.send(snapshot(&[a2, c], hash)).await.unwrap();
+            applied(&wg_rx).await;
+            assert!(disco_cmds(&disco_rx).is_empty());
+
+            drop(ctrl_ev_tx);
+            let _ = within(router).await;
+        }).await;
     }
 }

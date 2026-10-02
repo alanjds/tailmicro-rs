@@ -64,7 +64,8 @@ impl Config {
     /// `MagicDns::Full`: the FQDN, plus short names when the tailnet has
     /// MagicDNS on, and a tailnet name wins over the WiFi DNS server. The
     /// table is filled from the netmap, so it holds at most 8 peers and
-    /// refreshes only when the control connection is re-established.
+    /// is rebuilt from every netmap snapshot (the boot map, then each periodic
+    /// or on-miss re-fetch, see `with_refresh_interval`).
     pub fn with_magicdns(mut self, mode: tm_netstack::names::MagicDns) -> Self {
         self.magicdns = mode;
         self
