@@ -14,6 +14,7 @@
 pub mod noise;
 pub mod map_scalars;
 pub mod map_stream;
+pub mod roster;
 pub mod pin;
 mod io;
 
@@ -27,6 +28,7 @@ use tm_h2::{
 };
 use tm_keys::NodeState;
 use noise::{NoiseChannel, do_noise_handshake};
+use roster::Roster;
 
 /// The control connection's transport: tokio TCP seen through
 /// `embedded-io-async`, the trait the Noise and H/2 code is written against.
@@ -77,7 +79,7 @@ impl TailnetIp {
     pub fn to_ipv4(&self) -> core::net::Ipv4Addr { core::net::Ipv4Addr::from(self.0) }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerInfo {
     pub node_key:    [u8; 32],
     pub disco_key:   [u8; 32],
@@ -162,7 +164,13 @@ pub struct MapState<const MAX_PEERS: usize = 8, const MAX_REGIONS: usize = 4> {
 
 // ── Capability version ────────────────────────────────────────────────────────
 
-/// Conservative version: avoids PeerChangesDelta (cap 72+).
+/// Capability version we advertise. Cap 72 does NOT gate streamed deltas (the
+/// comment here used to claim it avoids `PeerChangesDelta`): `OnlineChange` is
+/// cap 16, `PeersChangedPatch` cap 33 (DERPRegion) and 36 (Key, DiscoKey,
+/// Online), and cap 72 itself is only a UPnP fix. A cap-72 client therefore
+/// receives `PeersChanged`, `PeersRemoved`, patches and online changes on a
+/// streaming poll, and `map_stream` decodes all of them. The number is left
+/// alone because lowering or raising it would change nothing we depend on.
 pub const CAPABILITY_VERSION: u16 = 72;
 
 /// HTTP/2 stream IDs for this connection's three requests. Each new
@@ -266,6 +274,12 @@ pub const DEFAULT_REFRESH_INTERVAL: core::time::Duration = core::time::Duration:
 pub const MIN_REFRESH_GAP: core::time::Duration = core::time::Duration::from_secs(120);
 /// A re-poll whose response has not finished this long after the request was
 /// sent is abandoned, so one lost response cannot block every later re-poll.
+/// How long a burst of netmap deltas is gathered before one snapshot goes to
+/// the runtime. A snapshot costs a heap-allocated `MapState` and a router diff;
+/// control can send several deltas back to back (a peer joining is a
+/// `PeersChanged` plus patches), and the window is not extended by later
+/// deltas so a steady trickle still publishes every `EMIT_COALESCE`.
+const EMIT_COALESCE: core::time::Duration = core::time::Duration::from_millis(200);
 const REFRESH_RESPONSE_DEADLINE: core::time::Duration = core::time::Duration::from_secs(60);
 pub const MAX_SERVICE_DESC: usize = 32;
 pub const MAX_OS_VERSION: usize = 48;
@@ -688,7 +702,11 @@ impl ControlActor {
         // server's keepalive interval means a dead connection and triggers a
         // reconnect. See docs/wg-dataplane-notes.md "Bring-up timeout".
         let connect_timeout = self.config.connect_timeout;
-        let bring_up = self.bring_up(auth_key, events);
+        // The netmap lives here for the life of the actor's connection loop:
+        // bring-up fills it, the poll merges deltas into it. Boxed so the
+        // ~3 KB roster is not part of this future's state.
+        let mut roster = Box::new(Roster::new());
+        let bring_up = self.bring_up(auth_key, events, &mut roster);
         let (mut main_conn, mut noise, mut h2, node_key_hex, mut publish_ctx) = match connect_timeout {
             Some(dur) => tokio::time::timeout(dur, bring_up).await.map_err(|_| {
                 tracing::error!("Control bring-up exceeded connect_timeout ({:?})", dur);
@@ -737,7 +755,7 @@ impl ControlActor {
                 // now because bring-up just delivered a full netmap.
                 let mut ctl = PollCtl::new(cmds, node_key_hex.as_str(), &publish_ctx,
                                            self.config.refresh_interval);
-                let r = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_STREAM_ID, true,
+                let r = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, &mut roster, MAP_STREAM_ID, true,
                     Some(self.poll_idle_timeout), Some(&mut ctl)).await;
                 shutdown = ctl.shutdown;
                 r
@@ -760,7 +778,7 @@ impl ControlActor {
             // already resolved); we just keep retrying.
             tokio::time::sleep(backoff).await;
             backoff = core::cmp::min(backoff.saturating_mul(2), core::time::Duration::from_secs(30));
-            match self.bring_up(auth_key, events).await {
+            match self.bring_up(auth_key, events, &mut roster).await {
                 Ok((c, n, h, _, pc)) => {
                     main_conn = c; noise = n; h2 = h; publish_ctx = pc;
                     backoff = core::time::Duration::from_secs(1);
@@ -777,10 +795,14 @@ impl ControlActor {
     /// function itself — the caller (`connect_and_poll`) wraps the call in
     /// `tokio::time::timeout` when `connect_timeout` is set.
     async fn bring_up(&mut self, auth_key: &str,
-                       events: &async_channel::Sender<ControlEvent>)
+                       events: &async_channel::Sender<ControlEvent>,
+                       roster: &mut Roster)
         -> Result<(TokioStream, NoiseChannel, H2State, heapless::String<80>, PublishCtx), ControlError>
     {
         info!("Tailscale connect_and_poll starting");
+        // A new connection starts from an empty netmap: nothing carries over
+        // from a previous session whose deltas we may have missed.
+        roster.clear();
         let host = self.config.control_host;
         let port = self.config.control_port;
         info!("Tailscale connecting to {}:{}", host, port);
@@ -884,7 +906,7 @@ impl ControlActor {
         // a raw JSON body with an END_STREAM, so stream_map_response parses it
         // and returns at end_stream, emitting MapUpdate + OurIpAssigned.
         info!("Tailscale Step 7.5: reading + parsing publish MapResponse");
-        let home_region = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_PUBLISH_STREAM_ID, true, None, None).await?;
+        let home_region = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, roster, MAP_PUBLISH_STREAM_ID, true, None, None).await?;
 
         // Step 7.6 (new): re-publish with our DERP home so peers get a stable
         // relay path to us. Encoded two ways, together, per the confirmed
@@ -919,7 +941,7 @@ impl ControlActor {
             // Drain + parse the response (re-emits the authoritative netmap,
             // which is idempotent for the runtime: same IP -> netif no-op,
             // repeat DERP Connect ignored). Its own return value is unused.
-            let _ = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, MAP_REPUBLISH_STREAM_ID, false, None, None).await?;
+            let _ = self.stream_map_response(&mut main_conn, &mut noise, &mut h2, events, roster, MAP_REPUBLISH_STREAM_ID, false, None, None).await?;
         } else {
             tracing::warn!("Tailscale Step 7.6: no reachable DERP region in netmap; skipping home advertisement (inbound may be unreliable)");
         }
@@ -956,20 +978,29 @@ impl ControlActor {
         Ok(())
     }
 
-    /// Returns the DERP home region selected from the parsed netmap (via
-    /// `select_home_region`), if this response carried a non-empty map. The
-    /// caller re-publishes with this as its `PreferredDERP`; the runtime picks
-    /// the same region from the same `MapUpdate`. `None` for empty responses
-    /// (e.g. the keepalive poll), whose return value the caller ignores.
+    /// Returns the DERP home region selected from the latest published
+    /// netmap snapshot (via `select_home_region`), if any. The caller
+    /// re-publishes with this as its `PreferredDERP`; the runtime picks the
+    /// same region from the same `MapUpdate`.
+    ///
+    /// Every message of every stream is decoded into `roster`, which is the
+    /// one place the netmap lives; what reaches the runtime is always a whole
+    /// snapshot of it. The streaming poll (stream 7) is parsed in
+    /// `Mode::Delta`; the other streams carry full maps (`Mode::Full`). A
+    /// stream-7 message we cannot decode is a missed delta, so it ends the poll
+    /// with an error and the caller reconnects: silently continuing would let
+    /// the roster drift from control's view with nothing to correct it.
+    #[allow(clippy::too_many_arguments)]
     async fn stream_map_response<S: embedded_io_async::Read + embedded_io_async::Write>(
         &self, stream: &mut S, noise: &mut NoiseChannel,
         h2: &mut H2State, events: &async_channel::Sender<ControlEvent>,
+        roster: &mut Roster,
         expected_stream: u32, emit_events: bool,
         idle_timeout: Option<core::time::Duration>,
         mut poll: Option<&mut PollCtl<'_>>,
     ) -> Result<Option<u16>, ControlError> {
         info!("Tailscale stream_map_response starting on stream {} (emit_events={})", expected_stream, emit_events);
-        // Home region selected from the parsed netmap; returned to the caller.
+        // Home region selected from the latest snapshot; returned to the caller.
         let mut home_region: Option<u16> = None;
         // Fixed-capacity scratch buffer (heapless, no heap allocation).
         //
@@ -983,78 +1014,35 @@ impl ControlActor {
         // `read_exact` below overwrites the whole range, so we never zero-fill.
         const FRAME_BUF_CAP: usize = 4096;
         let mut frame_buf: heapless::Vec<u8, FRAME_BUF_CAP> = heapless::Vec::new();
-        // Both the non-streaming publish and the streaming poll frame each
-        // MapResponse as a 4-byte-LE length prefix + JSON (per
-        // tools/wg_validator/ts_control.py's read_full_body/read_stream_message
-        // + write_map), which `map_stream` parses incrementally.
+        // Each MapResponse is `u32-LE length + JSON`. The body is fed to the
+        // push parser as DATA frames arrive, so a ~34-48 KB netmap is never one
+        // contiguous allocation (that could not be satisfied on the fragmented
+        // heap, and discarding the map lost the data plane). Only the parser's
+        // ~1 KB feeder ring and the fixed roster are resident.
         //
-        // Message reassembly state. Each MapResponse is `u32-LE length + JSON`.
-        // We collect the 4-byte prefix first, then allocate the body buffer
-        // exactly once at `mlen` via a FALLIBLE reserve and append body bytes
-        // straight into it (appends never realloc, so peak transient == mlen).
-        // The reserve is fallible so an over-budget map (the live map is ~40 KB
-        // and, on a heap fragmented by the Noise handshake + actor tasks, may
-        // not have a contiguous block that big — see the notes) is handled by a
-        // graceful bail instead of an OOM abort/reboot-loop. NB: this only
-        // guards OUR allocation; the map still needs to fit the live heap budget
-        // to be delivered (rung 3). See docs/wg-dataplane-notes.md.
-        // Streaming (push) parse: the MapResponse body is fed to actson as the
-        // decrypted DATA frames arrive, so the ~34-48 KB netmap is never held in
-        // one contiguous allocation (which try_reserve_exact could not satisfy
-        // on the fragmented heap, forcing us to discard the whole netmap and
-        // lose the data plane). Only actson's ~1 KB feeder ring and the fixed
-        // MapState are ever resident. See map_stream. `fed` counts body bytes
-        // fed for the current message so we know when `mlen` is complete.
-        let mut parser: Option<map_stream::MapStreamParser<8, 4>> = None;
-        let mut fed = 0usize;
-        let mut prefix = [0u8; 4];
-        let mut prefix_have = 0usize;
-        let mut cur_len: Option<usize> = None;
+        // Two reassembly slots: the long poll (stream 7) and one other stream
+        // (publish, or the single in-flight re-poll). Poll mode interleaves
+        // their frames, and a message can span several of them.
+        let mut slots = [Reasm::new(), Reasm::new()];
         // The poll connection already announced our IP during bring-up; a
         // re-poll must not announce it again.
         let mut our_ip_sent = poll.is_some();
-        // The streaming keepalive poll (MAP_STREAM_ID) is a live HTTP/2 stream
-        // the control server watches: per ts_control.py's start_keepalive_poll,
-        // the server only keeps OUR node marked online while we keep draining
-        // it. The non-streaming publish (MAP_PUBLISH_STREAM_ID) is a one-shot
-        // snapshot that must still parse and return at end_stream, so only the
-        // streaming caller gets drain-and-discard on a length desync below.
-        let streaming = expected_stream == MAP_STREAM_ID;
-        // Drain-and-discard the streaming keepalive body from the very first
-        // byte: we deliberately never allocate or parse it.
-        //
-        // Once Hostinfo is included (see connect_and_poll), the server answers
-        // the Stream=true poll with the FULL netmap first (~34 KB of JSON,
-        // length-prefixed) and then holds the stream open for keepalives.
-        // try_reserve_exact-ing that 34 KB on a device with ~65 KB free and a
-        // ~40 KB DERP TLS connection to stand up next exhausts the heap and
-        // aborts (observed live: "memory allocation of 6052 bytes failed" in
-        // DerpTls::connect right after this poll). We do not need the streaming
-        // netmap anyway: the authoritative snapshot (our IP, peers, DERPMap)
-        // already came from the non-streaming publish during bring-up. So we
-        // consume every byte, keep sending WINDOW_UPDATEs (flow control below),
-        // and stay in the read loop so the server keeps us marked online, but
-        // allocate nothing. Parsing streaming deltas (to pick up peers that
-        // come online after boot) is the deferred v2 of card t_e34afeed.
-        //
-        // In poll mode the discard is per stream instead: the long poll's own
-        // payload is skipped by `parse_this` below, and `discarding` only
-        // marks a desynced re-poll stream (reset when that re-poll ends).
-        let mut discarding = streaming && poll.is_none();
 
         let mut idle_at = idle_timeout.map(|d| tokio::time::Instant::now() + d);
 
         loop {
-            // Poll mode only: between frames, start a due re-poll and, while the
-            // stream is quiet, wait for a trigger instead of a frame. Nothing
-            // here runs mid-frame, and a ready frame always wins over a timer
-            // (see `PollCtl::wait`), so a re-poll can delay the long poll by
-            // one request write at most and can never be starved by it either.
+            // Poll mode only: between frames, flush a coalesced snapshot that
+            // is due, start a due re-poll and, while the stream is quiet, wait
+            // for a trigger instead of a frame. Nothing here runs mid-frame, and
+            // a ready frame always wins over a timer (see `PollCtl::wait`).
             if let Some(ctl) = poll.as_deref_mut() {
+                if ctl.emit_due(tokio::time::Instant::now()) {
+                    publish_snapshot(roster, events, emit_events, &mut home_region).await;
+                }
                 if ctl.refresh_wanted(tokio::time::Instant::now(), h2) {
                     self.send_refresh(ctl, stream, noise).await?;
                     // Parse state belongs to the previous re-poll, if any.
-                    parser = None; fed = 0; cur_len = None; prefix_have = 0; discarding = false;
+                    slots[1].reset();
                 }
                 if ctl.shutdown { return Ok(home_region); }
                 if noise.buffered() == 0 {
@@ -1099,7 +1087,7 @@ impl ControlActor {
                     || hdr.frame_type == FRAME_TYPE_RST_STREAM;
                 if ends && ctl.finish_refresh(hdr.stream_id, h2) {
                     info!("Tailscale re-poll stream {} ended without a body (type {})", hdr.stream_id, hdr.frame_type);
-                    parser = None; fed = 0; cur_len = None; prefix_have = 0; discarding = false;
+                    slots[1].reset();
                     continue;
                 }
             }
@@ -1114,114 +1102,97 @@ impl ControlActor {
                     if cwu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,0,cwu); noise.write_all(stream,&b).await?; }
                     if swu > 0 { let mut b=[0u8;13]; write_window_update(&mut b,data_stream,swu); noise.write_all(stream,&b).await?; }
 
-                    // Feed the payload through the prefix -> body state machine.
-                    // A single frame may finish one message and begin the next
-                    // (streaming poll), so drive it with a cursor.
-                    // In poll mode only the re-poll's stream is parsed; the long
-                    // poll's own payload is still skipped, and so is anything on
-                    // a stream we no longer track.
+                    let is_long_poll = data_stream == MAP_STREAM_ID;
+                    let slot = &mut slots[usize::from(!is_long_poll)];
+                    // In poll mode only the long poll and the in-flight re-poll
+                    // are parsed; a stream we no longer track is skipped.
                     let parse_this = match poll.as_deref() {
-                        Some(ctl) => ctl.is_refresh_stream(data_stream),
+                        Some(ctl) => is_long_poll || ctl.is_refresh_stream(data_stream),
                         None => true,
                     };
-                    let mut pos = if discarding || !parse_this { payload.len() } else { 0usize };
+                    let mut pos = if slot.discarding || !parse_this { payload.len() } else { 0usize };
+                    // Feed the payload through the prefix -> body state machine.
+                    // A single frame may finish one message and begin the next.
                     while pos < payload.len() {
                         // Phase 1: collect the 4-byte LE length prefix.
-                        if cur_len.is_none() {
-                            while prefix_have < 4 && pos < payload.len() {
-                                prefix[prefix_have] = payload[pos];
-                                prefix_have += 1; pos += 1;
+                        if slot.cur_len.is_none() {
+                            while slot.prefix_have < 4 && pos < payload.len() {
+                                slot.prefix[slot.prefix_have] = payload[pos];
+                                slot.prefix_have += 1; pos += 1;
                             }
-                            if prefix_have < 4 { break; }
-                            let mlen = u32::from_le_bytes(prefix) as usize;
+                            if slot.prefix_have < 4 { break; }
+                            let mlen = u32::from_le_bytes(slot.prefix) as usize;
                             // Sanity cap: a desynced stream reads a garbage length
-                            // (seen live as ~1.95 GB on the Stream=true keepalive)
-                            // that would OOM-abort with_capacity. Bail gracefully;
-                            // the netmap already came from the publish response.
+                            // (seen live as ~1.95 GB on the Stream=true keepalive).
                             if mlen > MAX_MAP_MSG {
-                                // Desynced/garbage length prefix. Discard the rest
-                                // of the stream to end_stream (rather than return
-                                // and orphan unread frames) so the connection stays
-                                // byte-consistent for the next request. Applies to
-                                // both the streaming keepalive (stay online) and the
-                                // non-streaming publish.
-                                info!("Tailscale stream_map_response: implausible message length {} on stream {}, discarding rest of stream", mlen, expected_stream);
-                                discarding = true;
-                                prefix_have = 0;
-                                cur_len = None;
+                                if is_long_poll {
+                                    // The long poll cannot be resynced mid-stream.
+                                    tracing::warn!("Tailscale poll: implausible message length {}; reconnecting", mlen);
+                                    return Err(ControlError::Json(JsonError::ParseError));
+                                }
+                                // Discard the rest of the stream to end_stream
+                                // (rather than return and orphan unread frames)
+                                // so the connection stays byte-consistent for
+                                // the next request.
+                                info!("Tailscale stream_map_response: implausible message length {} on stream {}, discarding rest of stream", mlen, data_stream);
+                                slot.discarding = true;
+                                slot.prefix_have = 0;
                                 break;
                             }
-                            // Start a fresh streaming parse for this message. No
-                            // `mlen`-byte allocation happens here or below: body
-                            // bytes are pushed into actson's bounded feeder as
-                            // they arrive, so a netmap too large to buffer (a
-                            // ~47 KB map on a fragmented ~57 KB heap, inflated by
-                            // ephemeral ghost peers) still parses instead of
-                            // forcing a discard that would drop the data plane.
-                            parser = Some(map_stream::MapStreamParser::new());
-                            fed = 0;
-                            cur_len = Some(mlen);
+                            let mode = if is_long_poll { map_stream::Mode::Delta } else { map_stream::Mode::Full };
+                            slot.parser = Some(map_stream::MapStreamParser::new(mode, roster));
+                            slot.fed = 0;
+                            slot.cur_len = Some(mlen);
                         }
 
                         // Phase 2: feed body bytes up to the known length.
-                        let want = cur_len.unwrap();
-                        let take = core::cmp::min(want - fed, payload.len() - pos);
-                        if let Some(p) = parser.as_mut() {
+                        let want = slot.cur_len.unwrap_or(0);
+                        let take = core::cmp::min(want - slot.fed, payload.len() - pos);
+                        if let Some(p) = slot.parser.as_mut() {
                             // A feed error is recorded inside the parser and
-                            // surfaced by finish(); we keep consuming every body
-                            // byte regardless so the stream stays byte-consistent.
-                            let _ = p.push(&payload[pos..pos + take]);
+                            // surfaced by finish(); every body byte is still
+                            // consumed so the stream stays byte-consistent.
+                            let _ = p.push(&payload[pos..pos + take], roster);
                         }
                         pos += take;
-                        fed += take;
-                        if fed < want { break; }
+                        slot.fed += take;
+                        if slot.fed < want { break; }
 
-                        // Complete message: finish the parse + emit, then reset.
-                        let parsed = parser.take().map(|p| p.finish());
+                        // Complete message: finish the parse, then act on it.
+                        let parsed = slot.parser.take().map(|p| p.finish(roster));
+                        slot.reset_message();
                         match parsed {
-                            Some(Ok(map)) => {
-                                if emit_events && !our_ip_sent && map.our_ip.0 != [0u8; 4] {
+                            Some(Ok(())) => {
+                                if emit_events && !our_ip_sent && roster.our_ip().0 != [0u8; 4] {
                                     our_ip_sent = true;
-                                    info!("Tailscale OurIpAssigned event sent: {}.{}.{}.{}", map.our_ip.0[0], map.our_ip.0[1], map.our_ip.0[2], map.our_ip.0[3]);
-                                    let _ = events.send(ControlEvent::OurIpAssigned(map.our_ip.clone())).await;
+                                    let ip = roster.our_ip().clone();
+                                    info!("Tailscale OurIpAssigned event sent: {}.{}.{}.{}", ip.0[0], ip.0[1], ip.0[2], ip.0[3]);
+                                    let _ = events.send(ControlEvent::OurIpAssigned(ip)).await;
                                 }
-                                // Skip empty snapshots (the keepalive poll returns
-                                // near-empty deltas that would clobber the netmap
-                                // the publish response already delivered).
-                                let non_empty = !map.peers.is_empty()
-                                    || map.our_ip.0 != [0u8; 4]
-                                    || !map.derp_regions.is_empty();
-                                if non_empty {
-                                    // Select our DERP home from the same snapshot
-                                    // the runtime will get, so both agree (see
-                                    // select_home_region). Computed before `map`
-                                    // is moved into the event.
-                                    if let Some(hr) = select_home_region(&map) {
-                                        home_region = Some(hr);
-                                    }
-                                    if emit_events {
-                                        info!("Tailscale MapUpdate event sent ({} peers, {} DERP regions, home_derp={:?})", map.peers.len(), map.derp_regions.len(), home_region);
-                                        let _ = events.send(ControlEvent::MapUpdate(Box::new(map))).await;
-                                    } else {
-                                        // Publish #2 drain: parsed only to complete
-                                        // the stream; the runtime already has this
-                                        // netmap from publish #1, so re-emitting
-                                        // would double OurIpAssigned/MapUpdate.
-                                        info!("Tailscale MapResponse parsed, not re-emitted ({} peers, {} DERP regions, home_derp={:?})", map.peers.len(), map.derp_regions.len(), home_region);
+                                if roster.take_dirty() {
+                                    match poll.as_deref_mut() {
+                                        // Bursts of deltas collapse into one
+                                        // snapshot, sent at the loop top.
+                                        Some(ctl) => ctl.note_change(tokio::time::Instant::now()),
+                                        None => publish_snapshot(roster, events, emit_events, &mut home_region).await,
                                     }
                                 } else {
-                                    info!("Tailscale MapUpdate skipped (empty snapshot)");
+                                    debug!("Tailscale map message changed nothing (stream {})", data_stream);
                                 }
                             }
-                            Some(Err(e)) => { info!("Tailscale map_stream parse error: {:?}", e); }
-                            None => {} // unreachable: parser is Some for a non-discarding message
+                            Some(Err(e)) if is_long_poll || poll.is_none() => {
+                                // A missed delta, or an unusable bring-up map.
+                                tracing::warn!("Tailscale map_stream parse error on stream {}: {:?}", data_stream, e);
+                                return Err(ControlError::Json(JsonError::ParseError));
+                            }
+                            Some(Err(e)) => {
+                                // A re-poll is only a correction pass; the
+                                // roster keeps what it had (a failed replace
+                                // never sweeps).
+                                tracing::warn!("Tailscale re-poll map parse error: {:?}", e);
+                            }
+                            None => {}
                         }
-                        // Drop the parser before reading the next message so two
-                        // parse states never coexist.
-                        parser = None;
-                        fed = 0;
-                        cur_len = None;
-                        prefix_have = 0;
                     }
 
                     if end_stream {
@@ -1231,13 +1202,16 @@ impl ControlActor {
                                 // poll carries on.
                                 h2.stream_done(data_stream);
                                 if ctl.finish_refresh(data_stream, h2) {
-                                    parser = None; fed = 0; cur_len = None; prefix_have = 0; discarding = false;
+                                    slots[1].reset();
                                 }
                                 info!("Tailscale re-poll stream {} complete", data_stream);
                             }
                             _ => {
                                 info!("Tailscale stream ended");
                                 h2.stream_done(data_stream);
+                                if poll.as_deref().is_some_and(|c| c.emit_pending()) {
+                                    publish_snapshot(roster, events, emit_events, &mut home_region).await;
+                                }
                                 return Ok(home_region);
                             }
                         }
@@ -1253,6 +1227,59 @@ impl ControlActor {
                 FrameAction::Ignore => {}
             }
         }
+    }
+}
+
+/// Reassembly state of one stream's `u32-LE length + JSON` messages.
+struct Reasm {
+    parser: Option<map_stream::MapStreamParser>,
+    /// Body bytes of the current message fed so far.
+    fed: usize,
+    prefix: [u8; 4],
+    prefix_have: usize,
+    cur_len: Option<usize>,
+    /// A re-poll or publish stream with a garbage length prefix: the rest of
+    /// the stream is skipped to its end.
+    discarding: bool,
+}
+
+impl Reasm {
+    const fn new() -> Self {
+        Self { parser: None, fed: 0, prefix: [0; 4], prefix_have: 0, cur_len: None, discarding: false }
+    }
+    /// Between messages of one stream.
+    fn reset_message(&mut self) {
+        self.parser = None; self.fed = 0; self.cur_len = None; self.prefix_have = 0;
+    }
+    /// A new stream takes over the slot.
+    fn reset(&mut self) {
+        self.reset_message();
+        self.discarding = false;
+    }
+}
+
+/// Send the roster's current snapshot to the runtime (and remember the DERP
+/// home it implies). An empty roster is skipped so a content-free message
+/// can never clobber a netmap the runtime already has.
+async fn publish_snapshot(
+    roster: &Roster, events: &async_channel::Sender<ControlEvent>,
+    emit_events: bool, home_region: &mut Option<u16>,
+) {
+    if !roster.has_content() {
+        info!("Tailscale MapUpdate skipped (empty snapshot)");
+        return;
+    }
+    let map = roster.snapshot();
+    // Select our DERP home from the same snapshot the runtime will get, so both
+    // agree (see select_home_region).
+    if let Some(hr) = select_home_region(&map) { *home_region = Some(hr); }
+    if emit_events {
+        info!("Tailscale MapUpdate event sent ({} peers, {} DERP regions, home_derp={:?})", map.peers.len(), map.derp_regions.len(), home_region);
+        let _ = events.send(ControlEvent::MapUpdate(map)).await;
+    } else {
+        // Publish #2 drain: the runtime already has this netmap from publish
+        // #1, so re-emitting would double OurIpAssigned/MapUpdate.
+        info!("Tailscale MapResponse parsed, not re-emitted ({} peers, {} DERP regions, home_derp={:?})", map.peers.len(), map.derp_regions.len(), home_region);
     }
 }
 
@@ -1306,6 +1333,10 @@ pub(crate) struct PollCtl<'a> {
     cmd_pending: bool,
     /// A `Shutdown` arrived (or the command channel closed).
     pub(crate) shutdown: bool,
+    /// When the roster changes gathered since the last snapshot are due to be
+    /// published. Set by the first change, never moved by later ones.
+    emit_at: Option<tokio::time::Instant>,
+    coalesce: core::time::Duration,
 }
 
 impl<'a> PollCtl<'a> {
@@ -1317,6 +1348,7 @@ impl<'a> PollCtl<'a> {
             next_stream_id: MAP_STREAM_ID + 2,
             last_refresh: tokio::time::Instant::now(),
             inflight: None, cmd_pending: false, shutdown: false,
+            emit_at: None, coalesce: EMIT_COALESCE,
         }
     }
 
@@ -1324,8 +1356,31 @@ impl<'a> PollCtl<'a> {
         matches!(self.inflight, Some((i, _)) if i == id)
     }
 
+    /// The roster changed: schedule a snapshot unless one is already due.
+    fn note_change(&mut self, now: tokio::time::Instant) {
+        if self.emit_at.is_none() { self.emit_at = Some(now + self.coalesce); }
+    }
+
+    /// `true` (once) when the gathered changes should be published now.
+    fn emit_due(&mut self, now: tokio::time::Instant) -> bool {
+        match self.emit_at {
+            Some(t) if now >= t => { self.emit_at = None; true }
+            _ => false,
+        }
+    }
+
+    fn emit_pending(&self) -> bool { self.emit_at.is_some() }
+
     /// The earliest instant a time-based decision is due.
     fn next_timer(&self) -> Option<tokio::time::Instant> {
+        let base = self.next_refresh_timer();
+        match (base, self.emit_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn next_refresh_timer(&self) -> Option<tokio::time::Instant> {
         match self.inflight {
             Some((_, sent)) => Some(sent + self.response_deadline),
             None => {
@@ -1926,7 +1981,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         let r = tokio::time::timeout(
             Duration::from_secs(5),
-            actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_STREAM_ID, true,
+            actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, &mut Roster::new(), MAP_STREAM_ID, true,
                                       Some(Duration::from_millis(80)), None),
         ).await.expect("the watchdog must fire, not hang");
         assert!(matches!(r, Err(ControlError::PollIdle)), "got {:?}", r.map(|_| ()));
@@ -1951,7 +2006,8 @@ mod tests {
             std::future::pending::<()>().await
         };
         let t0 = std::time::Instant::now();
-        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_STREAM_ID, true,
+        let mut roster = Roster::new();
+        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, &mut roster, MAP_STREAM_ID, true,
                                              Some(Duration::from_millis(100)), None);
         let r = tokio::select! {
             r = poll => r,
@@ -1973,7 +2029,7 @@ mod tests {
         let mut h2 = H2State::new();
         let r = tokio::time::timeout(
             Duration::from_millis(200),
-            actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_PUBLISH_STREAM_ID, true, None, None),
+            actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, &mut Roster::new(), MAP_PUBLISH_STREAM_ID, true, None, None),
         ).await;
         assert!(r.is_err(), "no watchdog: the read must still be pending");
     }
@@ -2046,7 +2102,8 @@ mod tests {
         let mut h2 = H2State::new();
         let mut ctl = PollCtl::new(&cmd_rx, NODE_HEX, &publish, Some(Duration::from_millis(40)));
         ctl.min_gap = Duration::from_millis(10);
-        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_STREAM_ID, true,
+        let mut roster = Roster::new();
+        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, &mut roster, MAP_STREAM_ID, true,
                                              Some(Duration::from_secs(5)), Some(&mut ctl));
         let script = async {
             let req = server.read_request(9).await;
@@ -2094,7 +2151,8 @@ mod tests {
         let mut h2 = H2State::new();
         let mut ctl = PollCtl::new(&cmd_rx, NODE_HEX, &publish, None);
         ctl.min_gap = Duration::from_millis(150);
-        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_STREAM_ID, true,
+        let mut roster = Roster::new();
+        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, &mut roster, MAP_STREAM_ID, true,
                                              Some(Duration::from_secs(5)), Some(&mut ctl));
         let script = async {
             let t0 = std::time::Instant::now();
@@ -2113,6 +2171,124 @@ mod tests {
         assert!(r.is_ok());
     }
 
+    fn with_id(peer: &str, id: u64) -> String {
+        peer.replacen("{\"Key\"", &format!("{{\"ID\":{},\"Key\"", id), 1)
+    }
+
+    /// Streamed deltas on the long poll are merged into the roster and
+    /// published as whole snapshots; a burst of them becomes ONE MapUpdate.
+    #[tokio::test]
+    async fn stream_deltas_merge_into_snapshots_and_bursts_coalesce() {
+        let PollRig { mut cn, mut cio, mut server, ev_tx, ev_rx, cmd_tx, cmd_rx, actor, publish } = PollRig::new();
+        let mut h2 = H2State::new();
+        let mut ctl = PollCtl::new(&cmd_rx, NODE_HEX, &publish, None);
+        ctl.coalesce = Duration::from_millis(60);
+        let mut roster = Roster::new();
+        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, &mut roster, MAP_STREAM_ID, true,
+                                             Some(Duration::from_secs(5)), Some(&mut ctl));
+        let a = with_id(PEER_A, 1);
+        let b = with_id(PEER_B, 2);
+        let script = async {
+            // The stream's first message is a whole map.
+            server.map_msg(MAP_STREAM_ID, &map_json(&[&a]), false).await;
+            match ev_rx.recv().await.unwrap() {
+                ControlEvent::MapUpdate(m) => assert_eq!(m.peers.len(), 1),
+                _ => panic!("expected MapUpdate"),
+            }
+            // A burst: an add, a DERP-home patch and a keepalive, back to back.
+            server.map_msg(MAP_STREAM_ID, &format!(r#"{{"PeersChanged":[{}]}}"#, b), false).await;
+            server.map_msg(MAP_STREAM_ID, r#"{"PeersChangedPatch":[{"NodeID":1,"DERPRegion":3}]}"#, false).await;
+            server.map_msg(MAP_STREAM_ID, r#"{"KeepAlive":true}"#, false).await;
+            match ev_rx.recv().await.unwrap() {
+                ControlEvent::MapUpdate(m) => {
+                    assert_eq!(m.peers.len(), 2, "the add is in the snapshot");
+                    assert_eq!(m.peers[0].derp_region, 3, "and so is the patch, in the same one");
+                    assert_eq!(m.peers[1].hostname.as_str(), "peer-b");
+                }
+                _ => panic!("expected MapUpdate"),
+            }
+            assert!(tokio::time::timeout(Duration::from_millis(300), ev_rx.recv()).await.is_err(),
+                    "a burst must not produce a second MapUpdate");
+            // Keepalives alone change nothing and publish nothing.
+            server.map_msg(MAP_STREAM_ID, r#"{"KeepAlive":true}"#, false).await;
+            assert!(tokio::time::timeout(Duration::from_millis(200), ev_rx.recv()).await.is_err());
+            // An offline patch leaves the snapshot but needs no key from control.
+            server.map_msg(MAP_STREAM_ID, r#"{"PeersChangedPatch":[{"NodeID":2,"Online":false}]}"#, false).await;
+            match ev_rx.recv().await.unwrap() {
+                ControlEvent::MapUpdate(m) => assert_eq!(m.peers.len(), 1),
+                _ => panic!("expected MapUpdate"),
+            }
+            server.map_msg(MAP_STREAM_ID, r#"{"PeersChangedPatch":[{"NodeID":2,"Online":true}]}"#, false).await;
+            match ev_rx.recv().await.unwrap() {
+                ControlEvent::MapUpdate(m) => assert_eq!(m.peers.len(), 2, "back online with its old key and IP"),
+                _ => panic!("expected MapUpdate"),
+            }
+            server.map_msg(MAP_STREAM_ID, r#"{"PeersRemoved":[1]}"#, false).await;
+            match ev_rx.recv().await.unwrap() {
+                ControlEvent::MapUpdate(m) => assert_eq!(m.peers.len(), 1),
+                _ => panic!("expected MapUpdate"),
+            }
+            cmd_tx.send(ControlCmd::Shutdown).await.unwrap();
+        };
+        let (r, ()) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(poll, script) })
+            .await.expect("poll hung");
+        assert!(r.is_ok(), "{:?}", r.map(|_| ()));
+    }
+
+    /// A stream message we cannot decode is a missed delta: the poll ends with
+    /// an error so the caller reconnects and starts from a fresh map.
+    #[tokio::test]
+    async fn undecodable_or_oversize_stream_message_ends_the_poll() {
+        for bad in [b"not json".to_vec(), (0xFFFF_FFFFu32).to_le_bytes().to_vec()] {
+            let PollRig { mut cn, mut cio, mut server, ev_tx, ev_rx: _ev_rx, cmd_tx: _cmd_tx, cmd_rx, actor, publish } = PollRig::new();
+            let mut h2 = H2State::new();
+            let mut ctl = PollCtl::new(&cmd_rx, NODE_HEX, &publish, None);
+            let mut roster = Roster::new();
+            let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, &mut roster, MAP_STREAM_ID, true,
+                                                 Some(Duration::from_secs(5)), Some(&mut ctl));
+            let script = async {
+                if bad.len() == 4 {
+                    server.frame(0, 0, MAP_STREAM_ID, &bad).await;
+                } else {
+                    server.map_msg(MAP_STREAM_ID, std::str::from_utf8(&bad).unwrap(), false).await;
+                }
+            };
+            let (r, ()) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(poll, script) })
+                .await.expect("poll hung");
+            assert!(matches!(r, Err(ControlError::Json(_))), "{:?}", r.map(|_| ()));
+        }
+    }
+
+    /// A broken re-poll response is only a failed correction: the roster keeps
+    /// its peers and the long poll carries on.
+    #[tokio::test]
+    async fn broken_repoll_response_is_survivable() {
+        let PollRig { mut cn, mut cio, mut server, ev_tx, ev_rx, cmd_tx, cmd_rx, actor, publish } = PollRig::new();
+        let mut h2 = H2State::new();
+        let mut ctl = PollCtl::new(&cmd_rx, NODE_HEX, &publish, None);
+        ctl.min_gap = Duration::from_millis(10);
+        ctl.coalesce = Duration::from_millis(30);
+        let mut roster = Roster::new();
+        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, &mut roster, MAP_STREAM_ID, true,
+                                             Some(Duration::from_secs(5)), Some(&mut ctl));
+        let script = async {
+            server.map_msg(MAP_STREAM_ID, &map_json(&[PEER_A]), false).await;
+            let _ = ev_rx.recv().await.unwrap();
+            cmd_tx.send(ControlCmd::Refresh).await.unwrap();
+            let _ = server.read_request(9).await;
+            server.map_msg(9, r#"{"Peers":[{"Key":"#, true).await;
+            server.map_msg(MAP_STREAM_ID, &format!(r#"{{"PeersChanged":[{}]}}"#, with_id(PEER_B, 5)), false).await;
+            match ev_rx.recv().await.unwrap() {
+                ControlEvent::MapUpdate(m) => assert_eq!(m.peers.len(), 2, "PEER_A survived the broken re-poll"),
+                _ => panic!("expected MapUpdate"),
+            }
+            cmd_tx.send(ControlCmd::Shutdown).await.unwrap();
+        };
+        let (r, ()) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(poll, script) })
+            .await.expect("poll hung");
+        assert!(r.is_ok(), "{:?}", r.map(|_| ()));
+    }
+
     /// A re-poll whose response never completes is abandoned after the
     /// deadline, and a stray late frame from it is skipped without breaking the
     /// next one.
@@ -2123,7 +2299,8 @@ mod tests {
         let mut ctl = PollCtl::new(&cmd_rx, NODE_HEX, &publish, Some(Duration::from_millis(30)));
         ctl.min_gap = Duration::from_millis(10);
         ctl.response_deadline = Duration::from_millis(80);
-        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_STREAM_ID, true,
+        let mut roster = Roster::new();
+        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, &mut roster, MAP_STREAM_ID, true,
                                              Some(Duration::from_secs(5)), Some(&mut ctl));
         let script = async {
             let _ = server.read_request(9).await;
@@ -2155,7 +2332,8 @@ mod tests {
         let mut h2 = H2State::new();
         let mut ctl = PollCtl::new(&cmd_rx, NODE_HEX, &publish, Some(Duration::from_millis(30)));
         ctl.min_gap = Duration::from_millis(10);
-        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_STREAM_ID, true,
+        let mut roster = Roster::new();
+        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, &mut roster, MAP_STREAM_ID, true,
                                              Some(Duration::from_secs(5)), Some(&mut ctl));
         let script = async {
             let _ = server.read_request(9).await;
@@ -2176,7 +2354,8 @@ mod tests {
         let PollRig { mut cn, mut cio, mut server, ev_tx, ev_rx: _ev_rx, cmd_tx: _cmd_tx, cmd_rx, actor, publish } = PollRig::new();
         let mut h2 = H2State::new();
         let mut ctl = PollCtl::new(&cmd_rx, NODE_HEX, &publish, None);
-        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, MAP_STREAM_ID, true,
+        let mut roster = Roster::new();
+        let poll = actor.stream_map_response(&mut cio, &mut cn, &mut h2, &ev_tx, &mut roster, MAP_STREAM_ID, true,
                                              Some(Duration::from_millis(150)), Some(&mut ctl));
         let script = async {
             let quiet = tokio::time::timeout(Duration::from_millis(100), server.read_frame()).await;
