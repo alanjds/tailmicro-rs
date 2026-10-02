@@ -1091,11 +1091,9 @@ async fn event_router_task(
                             // fix): a DERP drop used to be visible only in
                             // debug builds. DerpActor itself now redials with
                             // backoff; this is a belt-and-suspenders nudge in
-                            // case that ever regresses -- re-sending the same
-                            // last-known-good Connect target here is harmless
-                            // even while the actor is already redialing on its
-                            // own (a repeat Connect to an already-connecting
-                            // actor is a no-op).
+                            // case that ever regresses. The actor ignores a
+                            // Connect for its current target while it waits out
+                            // a redial backoff, so this cannot defeat the backoff.
                             if let Some((host, port)) = last_derp_target.clone() {
                                 info!("Runtime::join() - DERP disconnected; nudging reconnect to {}:{}", host.as_str(), port);
                                 let _ = derp_tx2.send(DerpCmd::Connect {
