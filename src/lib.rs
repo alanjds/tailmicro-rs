@@ -55,6 +55,10 @@ pub use tm_netstack::names::MagicDns;
 pub use tm_control::{Service, ServiceProto, MAX_SERVICES, MAX_SERVICE_DESC};
 pub use tm_keys::NodeState;
 pub use tm_runtime::{tokio_freertos_yield, OurIpReceiver, OurIpSender};
+/// The data-plane future returned by [`Device::connect`]; the same type as
+/// `tm_runtime::Driver`, re-exported so apps need not depend on `tm_runtime`
+/// just to name it.
+pub use tm_runtime::Driver;
 
 pub mod config;
 mod error;
@@ -111,7 +115,7 @@ impl Device {
     pub async fn connect(
         config: &Config,
         auth_key: Option<String>,
-    ) -> Result<(Self, tm_runtime::Driver), Error> {
+    ) -> Result<(Self, Driver), Error> {
         tracing::debug!("Device::connect() - starting device initialization");
 
         tm_netstack::names::set_mode(config.magicdns);
@@ -190,4 +194,17 @@ pub mod keys {
         NodePrivateKey, NodePublicKey,
         NodeState,
     };
+}
+
+#[cfg(test)]
+mod driver_reexport {
+    /// `tailmicro::Driver` is the very type `Device::connect` hands back, so
+    /// apps can swap `tm_runtime::Driver` for it with no other change.
+    #[test]
+    fn driver_is_the_runtime_driver() {
+        fn same(d: tm_runtime::Driver) -> crate::Driver {
+            d
+        }
+        let _ = same;
+    }
 }
