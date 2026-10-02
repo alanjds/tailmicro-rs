@@ -1697,6 +1697,48 @@ unaffected (gap connect p50 115-128 ms against Step 11's 122-124).
 this state (about 170 ms over DERP, about 100 ms direct), so none of it
 is being pursued now.
 
+### Step 13 (2026-10-02): netmap refresh keeps every buffer bounded
+
+The control poll used to drop every DATA payload after boot. It now decodes
+streamed netmap messages (and the stream's own first full map), so it holds a
+few new buffers. All are fixed-capacity (`heapless` / `ArrayVec`); nothing
+grows with the size of the netmap.
+
+| Buffer | Size | Where it lives | Lifetime |
+|---|---|---|---|
+| `Roster` (16 peers incl. offline, 4 DERP regions, names) | about 3.8 KB (host 64-bit measurement; the 32-bit figure is smaller and not measured) | boxed once in `connect_and_poll` | whole session |
+| `MapStreamParser` (actson feeder ring plus scalar state) | about 1 KB each, 2 slots (long poll and one re-poll) | inline in the pinned poll future | per streamed message |
+| `Reasm` length prefix assembly | 4 B per slot | same | per message |
+| `ControlEvent::MapUpdate(Box<MapState>)` | one boxed snapshot of at most `MAX_PEERS=8` peers | allocated per published snapshot, freed by the runtime | per snapshot |
+
+Notes:
+
+- The old code kept `OmitPeers=true` on the stream because a full netmap
+  parsed on the held-open poll aborted with an 8 KB allocation failure. The
+  push parser never materialises the body, so the stream now asks for
+  `OmitPeers=false`. Only the 4096-byte `FRAME_BUF_CAP` frame buffer and the
+  two parser slots see the 29 KB first message, 4 KB at a time.
+- `ROSTER_CAP=16` is larger than `MAX_PEERS=8` on purpose: headscale reports
+  online/offline as a patch without the key, IP or DERP home, so an offline
+  peer must stay in the roster to come back. The snapshot is online-only and
+  capped at 8 in control's order, with an error log when more are dropped.
+- Snapshots are coalesced (`EMIT_COALESCE`, 200 ms) except the first one, so a
+  burst of deltas costs one boxed snapshot, not one per message.
+
+Real ESP32-C3 (bring-up from the stream's first message, 3 peers, 4 DERP
+regions, one run each, so treat as indicative; the DERP TLS handshake timing
+moves these numbers):
+
+| | Before this series (`8632112`) | After (`56a08c9`) |
+|---|---|---|
+| registration to tailnet IP | 7.9 s | 7.0 s |
+| "Heap after device connect" | 54.5 KB free | 58.9 KB free |
+| heap-watch minimum largest block | 20480 B | 28672 B (330 s soak) |
+
+Not measured: per-poll heap while a real delta arrives (the tailnet did not
+change during the soak, so only 22-byte keepalive messages were seen after the
+first map), and the main-stack high-water mark (nothing logs it).
+
 ## Possible future improvements
 
 Options recorded for later, after Step 12. None is implemented, and none

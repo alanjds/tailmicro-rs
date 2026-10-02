@@ -136,3 +136,37 @@ Risks:
 ## Not verified
 
 Real-control behavior for `Stream=true` plus `omit_peers=true`; half-open TCP detection; WG behavior for inbound handshakes from unknown keys; the actual size of a mid-session delta on a real tailnet; whether control rate-limits repeated non-streaming map requests; per-poll heap behavior on device.
+
+## Implementation status
+
+Branch `simplification-survey`. Each phase below says what is done, what was measured and what is unverified.
+
+### Phase 0 (watchdog): done
+- `d4f126a`: the streaming poll has a read watchdog (`POLL_IDLE_TIMEOUT`, a little over the server keepalive); expiry returns an error so the actor reconnects. Host test with a silent stream.
+- Measured: nothing on device. Unverified: half-open TCP detection on a real network (the host test uses a silent local socket).
+
+### Phase 1 (re-poll safety net): done
+- `75ae17d`: rate-limited full re-poll on the live connection, by timer (`Config::refresh_interval`, off unless the firmware sets it) and on a router `ip_to_key` miss (`request_refresh_on_miss`). The re-poll resends the publish body, because a non-streaming `OmitPeers=false` request is a write at cap 68 and above.
+- Finding: Headscale answers a non-streaming `OmitPeers=false` request with an empty 200, so the timed and miss re-poll only yields a netmap on Tailscale SaaS. On Headscale the stream's first message and deltas are the only path. The firmware does not set `refresh_interval`, so only the miss trigger is live.
+- Fix found on the way (same commit): per-stream HTTP/2 credit in `tm_h2`. The old shared counter double counted and could send the stream WINDOW_UPDATE for the wrong stream, which over-granted the server window beyond the 4096-byte frame cap.
+- Unverified on device: a real re-poll against Tailscale SaaS.
+
+### Phase 2 (router/WG/disco diff, streamed deltas): done
+- `feaaf06`: `apply_map` diffs existing peers (disco key, WG endpoint, DERP region, IP) and removes vanished ones from the router, WG and disco. Also fixed a WG peer-id bug found by the new diff tests.
+- `03fb48d`: `MapStreamParser` decodes streamed messages (full `Peers`, `PeersChanged`, `PeersRemoved`, `PeersChangedPatch`, `OnlineChange`, `DERPMap`, `KeepAlive`) into a bounded `Roster`. Golden JSON frames are constructed from the Go field names (no real capture), with chunk size sweeps down to one byte.
+- `56a08c9`: the stream asks for `OmitPeers=false` and its first message is the bring-up netmap. Publishes #1 and #2 are lite (`OmitPeers=true`, empty 200). `Device::connect` still returns on `OurIpAssigned` and keeps `connect_timeout`, now as a readiness deadline in the poll loop. The timed and miss re-poll stays as a rare fallback. Stream ids are 3 (publish #1), 5 (poll), 7 (publish #2), 9 and up (re-polls).
+- Measured on a real ESP32-C3 (one boot of the final build, 330 s soak): bring-up reached `100.75.48.69` from the stream's first message, 3 peers and 4 DERP regions, MagicDNS table built with 4 names including `bospill`, WG synced 3 peers, DERP home 11 connected, direct LAN path established, no panic, OOM or watchdog. Registration to IP took 7.0 s against 7.9 s for the pre-series build. Numbers in `ALLOCATIONS.md` Step 13.
+- The 29 KB first message arrives one 4096-byte frame per roughly 0.92 s. The parse itself costs about 10 ms per frame (measured with a temporary timer, removed), so the pacing is the HTTP/2 window (`INITIAL_WINDOW=4096`) times the control round trip. Raising the window needs `FRAME_BUF_CAP` to grow with it and is not done.
+
+### Policies as implemented
+- `MAX_PEERS=8` is applied to the snapshot, not the roster. Every refresh replaces the whole peer list, keeps control's order, and logs an error for the 9th and later.
+- `ROSTER_CAP=16` retains offline peers, because Headscale sends presence as `PeersChangedPatch [{NodeID, Online}]` only.
+- Online-only filtering stays. A peer reported offline is removed from WG at the next snapshot and re-added (with a new handshake) when it reports online again. There is no hysteresis, so a flapping peer churns.
+- The MagicDNS table is rebuilt on every snapshot.
+- Headscale sends `HomeDERP` (an int), not the legacy `DERP` string. The old parser ignored it, so Headscale peers had `derp_region` 0; it is read now.
+- `CAPABILITY_VERSION` stays 72. Only the comment was wrong: `OnlineChange` is from cap 16, `PeersChangedPatch` from 33 (`DERPRegion`) and 36 (`Key`, `DiscoKey`, `Online`), and 72 added only a UPnP fix.
+
+### Known gaps
+- A change of our own home DERP region is not applied: `DerpCmd::Connect` is ignored once connected. Peers' DERP homes are updated.
+- An undecodable stream message reconnects instead of continuing, because a missed delta would drift silently. A first-session failure still ends `run()` without a retry (unchanged).
+- Per-poll heap with a real delta, the stack high-water mark, `bospill` name resolution through the lwIP hook (only the table contents were observed), a peer going offline and online on a real tailnet, and a re-poll against Tailscale SaaS were not exercised on the device.
