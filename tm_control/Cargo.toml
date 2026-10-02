@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Tailscale control plane: Noise IK, ts2021, streaming MapResponse"
 
 [dependencies]
+tm_buf.workspace  = true
 tm_h2.workspace   = true
 tm_keys.workspace = true
 arrayvec  = { workspace = true }

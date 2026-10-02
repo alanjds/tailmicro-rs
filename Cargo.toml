@@ -103,6 +103,7 @@ lan-direct = ["tm_runtime/lan-direct"]
 
 [dependencies]
 tm_runtime.workspace   = true
+tm_buf.workspace       = true
 tm_keys.workspace      = true
 tm_netstack.workspace  = true
 tm_control.workspace   = true

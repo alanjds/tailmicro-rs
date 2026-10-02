@@ -1648,6 +1648,7 @@ name = "tailmicro"
 version = "0.1.0"
 dependencies = [
  "heapless",
+ "tm_buf",
  "tm_control",
  "tm_keys",
  "tm_netstack",
@@ -1746,6 +1747,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snow",
+ "tm_buf",
  "tm_h2",
  "tm_keys",
  "tokio",

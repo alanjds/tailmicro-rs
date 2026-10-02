@@ -778,6 +778,13 @@ impl ControlActor {
             // persistently failing control server is retried, not hammered.
             // Bring-up failures here do NOT propagate (readiness is already
             // resolved); we just keep retrying.
+            if !tm_buf::link::is_up() {
+                tracing::warn!("Tailscale control: link down; deferring reconnect until it returns");
+                while !tm_buf::link::is_up() {
+                    tokio::time::sleep(core::time::Duration::from_secs(1)).await;
+                }
+                backoff = core::time::Duration::from_secs(1);
+            }
             tokio::time::sleep(backoff).await;
             backoff = core::cmp::min(backoff.saturating_mul(2), core::time::Duration::from_secs(30));
             match self.bring_up(auth_key, &mut roster).await {

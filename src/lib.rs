@@ -55,6 +55,13 @@ pub use tm_netstack::names::MagicDns;
 pub use tm_control::{Service, ServiceProto, MAX_SERVICES, MAX_SERVICE_DESC};
 pub use tm_keys::NodeState;
 pub use tm_runtime::{tokio_freertos_yield, OurIpReceiver, OurIpSender};
+
+/// Register a cheap predicate telling tailmicro whether the network link is up.
+/// While it returns `false`, DERP and control park instead of redialing. Only
+/// the first call takes effect; without one the link is assumed up.
+pub fn set_link_check(check: fn() -> bool) {
+    tm_buf::link::set_check(check);
+}
 /// The data-plane future returned by [`Device::connect`]; the same type as
 /// `tm_runtime::Driver`, re-exported so apps need not depend on `tm_runtime`
 /// just to name it.
