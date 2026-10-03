@@ -1032,6 +1032,12 @@ async fn event_router_task(
                         ControlEvent::Error(e) => {
                             log_control_error(&e);
                         }
+                        // The URL itself is for the application, which reads it
+                        // with `tm_control::login::login_url()` while
+                        // `Runtime::connect` is still pending; nothing to route.
+                        ControlEvent::LoginRequired(_) => {
+                            info!("Runtime::join() - control needs an interactive login");
+                        }
                     }
                     Err(_) => {
                         info!("Runtime::join() - control event channel closed, breaking");

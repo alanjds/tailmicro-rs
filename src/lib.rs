@@ -53,6 +53,7 @@ pub use config::Config;
 pub use error::Error;
 pub use tm_netstack::names::{MagicDns, Resolution, Resolver};
 pub use tm_control::{Service, ServiceProto, MAX_SERVICES, MAX_SERVICE_DESC};
+pub use tm_control::login::{control_key_rejected, login_url, LoginUrl, LOGIN_URL_MAX};
 pub use tm_keys::NodeState;
 pub use tm_runtime::{tokio_freertos_yield, OurIpReceiver, OurIpSender};
 
@@ -112,7 +113,15 @@ impl Device {
     /// # Arguments
     /// * `config` - Tailscale configuration (must carry a verified control
     ///   pin — see `Config::with_control_pin_hex`)
-    /// * `auth_key` - Auth key for Tailscale control plane
+    /// * `auth_key` - Auth key for Tailscale control plane. `None` or empty
+    ///   selects interactive login: control answers with a URL, readable with
+    ///   [`login_url`] from another task while this call stays pending (no
+    ///   `connect_timeout` applies while it waits for the user), and the call
+    ///   returns once the user has approved the device. An already-authorized
+    ///   node needs neither a key nor a login.
+    ///
+    /// Fails with `Error::Control(ControlError::ControlKeyRejected)` when the
+    /// pinned control key does not match the server.
     pub async fn connect(
         config: &Config,
         auth_key: Option<String>,
@@ -146,7 +155,15 @@ impl Device {
         #[cfg(not(target_os = "espidf"))]
         let result = tm_runtime::Runtime::connect(rt_config).await;
 
-        let (runtime, our_ip, driver) = result.map_err(|_| Error::NotConnected)?;
+        let (runtime, our_ip, driver) = result.map_err(|_| {
+            // The runtime only reports that bring-up failed; the control actor
+            // leaves the reason of a key mismatch in `tm_control::login`.
+            if control_key_rejected() {
+                Error::Control(tm_control::ControlError::ControlKeyRejected)
+            } else {
+                Error::NotConnected
+            }
+        })?;
         Ok((Self { runtime, our_ip }, driver))
     }
 

@@ -8,8 +8,12 @@
 //! real code path, not a reimplementation.
 //!
 //! Usage:
-//!   TAILMICRO_CONTROL_PIN=<hex> TS_AUTHKEY=<key> [TAILMICRO_CONTROL_HOST=host] \
-//!     cargo run -p tm_control --example host_handshake
+//!   TAILMICRO_CONTROL_PIN=<hex> [TS_AUTHKEY=<key>] [TAILMICRO_CONTROL_HOST=host] \
+//!     [HOST_HANDSHAKE_SECS=10] cargo run -p tm_control --example host_handshake
+//!
+//! Without `TS_AUTHKEY` the device registers keyless and control answers with
+//! an auth URL (`LoginRequired`); the example then keeps waiting for approval
+//! for `HOST_HANDSHAKE_SECS` instead of stopping at the first event.
 
 use tm_control::{Config, ControlActor, ControlCmd, ControlEvent};
 use tm_keys::NodeState;
@@ -42,7 +46,8 @@ async fn main() {
 
     // Drain events for a few seconds; a real registration will keep streaming,
     // so this is just enough to observe handshake success/failure.
-    let timeout = tokio::time::sleep(std::time::Duration::from_secs(10));
+    let secs = std::env::var("HOST_HANDSHAKE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(secs));
     tokio::pin!(timeout);
     loop {
         tokio::select! {
@@ -52,6 +57,7 @@ async fn main() {
                     Ok(ControlEvent::OurIpAssigned(ip)) => println!("ControlEvent::OurIpAssigned: {:?}", ip.0),
                     Ok(ControlEvent::MapUpdate(_)) => { println!("ControlEvent::MapUpdate received - handshake and registration succeeded!"); break; }
                     Ok(ControlEvent::KeyExpiry) => println!("ControlEvent::KeyExpiry"),
+                    Ok(ControlEvent::LoginRequired(url)) => println!("ControlEvent::LoginRequired: open {}", url.as_str()),
                     Err(_) => { println!("event channel closed"); break; }
                 }
             }

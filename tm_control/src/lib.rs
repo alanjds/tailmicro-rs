@@ -16,6 +16,7 @@ pub mod map_scalars;
 pub mod map_stream;
 pub mod roster;
 pub mod pin;
+pub mod login;
 mod io;
 
 use arrayvec::ArrayVec;
@@ -359,9 +360,21 @@ pub enum ControlError { Tls, Noise(NoiseError), Http, H2(H2Error), Json(JsonErro
                         /// PING, WINDOW_UPDATE...) for `POLL_IDLE_TIMEOUT`: the
                         /// server's keepalives stopped, so the connection is
                         /// presumed half-open. The poll loop reconnects.
-                        PollIdle }
+                        PollIdle,
+                        /// The pinned control key is not the server's: the server
+                        /// closed the connection without answering the Noise
+                        /// initiation on two consecutive dials. See
+                        /// `NoiseError::NoResponse` and [`login::control_key_rejected`].
+                        ControlKeyRejected }
 #[derive(Debug)]
-pub enum NoiseError { Handshake, Decrypt, Encrypt }
+pub enum NoiseError {
+    Handshake, Decrypt, Encrypt,
+    /// The server closed the connection cleanly without answering the
+    /// upgrade request. See `read_101_response`: this is how a wrong pinned
+    /// control key presents, so `bring_up` confirms it once more and then
+    /// reports [`ControlError::ControlKeyRejected`].
+    NoResponse,
+}
 #[derive(Debug)]
 pub enum JsonError { InvalidUtf8, ParseError, MissingField }
 
@@ -387,6 +400,13 @@ pub enum ControlEvent {
     // ESP32-C3 stack overflow at Runtime::join()'s tokio::join! entry, fixed
     // by boxing every oversized channel message payload across the workspace).
     MapUpdate(Box<MapState>), OurIpAssigned(TailnetIp), KeyExpiry, Error(ControlError),
+    /// Control answered the registration with an interactive-login URL and
+    /// the node is not authorized yet. Boxed for the same reason as
+    /// `MapUpdate`: the channel's slot size is that of its largest variant,
+    /// and an inline 160-byte string would be paid for in every slot. The
+    /// same URL is readable via [`login::login_url`] until login completes,
+    /// which is what an application blocked inside `Device::connect` uses.
+    LoginRequired(Box<login::LoginUrl>),
 }
 
 // ── Wire types ────────────────────────────────────────────────────────────────
@@ -408,10 +428,23 @@ struct RegisterRequest<'a> {
     // skip behavior for this same field.
     #[serde(skip_serializing_if = "Option::is_none")]
     old_node_key: Option<&'a str>,
-    auth: RegisterAuth<'a>, hostinfo: HostInfo<'a>,
+    // Omitted when there is no key: that is how tailscaled itself asks for an
+    // interactive login (and for a keyless resume), `Auth` being a nullable
+    // pointer in tailcfg.RegisterRequest.
+    #[serde(skip_serializing_if = "RegisterAuth::is_empty")]
+    auth: RegisterAuth<'a>,
+    hostinfo: HostInfo<'a>,
+    // The AuthURL control handed out earlier. Sent on the register that
+    // follows it, which control holds open until the user finishes logging in
+    // (tailcfg.RegisterRequest.Followup).
+    #[serde(skip_serializing_if = "str::is_empty")]
+    followup: &'a str,
 }
 #[derive(Serialize)]
 struct RegisterAuth<'a> { #[serde(rename="AuthKey")] auth_key: &'a str }
+impl RegisterAuth<'_> {
+    fn is_empty(&self) -> bool { self.auth_key.is_empty() }
+}
 /// Choose the DERP region this node uses as its home: the region it connects
 /// its DERP session to AND advertises to peers as its `PreferredDERP`. Peers
 /// relay inbound WireGuard/disco traffic to us via this region, so the value
@@ -610,7 +643,12 @@ fn host_info(config: &Config, net_info: Option<NetInfo>) -> HostInfo<'_> {
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct RegisterResponse {
-    #[serde(default)] auth_url: Option<String>,
+    // Explicit name: PascalCase would give "AuthUrl", but tailcfg spells it
+    // "AuthURL" and serde matches field names case-sensitively, so without
+    // this the URL was silently dropped.
+    #[serde(rename = "AuthURL", default)] auth_url: Option<String>,
+    // tailcfg.RegisterResponse.Error: non-empty means control refused.
+    #[serde(default)] error: Option<String>,
     #[serde(default)] node_key_expired: bool,
     #[serde(default)] machine_authorized: bool,
 }
@@ -647,6 +685,105 @@ struct MapRequest<'a> {
 /// serde `skip_serializing_if` predicate for a plain bool field.
 fn is_false(b: &bool) -> bool { !*b }
 
+
+/// Body of `/machine/register`. `auth_key` and `followup` are each omitted
+/// when empty: both empty is the keyless request (interactive login, or the
+/// resume of an already-authorized node).
+fn register_body(config: &Config, node_key_hex: &str, auth_key: &str, followup: &str)
+    -> Result<heapless::Vec<u8, REQUEST_BODY_CAP>, JsonError>
+{
+    to_json_buf(&RegisterRequest {
+        version: CAPABILITY_VERSION, node_key: node_key_hex,
+        old_node_key: None,
+        auth: RegisterAuth { auth_key },
+        hostinfo: host_info(config, None),
+        followup,
+    })
+}
+
+fn parse_register_response(body: &[u8]) -> Result<RegisterResponse, ControlError> {
+    serde_json::from_slice(body).map_err(|_| ControlError::Json(JsonError::ParseError))
+}
+
+enum RegisterOutcome {
+    /// Proceed to the map: authorized, or nothing for us to act on.
+    Authorized,
+    /// A human must open this URL.
+    LoginNeeded(String),
+}
+
+fn classify_register(reg: &RegisterResponse) -> Result<RegisterOutcome, ControlError> {
+    if let Some(e) = reg.error.as_deref().filter(|e| !e.is_empty()) {
+        tracing::error!("control refused the registration: {}", e);
+        return Err(ControlError::RegistrationFailed);
+    }
+    // An AuthURL wins even over NodeKeyExpired: control hands one out to let
+    // an expired node log in again.
+    if let Some(url) = reg.auth_url.as_deref().filter(|u| !u.is_empty()) {
+        if !reg.machine_authorized {
+            return Ok(RegisterOutcome::LoginNeeded(url.to_owned()));
+        }
+    }
+    // Expired with no way to log in: rotating the node key (OldNodeKey) is
+    // what would be needed, and that key belongs to the application's storage.
+    if reg.node_key_expired { return Err(ControlError::RegistrationFailed); }
+    Ok(RegisterOutcome::Authorized)
+}
+
+/// Longest a single held-open followup request is waited on before it is
+/// re-sent. Control ends its own hold well within this; the bound only keeps
+/// a silently dead connection from stalling login forever.
+const LOGIN_ROUND_MAX: core::time::Duration = core::time::Duration::from_secs(300);
+/// Shortest spacing between login rounds (see `register_until_authorized`).
+const LOGIN_MIN_ROUND: core::time::Duration = core::time::Duration::from_secs(5);
+const LOGIN_RETRY_DELAY: core::time::Duration = core::time::Duration::from_secs(5);
+/// Consecutive failed followups after which the URL is presumed dead and a
+/// fresh registration (hence a fresh URL) is requested.
+const LOGIN_FOLLOWUP_FAILURES: u8 = 3;
+
+/// The readiness deadline of one bring-up, suspendable.
+///
+/// `connect_timeout` bounds how long the device may take to come online, but
+/// a person approving a login in a browser takes minutes and is not a
+/// failure. While login is pending the deadline is cleared, and when it ends
+/// the full budget starts over for what remains (publish + first netmap).
+struct ReadyGate {
+    // A Mutex rather than a Cell so the actor's future stays `Send` (the host
+    // examples spawn it); it is never held across an await.
+    at: std::sync::Mutex<Option<tokio::time::Instant>>,
+    budget: Option<core::time::Duration>,
+    wake: tokio::sync::Notify,
+}
+
+impl ReadyGate {
+    fn new(budget: Option<core::time::Duration>) -> Self {
+        Self {
+            at: std::sync::Mutex::new(budget.map(|d| tokio::time::Instant::now() + d)),
+            budget,
+            wake: tokio::sync::Notify::new(),
+        }
+    }
+    fn get(&self) -> Option<tokio::time::Instant> { *self.at.lock().unwrap_or_else(|p| p.into_inner()) }
+    fn set(&self, v: Option<tokio::time::Instant>) { *self.at.lock().unwrap_or_else(|p| p.into_inner()) = v; }
+    fn pause(&self) { self.set(None); self.wake.notify_one(); }
+    fn resume(&self) {
+        self.set(self.budget.map(|d| tokio::time::Instant::now() + d));
+        self.wake.notify_one();
+    }
+    fn deadline(&self) -> Option<tokio::time::Instant> { self.get() }
+    /// Resolves when the (current) deadline passes; pends forever if there is none.
+    async fn expired(&self) {
+        loop {
+            match self.get() {
+                None => self.wake.notified().await,
+                Some(at) => tokio::select! {
+                    _ = tokio::time::sleep_until(at) => if self.get() == Some(at) { return },
+                    _ = self.wake.notified() => {}
+                },
+            }
+        }
+    }
+}
 
 // ── ControlActor ─────────────────────────────────────────────────────────────
 
@@ -709,6 +846,9 @@ impl ControlActor {
         loop {
             match cmds.recv().await {
                 Ok(ControlCmd::Start { ref auth_key }) => {
+                    // A restart must not show the previous attempt's verdict.
+                    login::clear_login_url();
+                    login::set_control_key_rejected(false);
                     if let Err(e) = self.connect_and_poll(auth_key.as_str(), &events, &cmds).await {
                         tracing::error!("Control error: {:?}", e);
                         let _ = events.send(ControlEvent::Error(e)).await;
@@ -746,19 +886,26 @@ impl ControlActor {
         // watchdog (`POLL_IDLE_TIMEOUT`): silence longer than the server's
         // keepalive interval means a dead connection and triggers a reconnect.
         // See docs/wg-dataplane-notes.md "Bring-up timeout".
-        let mut ready_deadline = self.config.connect_timeout.map(|d| (tokio::time::Instant::now() + d, d));
+        let budget = self.config.connect_timeout;
+        let gate = ReadyGate::new(budget);
         // The netmap lives here for the life of the connection loop: the
         // stream's first message fills it, later deltas merge into it. Boxed
         // so the ~4 KB roster is not part of this future's state.
         let mut roster = Box::new(Roster::new());
-        let bring_up = self.bring_up(auth_key, &mut roster);
-        let (mut main_conn, mut noise, mut h2, node_key_hex, mut publish_ctx) = match ready_deadline {
-            Some((at, dur)) => tokio::time::timeout_at(at, bring_up).await.map_err(|_| {
-                tracing::error!("Control bring-up exceeded connect_timeout ({:?})", dur);
-                ControlError::Timeout
-            })??,
+        let bring_up = self.bring_up(auth_key, &mut roster, events, &gate);
+        let (mut main_conn, mut noise, mut h2, node_key_hex, mut publish_ctx) = match budget {
+            Some(dur) => tokio::select! {
+                r = bring_up => r?,
+                _ = gate.expired() => {
+                    tracing::error!("Control bring-up exceeded connect_timeout ({:?})", dur);
+                    return Err(ControlError::Timeout);
+                }
+            },
             None => bring_up.await?,
         };
+        // After a login the deadline restarted (see `ReadyGate`), so the wait
+        // for the first map below is bounded from there, not from the start.
+        let mut ready_deadline = gate.deadline().zip(budget);
 
         // Poll loop, kept alive across drops.
         //
@@ -827,7 +974,7 @@ impl ControlActor {
             // Held for the bring-up only, never the whole session. Dropped at
             // the end of the match arm scope, on error, or on cancellation.
             let dial_guard = acquire_dial_guard(DIAL_WAIT_MAX).await;
-            let bring_up_res = self.bring_up(auth_key, &mut roster).await;
+            let bring_up_res = self.bring_up(auth_key, &mut roster, events, &ReadyGate::new(None)).await;
             drop(dial_guard);
             match bring_up_res {
                 Ok((c, n, h, _, pc)) => {
@@ -840,12 +987,15 @@ impl ControlActor {
         }
     }
 
-    /// Bring-up: TCP + Noise + register + the lite publish, then the streaming
-    /// poll request is written. The netmap (our IP, DERPMap, peers) is NOT
+    /// Bring-up: TCP + Noise + register (with the interactive login, when
+    /// control asks for one) + the lite publish, then the streaming poll
+    /// request is written. The netmap (our IP, DERPMap, peers) is NOT
     /// read here: it is the poll's first message, handled by
     /// `stream_map_response` in poll mode. The caller bounds this call (and the
-    /// wait for that first message) with `connect_timeout`.
-    async fn bring_up(&mut self, auth_key: &str, roster: &mut Roster)
+    /// wait for that first message) with `connect_timeout`, except that `gate`
+    /// suspends the bound while a human is logging in.
+    async fn bring_up(&mut self, auth_key: &str, roster: &mut Roster,
+                      events: &async_channel::Sender<ControlEvent>, gate: &ReadyGate)
         -> Result<(TokioStream, NoiseChannel, H2State, heapless::String<80>, PublishCtx), ControlError>
     {
         info!("Tailscale connect_and_poll starting");
@@ -853,66 +1003,11 @@ impl ControlActor {
         // from a previous session whose deltas we may have missed.
         roster.clear();
         let host = self.config.control_host;
-        let port = self.config.control_port;
-        info!("Tailscale connecting to {}:{}", host, port);
 
-        // The control server's Noise static key comes from the verified pin
-        // (Config::control_pin) — no /key HTTP(S) pre-fetch anymore.
-        info!("Tailscale Step 1: opening main connection");
-        let mut main_conn = self.open_tcp(host, port).await?;
-        info!("Tailscale Step 1: main TCP connection established");
-        info!("Tailscale Step 2: doing Noise IK handshake");
-        let mut noise = do_noise_handshake(
-            &mut main_conn, &self.node_state.machine_key, &self.config.control_pin,
-            host, CAPABILITY_VERSION,
-        ).await?;
-        info!("Tailscale Step 2: Noise IK handshake complete");
-
-        // Step 5: H/2 preface + SETTINGS
-        noise.write_all(&mut main_conn, CLIENT_PREFACE).await?;
-        let mut settings_buf = [0u8; 24];
-        let settings_len = write_settings(&mut settings_buf);
-        noise.write_all(&mut main_conn, &settings_buf[..settings_len]).await?;
-
-        // Step 6 & 7: RegisterRequest / RegisterResponse
-        //
-        // Each ~4.3KB request/response buffer below is wrapped in its own
-        // block so it is dropped right after its last use, instead of
-        // staying live (and folded into this async fn's state machine)
-        // through every later await. Left unscoped, reg_req/reg_bytes/
-        // map_req together added ~13KB to this function's state on top of
-        // everything else, which is what blew the ESP32-C3's 16000-byte
-        // main task stack (confirmed live: Guru Meditation stack protection
-        // fault). print-type-sizes confirmed the fix: connect_and_poll's
-        // state dropped from 19048 bytes to a few hundred.
+        // Steps 1-7: connect and register, up to a machine-authorized node.
         let node_key_hex = self.node_state.node_key.public().to_hex();
-        let mut h2 = H2State::new();
-
-        {
-            let reg_body = to_json_buf(&RegisterRequest {
-                version: CAPABILITY_VERSION, node_key: node_key_hex.as_str(),
-                old_node_key: None,
-                auth: RegisterAuth { auth_key },
-                hostinfo: host_info(&self.config, None),
-            }).map_err(ControlError::Json)?;
-
-            info!("Tailscale Step 4: registering node");
-            tracing::debug!("register request body: {}", core::str::from_utf8(&reg_body).unwrap_or("<invalid utf8>"));
-            let reg_req = build_h2_post("/machine/register", host, REGISTER_STREAM_ID, &reg_body);
-            noise.write_all(&mut main_conn, &reg_req).await?;
-        }
-
-        info!("Tailscale Step 4: reading registration response");
-        {
-            let reg_bytes = read_one_h2_body(&mut main_conn, &mut noise, &mut h2, REGISTER_STREAM_ID).await?;
-            tracing::debug!("register response body: {}", core::str::from_utf8(&reg_bytes).unwrap_or("<invalid utf8>"));
-            let reg: RegisterResponse = serde_json::from_slice(&reg_bytes)
-                .map_err(|_| ControlError::Json(JsonError::ParseError))?;
-
-            if reg.node_key_expired { return Err(ControlError::RegistrationFailed); }
-            if let Some(url) = &reg.auth_url { tracing::warn!("Auth URL: {}", url); }
-            info!("Tailscale Step 4: registration complete, node_key_expired={}, machine_authorized={}", reg.node_key_expired, reg.machine_authorized);
-        }
+        let (mut main_conn, mut noise, mut h2) =
+            self.register_until_authorized(auth_key, node_key_hex.as_str(), events, gate).await?;
 
         // Step 7.5: publish Hostinfo/DiscoKey via a non-streaming MapRequest
         // before opening the streaming poll.
@@ -978,6 +1073,161 @@ impl ControlActor {
         }
 
         Ok((main_conn, noise, h2, node_key_hex, publish_ctx))
+    }
+
+    /// Dial control and register until the node is machine-authorized,
+    /// returning the live connection for the publish and the poll.
+    ///
+    /// An `AuthURL` answer means a human has to approve the node. The URL is
+    /// published through [`login`] and `ControlEvent::LoginRequired`, then
+    /// each following round is a fresh connection whose register carries the
+    /// URL as `Followup`, which control holds open until login completes. A
+    /// fresh connection per round (rather than a second stream on this one)
+    /// keeps the fixed stream ids of the publish and the poll valid, and
+    /// frees the ~8 KB of Noise buffers between rounds. None of this waiting
+    /// counts against `connect_timeout` (see [`ReadyGate`]).
+    async fn register_until_authorized(
+        &mut self, auth_key: &str, node_key_hex: &str,
+        events: &async_channel::Sender<ControlEvent>, gate: &ReadyGate,
+    ) -> Result<(TokioStream, NoiseChannel, H2State), ControlError> {
+        let mut no_response = 0u8;
+        let mut failures = 0u8;
+        loop {
+            let followup = login::login_url();
+            let started = tokio::time::Instant::now();
+            // A spent key is not re-sent on a followup: the URL identifies the
+            // pending login on its own.
+            let key = if followup.is_some() { "" } else { auth_key };
+            let round = self.register_round(key, followup.as_deref().unwrap_or(""), node_key_hex);
+            let res = if followup.is_some() {
+                match tokio::time::timeout(LOGIN_ROUND_MAX, round).await {
+                    Ok(r) => r,
+                    // The held-open request simply outlived our patience; ask again.
+                    Err(_) => { debug!("login followup round timed out; asking again"); continue; }
+                }
+            } else {
+                round.await
+            };
+            match res {
+                Ok((conn, noise, h2, reg)) => match classify_register(&reg)? {
+                    RegisterOutcome::Authorized => {
+                        if followup.is_some() {
+                            info!("Tailscale login approved");
+                            gate.resume();
+                        }
+                        login::clear_login_url();
+                        return Ok((conn, noise, h2));
+                    }
+                    RegisterOutcome::LoginNeeded(url) => {
+                        // Free the Noise buffers before the next dial.
+                        drop((conn, noise, h2));
+                        gate.pause();
+                        failures = 0;
+                        if followup.as_deref() != Some(url.as_str()) {
+                            if !login::set_login_url(&url) {
+                                tracing::error!("auth URL is {} bytes, longer than {}", url.len(), login::LOGIN_URL_MAX);
+                                return Err(ControlError::RegistrationFailed);
+                            }
+                            tracing::warn!("Tailscale login required: open {}", url);
+                            if let Some(u) = login::login_url() {
+                                let _ = events.send(ControlEvent::LoginRequired(Box::new(u))).await;
+                            }
+                        }
+                        // A server that answers a followup at once instead of
+                        // holding it would otherwise be polled in a hot loop.
+                        tokio::time::sleep_until(started + LOGIN_MIN_ROUND).await;
+                    }
+                },
+                Err(ControlError::Noise(NoiseError::NoResponse)) => {
+                    // One clean close can be a load balancer; two in a row is a
+                    // server that cannot read our initiation, i.e. a key mismatch.
+                    no_response += 1;
+                    if no_response >= 2 {
+                        tracing::error!("control closed the Noise handshake twice without a reply: pinned control key rejected");
+                        login::set_control_key_rejected(true);
+                        return Err(ControlError::ControlKeyRejected);
+                    }
+                    tokio::time::sleep(core::time::Duration::from_millis(500)).await;
+                }
+                // Before any login started a failure is the caller's to handle,
+                // exactly as before interactive login existed.
+                Err(e) if followup.is_none() => return Err(e),
+                Err(e) => {
+                    failures += 1;
+                    tracing::warn!("login followup failed ({:?}, {} in a row)", e, failures);
+                    if failures >= LOGIN_FOLLOWUP_FAILURES {
+                        // The URL may have expired server-side: forget it so the
+                        // next round registers afresh and gets a new one.
+                        login::clear_login_url();
+                        failures = 0;
+                    }
+                    tokio::time::sleep(LOGIN_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+
+    /// One dial: TCP + Noise + H/2 preface + a single `/machine/register`
+    /// exchange. Split out (and kept off the caller's frame) so the request
+    /// and response buffers are dropped before any following await.
+    #[inline(never)]
+    async fn register_round(&self, auth_key: &str, followup: &str, node_key_hex: &str)
+        -> Result<(TokioStream, NoiseChannel, H2State, RegisterResponse), ControlError>
+    {
+        let host = self.config.control_host;
+        let port = self.config.control_port;
+        info!("Tailscale connecting to {}:{}", host, port);
+
+        // The control server's Noise static key comes from the verified pin
+        // (Config::control_pin), with no /key HTTP(S) pre-fetch anymore.
+        info!("Tailscale Step 1: opening main connection");
+        let mut main_conn = self.open_tcp(host, port).await?;
+        info!("Tailscale Step 1: main TCP connection established");
+        info!("Tailscale Step 2: doing Noise IK handshake");
+        let mut noise = do_noise_handshake(
+            &mut main_conn, &self.node_state.machine_key, &self.config.control_pin,
+            host, CAPABILITY_VERSION,
+        ).await?;
+        info!("Tailscale Step 2: Noise IK handshake complete");
+
+        // Step 5: H/2 preface + SETTINGS
+        noise.write_all(&mut main_conn, CLIENT_PREFACE).await?;
+        let mut settings_buf = [0u8; 24];
+        let settings_len = write_settings(&mut settings_buf);
+        noise.write_all(&mut main_conn, &settings_buf[..settings_len]).await?;
+
+        // Step 6 & 7: RegisterRequest / RegisterResponse
+        //
+        // Each ~4.3KB request/response buffer below is wrapped in its own
+        // block so it is dropped right after its last use, instead of
+        // staying live (and folded into this async fn's state machine)
+        // through every later await. Left unscoped, reg_req/reg_bytes/
+        // map_req together added ~13KB to this function's state on top of
+        // everything else, which is what blew the ESP32-C3's 16000-byte
+        // main task stack (confirmed live: Guru Meditation stack protection
+        // fault). print-type-sizes confirmed the fix: connect_and_poll's
+        // state dropped from 19048 bytes to a few hundred.
+        let mut h2 = H2State::new();
+
+        {
+            let reg_body = register_body(&self.config, node_key_hex, auth_key, followup)
+                .map_err(ControlError::Json)?;
+
+            info!("Tailscale Step 4: registering node");
+            // Not logged: the body carries the auth key.
+            let reg_req = build_h2_post("/machine/register", host, REGISTER_STREAM_ID, &reg_body);
+            noise.write_all(&mut main_conn, &reg_req).await?;
+        }
+
+        info!("Tailscale Step 4: reading registration response");
+        let reg = {
+            let reg_bytes = read_one_h2_body(&mut main_conn, &mut noise, &mut h2, REGISTER_STREAM_ID).await?;
+            tracing::debug!("register response body: {}", core::str::from_utf8(&reg_bytes).unwrap_or("<invalid utf8>"));
+            parse_register_response(&reg_bytes)?
+        };
+        info!("Tailscale Step 4: registration answered, node_key_expired={}, machine_authorized={}, auth_url={}",
+              reg.node_key_expired, reg.machine_authorized, reg.auth_url.is_some());
+        Ok((main_conn, noise, h2, reg))
     }
 
     /// Publish #2: once the poll's first netmap has revealed the DERPMap and
@@ -1804,7 +2054,17 @@ mod tests {
         assert_eq!(select_home_region(&m), None);
     }
 
+    /// `run()` clears and sets the process-wide `login` state, so tests that
+    /// run the actor must not overlap.
+    static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     async fn run_once(config: Config) -> ControlEvent {
+        run_once_with_flag(config).await.0
+    }
+
+    /// The first event, and `login::control_key_rejected()` as `run()` left it.
+    async fn run_once_with_flag(config: Config) -> (ControlEvent, bool) {
+        let _serial = RUN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let node_state = NodeState::generate();
         let actor = ControlActor::new(config, node_state);
 
@@ -1824,7 +2084,8 @@ mod tests {
             .await
             .expect("ControlActor::run must return promptly, not hang");
 
-        ev_rx.recv().await.expect("expected a ControlEvent")
+        let ev = ev_rx.recv().await.expect("expected a ControlEvent");
+        (ev, login::control_key_rejected())
     }
 
     /// Bring-up (the Noise handshake read) exceeding a tiny `connect_timeout`
@@ -2018,6 +2279,7 @@ mod tests {
         let reg = to_json_buf(&RegisterRequest {
             version: CAPABILITY_VERSION, node_key: NODE_HEX, old_node_key: None,
             auth: RegisterAuth { auth_key: "tskey-auth-x" }, hostinfo: host_info(&c, None),
+            followup: "",
         }).unwrap();
         let poll = to_json_buf(&MapRequest {
             version: CAPABILITY_VERSION, compress: "", keep_alive: true,
@@ -2045,6 +2307,7 @@ mod tests {
         let reg = to_json_buf(&RegisterRequest {
             version: CAPABILITY_VERSION, node_key: NODE_HEX, old_node_key: Some(NODE_HEX),
             auth: RegisterAuth { auth_key: &"k".repeat(128) }, hostinfo: host_info(&c, None),
+            followup: "",
         }).unwrap();
         assert!(reg.len() <= REQUEST_BODY_CAP);
     }
@@ -2060,6 +2323,160 @@ mod tests {
         for bad in ["", "-a", "a-", "A", "a_b", "a.b", &"a".repeat(64)] {
             assert!(!valid_hostname(bad), "{bad}");
         }
+    }
+
+    // ── Interactive login ─────────────────────────────────────────────────────
+
+    fn reg_json(auth_key: &str, followup: &str) -> serde_json::Value {
+        let body = register_body(&cfg(&[]), NODE_HEX, auth_key, followup).unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// No key and no followup is the keyless request: neither `Auth` nor
+    /// `Followup` may appear (tailscaled omits both), and the empty
+    /// `OldNodeKey` must stay omitted too (it made control answer 500).
+    #[test]
+    fn keyless_register_omits_auth_followup_and_old_node_key() {
+        let v = reg_json("", "");
+        let o = v.as_object().unwrap();
+        assert_eq!(o["NodeKey"], NODE_HEX);
+        assert_eq!(o["Version"], CAPABILITY_VERSION);
+        for k in ["Auth", "Followup", "OldNodeKey"] {
+            assert!(!o.contains_key(k), "{k} must be omitted");
+        }
+        assert!(o.contains_key("Hostinfo"));
+    }
+
+    /// The auth-key path is byte-for-byte what it was: `Auth.AuthKey`, no `Followup`.
+    #[test]
+    fn auth_key_register_body_is_unchanged() {
+        let v = reg_json("tskey-auth-x", "");
+        assert_eq!(v["Auth"], serde_json::json!({"AuthKey": "tskey-auth-x"}));
+        assert!(v.get("Followup").is_none());
+    }
+
+    /// After an AuthURL the next register repeats the node key and carries the
+    /// URL as `Followup`, without the (spent) key.
+    #[test]
+    fn followup_register_carries_the_url_and_no_auth() {
+        let url = "https://login.tailscale.com/a/0123456789abc";
+        let v = reg_json("", url);
+        assert_eq!(v["Followup"], url);
+        assert_eq!(v["NodeKey"], NODE_HEX);
+        assert!(v.get("Auth").is_none());
+        let max = "f".repeat(login::LOGIN_URL_MAX);
+        let body = register_body(&cfg(&FOUR), NODE_HEX, "", &max).unwrap();
+        assert!(body.len() <= REQUEST_BODY_CAP);
+    }
+
+    /// Verbatim shape of a keyless register answer from the real control
+    /// server (captured live, URL id replaced): `AuthURL` set, not authorized.
+    const LOGIN_RESPONSE: &str = r#"{"User":{"ID":0,"DisplayName":""},"Login":{"ID":0,"Provider":"","LoginName":"","DisplayName":""},"NodeKeyExpired":false,"MachineAuthorized":false,"AuthURL":"https://login.tailscale.com/a/0123456789abc","NodeKeySignature":null,"Error":""}"#;
+    const AUTHORIZED_RESPONSE: &str = r#"{"User":{"ID":1,"DisplayName":"a"},"Login":{"ID":1,"Provider":"google","LoginName":"a@example.com","DisplayName":"a"},"NodeKeyExpired":false,"MachineAuthorized":true,"AuthURL":"","NodeKeySignature":null,"Error":""}"#;
+
+    #[test]
+    fn auth_url_response_asks_for_login() {
+        let reg = parse_register_response(LOGIN_RESPONSE.as_bytes()).unwrap();
+        assert!(!reg.machine_authorized && !reg.node_key_expired);
+        match classify_register(&reg).unwrap() {
+            RegisterOutcome::LoginNeeded(u) => assert_eq!(u, "https://login.tailscale.com/a/0123456789abc"),
+            RegisterOutcome::Authorized => panic!("must ask for login"),
+        }
+    }
+
+    #[test]
+    fn authorized_response_proceeds_without_login() {
+        let reg = parse_register_response(AUTHORIZED_RESPONSE.as_bytes()).unwrap();
+        assert!(reg.machine_authorized);
+        assert!(matches!(classify_register(&reg).unwrap(), RegisterOutcome::Authorized));
+        // A keyless resume of an authorized node may omit every optional field.
+        let reg = parse_register_response(br#"{"MachineAuthorized":true}"#).unwrap();
+        assert!(matches!(classify_register(&reg).unwrap(), RegisterOutcome::Authorized));
+    }
+
+    #[test]
+    fn refusals_and_expiry_are_not_logins() {
+        let bad = |j: &str| classify_register(&parse_register_response(j.as_bytes()).unwrap());
+        assert!(matches!(bad(r#"{"Error":"invalid key"}"#), Err(ControlError::RegistrationFailed)));
+        // Expired with no URL to log in at: still a failure (see classify_register).
+        assert!(matches!(bad(r#"{"NodeKeyExpired":true}"#), Err(ControlError::RegistrationFailed)));
+        // Expired but control offered a URL: that is a login.
+        assert!(matches!(
+            bad(r#"{"NodeKeyExpired":true,"AuthURL":"https://x/a/1"}"#),
+            Ok(RegisterOutcome::LoginNeeded(_))
+        ));
+        assert!(parse_register_response(b"not json").is_err());
+    }
+
+    /// A server that reads our Noise initiation, cannot decrypt it, and hangs
+    /// up without a word (what the real one does for a wrong pinned key, see
+    /// `read_101_response`): confirmed on a second dial, reported distinctly.
+    #[tokio::test]
+    async fn silent_close_twice_is_control_key_rejected() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dials = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let d = dials.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                d.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Read the upgrade request first: closing with it unread would
+                // make the kernel send a reset, which is not what a server
+                // that processed the initiation does.
+                let mut buf = [0u8; 512];
+                let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+                drop(sock); // clean FIN, no response
+            }
+        });
+        let config = Config { control_host: leak_host(addr), control_port: addr.port(), ..cfg(&[]) };
+        let (ev, flag) = run_once_with_flag(config).await;
+        assert!(matches!(ev, ControlEvent::Error(ControlError::ControlKeyRejected)), "got a different event");
+        assert!(flag, "the app-visible flag must be set");
+        assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 2, "one confirming redial, no more");
+    }
+
+    /// A refused connection is a network problem, never a key verdict.
+    #[tokio::test]
+    async fn refused_connection_is_not_control_key_rejected() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let config = Config { control_host: leak_host(addr), control_port: addr.port(), ..cfg(&[]) };
+        let (ev, flag) = run_once_with_flag(config).await;
+        assert!(matches!(ev, ControlEvent::Error(ControlError::Io)), "got a different event");
+        assert!(!flag);
+    }
+
+    /// The readiness deadline does not run while a login is pending, and
+    /// restarts in full when it ends.
+    #[tokio::test]
+    async fn ready_gate_pauses_for_login_and_restarts_after() {
+        let gate = ReadyGate::new(Some(Duration::from_millis(80)));
+        gate.pause();
+        assert!(tokio::time::timeout(Duration::from_millis(200), gate.expired()).await.is_err(),
+                "paused gate must not expire");
+        gate.resume();
+        let t0 = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(2), gate.expired()).await.expect("must expire after resume");
+        assert!(t0.elapsed() >= Duration::from_millis(70), "full budget restarts on resume");
+        // No budget configured: never expires, pause/resume change nothing.
+        let unbounded = ReadyGate::new(None);
+        unbounded.resume();
+        assert!(tokio::time::timeout(Duration::from_millis(100), unbounded.expired()).await.is_err());
+        assert!(unbounded.deadline().is_none());
+    }
+
+    #[test]
+    fn login_url_state_roundtrip_and_oversize() {
+        let _serial = RUN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        login::clear_login_url();
+        assert!(login::login_url().is_none());
+        assert!(login::set_login_url("https://login.tailscale.com/a/abc"));
+        assert_eq!(login::login_url().unwrap().as_str(), "https://login.tailscale.com/a/abc");
+        assert!(!login::set_login_url(&"u".repeat(login::LOGIN_URL_MAX + 1)));
+        assert!(login::login_url().is_none(), "an oversize URL must not leave a stale or truncated one");
+        login::clear_login_url();
     }
 
     // ── Mock control server over an in-memory Noise channel ───────────────────

@@ -712,15 +712,23 @@ async fn read_101_response<S: Read + Write>(
         if total >= buf.len() {
             return Err(ControlError::Noise(NoiseError::Handshake));
         }
-        let n = {
-            // Read one byte at a time to avoid consuming Noise bytes
-            // that immediately follow the \r\n\r\n boundary.
-            let single = &mut [0u8; 1];
-            crate::io::read_exact(stream, single).await?;
-            buf[total] = single[0];
-            1
-        };
-        total += n;
+        // Read one byte at a time to avoid consuming Noise bytes
+        // that immediately follow the \r\n\r\n boundary.
+        match crate::io::read_byte_or_eof(stream).await? {
+            Some(b) => { buf[total] = b; total += 1; }
+            // A clean close before the first response byte is what the real
+            // control server does (measured against controlplane.tailscale.com)
+            // when the Noise initiation does not decrypt, i.e. the pinned
+            // responder key is wrong. A healthy server always answers an
+            // upgrade with a status line, so this is told apart from a network
+            // failure (reset, timeout, connect error) which never reaches here
+            // as a clean EOF. Mid-header EOF stays a plain Io error.
+            None if total == 0 => {
+                tracing::error!("ts2021: peer closed without any HTTP response to the upgrade");
+                return Err(ControlError::Noise(NoiseError::NoResponse));
+            }
+            None => return Err(ControlError::Io),
+        }
 
         // Check for end-of-headers sentinel
         if total >= 4 && &buf[total-4..total] == b"\r\n\r\n" {
