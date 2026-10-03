@@ -77,14 +77,6 @@
     <label for="seedHex">or seed as 64 hex characters</label>
     <input type="password" id="seedHex" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="64 hex characters">
     <div class="row">
-      <input type="checkbox" id="remember">
-      <label class="inline" for="remember">Remember seed in this browser (localStorage)</label>
-      <button type="button" id="forget">Forget</button>
-    </div>
-    <div class="warn" id="rememberWarn" hidden>
-      The seed will be stored unencrypted in this browser profile. Anyone with access to it can mint pins your devices trust. Leave this off on shared machines.
-    </div>
-    <div class="row">
       <button type="button" id="clear">Clear</button>
       <button type="button" id="gen">Generate new signing seed</button>
     </div>
@@ -149,7 +141,6 @@ const BODY_LEN = 45;
 const BLOB_LEN = 109;
 // Fixed PKCS8 wrapper for a raw 32-byte Ed25519 seed (RFC 8410).
 const PKCS8_PREFIX = [0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20];
-const STORE_KEY = "pin_signer_seed";
 
 function toHex(bytes) {
   let s = "";
@@ -254,16 +245,6 @@ if (typeof document !== "undefined") {
     s.className = cls || "";
   }
 
-  function storageGet() {
-    try { return localStorage.getItem(STORE_KEY); } catch (e) { return null; }
-  }
-  function storageSet(hex) {
-    try { localStorage.setItem(STORE_KEY, hex); return true; } catch (e) { return false; }
-  }
-  function storageDel() {
-    try { localStorage.removeItem(STORE_KEY); } catch (e) { /* ignore */ }
-  }
-
   function dropSeed() {
     if (fileSeed) fileSeed.fill(0);
     fileSeed = null;
@@ -272,20 +253,14 @@ if (typeof document !== "undefined") {
   }
 
   function seedNote() {
-    const stored = storageGet();
-    $("seedNote").textContent = fileSeed ? "Seed held in memory."
-      : (stored && $("remember").checked ? "Using the seed remembered in this browser when the fields are empty." : "");
+    $("seedNote").textContent = fileSeed ? "Seed held in memory." : "";
   }
 
-  // Seed priority: file/generated, then hex field, then remembered.
+  // Seed priority: file/generated, then hex field.
   function currentSeed() {
     if (fileSeed) return new Uint8Array(fileSeed);
     const hex = $("seedHex").value.trim();
     if (hex) return fromHex(hex, 32);
-    if ($("remember").checked) {
-      const stored = storageGet();
-      if (stored) return fromHex(stored, 32);
-    }
     throw new Error("no signing seed: pick the file, paste hex, or generate one");
   }
 
@@ -316,20 +291,6 @@ if (typeof document !== "undefined") {
     } catch (e) {
       setStatus("Could not read the seed file.", "err");
     }
-  });
-
-  $("remember").addEventListener("change", () => {
-    $("rememberWarn").hidden = !$("remember").checked;
-    if (!$("remember").checked) storageDel();
-    seedNote();
-  });
-
-  $("forget").addEventListener("click", () => {
-    storageDel();
-    $("remember").checked = false;
-    $("rememberWarn").hidden = true;
-    seedNote();
-    setStatus("Remembered seed removed from this browser.", "ok");
   });
 
   $("clear").addEventListener("click", () => {
@@ -420,9 +381,6 @@ if (typeof document !== "undefined") {
       $("out").hidden = false;
       setStatus("Signed. Expires " + new Date(notAfter * 1000).toLocaleString() + ".", "ok");
 
-      if ($("remember").checked && (fileSeed || $("seedHex").value.trim())) {
-        if (!storageSet(toHex(seed))) setStatus("Signed, but this browser refused to store the seed.", "err");
-      }
       // Seed hygiene: nothing stays in fields after a successful signing.
       dropSeed();
       seedNote();
@@ -440,11 +398,6 @@ if (typeof document !== "undefined") {
     if (!(await ed25519Supported())) {
       $("unsupported").hidden = false;
       for (const id of ["sign", "gen"]) $(id).disabled = true;
-    }
-    if (storageGet()) {
-      $("remember").checked = true;
-      $("rememberWarn").hidden = false;
-      seedNote();
     }
   })();
 }

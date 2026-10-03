@@ -74,6 +74,8 @@ and without rebuilding firmware.
   HTTP, which is not a secure context and has no `crypto.subtle`.
 - Trust the host: whoever serves the page can alter its code and steal the
   seed. Use a copy you control, or open it from a local file.
-- The seed stays in memory only. It is cleared after a successful signing and
-  by the Clear button. "Remember seed" (localStorage, off by default) stores it
-  unencrypted in the browser profile; Forget removes it.
+- The page never stores the seed (no localStorage, cookies or IndexedDB). It
+  stays in memory only and is cleared after a successful signing and by the
+  Clear button.
+- Keep your seed file and pick it each time. The firmware's verify key is fixed
+  at build time, so a different seed would not be trusted by the device.
