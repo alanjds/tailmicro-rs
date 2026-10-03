@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Pin signer</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1b1f24; --muted: #57606a; --card: #f6f8fa;
+    --border: #d0d7de; --accent: #0969da; --accent-fg: #ffffff;
+    --warn-bg: #fff8c5; --warn-fg: #4d2d00; --err: #b3261e; --ok: #1a7f37;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --fg: #e6edf3; --muted: #9198a1; --card: #161b22;
+      --border: #30363d; --accent: #4493f8; --accent-fg: #0d1117;
+      --warn-bg: #3b2e00; --warn-fg: #f2d17a; --err: #ff7b72; --ok: #56d364;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 42rem; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.05rem; margin: 0 0 .5rem; }
+  p { margin: .4rem 0; }
+  .muted { color: var(--muted); font-size: .9rem; }
+  section {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px; margin: 14px 0;
+  }
+  label { display: block; font-weight: 600; margin: .6rem 0 .2rem; }
+  label.inline { display: inline; font-weight: normal; }
+  input[type=text], input[type=password], input[type=number], textarea {
+    width: 100%; padding: 8px; font: inherit; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  }
+  input[type=file] { max-width: 100%; }
+  textarea { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; word-break: break-all; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; }
+  pre { white-space: pre-wrap; word-break: break-all; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin: .4rem 0; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: .6rem; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+  @media (max-width: 30rem) { .grid { grid-template-columns: 1fr; } }
+  button {
+    font: inherit; padding: 8px 14px; border-radius: 6px; cursor: pointer;
+    color: var(--fg); background: var(--bg); border: 1px solid var(--border);
+  }
+  button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  :focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .warn { background: var(--warn-bg); color: var(--warn-fg); border-radius: 6px; padding: 8px 10px; margin: .5rem 0; font-size: .9rem; }
+  #status { min-height: 1.5em; font-weight: 600; }
+  #status.err { color: var(--err); }
+  #status.ok { color: var(--ok); }
+  a.pinlink { word-break: break-all; color: var(--accent); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Control-key pin signer</h1>
+  <p class="muted">Does in the browser what <code>tools/gen_fingerprint.py</code> does: fetches the control server key over validated HTTPS and signs a 109-byte pin with your Ed25519 seed. Everything runs locally. The seed is never sent anywhere.</p>
+
+  <div id="unsupported" class="warn" role="alert" hidden>
+    This browser has no WebCrypto Ed25519 (needs Chrome 137+, Firefox 129+ or Safari 17+).
+    Update the browser, or run <code>python3 tools/gen_fingerprint.py</code> instead.
+  </div>
+
+  <section aria-labelledby="h-seed">
+    <h2 id="h-seed">1. Signing seed</h2>
+    <label for="seedFile">Seed file (raw 32 bytes, <code>tm_signing_key.bin</code>)</label>
+    <input type="file" id="seedFile">
+    <label for="seedHex">or seed as 64 hex characters</label>
+    <input type="password" id="seedHex" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="64 hex characters">
+    <div class="row">
+      <input type="checkbox" id="remember">
+      <label class="inline" for="remember">Remember seed in this browser (localStorage)</label>
+      <button type="button" id="forget">Forget</button>
+    </div>
+    <div class="warn" id="rememberWarn" hidden>
+      The seed will be stored unencrypted in this browser profile. Anyone with access to it can mint pins your devices trust. Leave this off on shared machines.
+    </div>
+    <div class="row">
+      <button type="button" id="clear">Clear</button>
+      <button type="button" id="gen">Generate new signing seed</button>
+    </div>
+    <p class="muted" id="seedNote"></p>
+    <div id="genOut" hidden>
+      <p>New seed generated and kept in memory. Save the downloaded <code>tm_signing_key.bin</code> somewhere safe, it is the only copy. Paste this verify key into <code>PIN_VERIFY_KEY</code> in the firmware:</p>
+      <pre id="genKey"></pre>
+      <div class="warn">Changing the verify key needs a firmware rebuild. Devices built with the old key reject pins signed by the new seed.</div>
+    </div>
+  </section>
+
+  <section aria-labelledby="h-params">
+    <h2 id="h-params">2. Parameters</h2>
+    <div class="grid">
+      <div>
+        <label for="host">Control host</label>
+        <input type="text" id="host" value="controlplane.tailscale.com" autocomplete="off" spellcheck="false">
+      </div>
+      <div>
+        <label for="cap">Cap version</label>
+        <input type="number" id="cap" value="110" min="1" step="1">
+      </div>
+      <div>
+        <label for="days">Validity (days)</label>
+        <input type="number" id="days" value="35" min="1" max="3650" step="1">
+        <p class="muted">Expires: <span id="expiry"></span></p>
+      </div>
+      <div>
+        <label for="device">Device address</label>
+        <input type="text" id="device" placeholder="192.168.15.74 or hostname" autocomplete="off" spellcheck="false" autocapitalize="off">
+      </div>
+    </div>
+    <div class="row">
+      <button type="button" id="sign" class="primary">Fetch key and sign</button>
+    </div>
+    <p id="status" role="status" aria-live="polite"></p>
+  </section>
+
+  <section aria-labelledby="h-out" id="out" hidden>
+    <h2 id="h-out">3. Result</h2>
+    <label for="ctrlKey">Control key fetched (compare with what you expect)</label>
+    <input type="text" id="ctrlKey" readonly>
+    <label for="pinHex">Pin (109 bytes, hex)</label>
+    <textarea id="pinHex" rows="4" readonly></textarea>
+    <div class="row"><button type="button" id="copy">Copy</button><span id="copied" class="muted" role="status"></span></div>
+    <p id="linkWrap" hidden>Open on the device: <a id="pinLink" class="pinlink" rel="noreferrer"></a></p>
+    <p class="muted" id="linkNote" hidden>The pin sits in the URL fragment on purpose: browsers never send it to the server or log it. The device page reads it with JavaScript.</p>
+    <label for="verifyKey">Verify key of this seed (must match <code>PIN_VERIFY_KEY</code> in the firmware)</label>
+    <pre id="verifyKey"></pre>
+  </section>
+
+  <p class="muted">Notes: host this page on a trusted static HTTPS server or open it from a local file. Whoever serves it can change its code and steal the seed, so only use a copy you control. The device itself serves plain HTTP, which has no WebCrypto, hence this separate page.</p>
+</main>
+
+<script>
+"use strict";
+// Core functions first (pure, testable in node via vm), DOM wiring last.
+
+const MAGIC = [0x54, 0x4d, 0x50, 0x4e]; // "TMPN"
+const VERSION = 1;
+const BODY_LEN = 45;
+const BLOB_LEN = 109;
+// Fixed PKCS8 wrapper for a raw 32-byte Ed25519 seed (RFC 8410).
+const PKCS8_PREFIX = [0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20];
+const STORE_KEY = "pin_signer_seed";
+
+function toHex(bytes) {
+  let s = "";
+  for (const b of bytes) s += b.toString(16).padStart(2, "0");
+  return s;
+}
+
+function fromHex(str, expectLen) {
+  const t = String(str).replace(/\s+/g, "");
+  if (!/^[0-9a-fA-F]*$/.test(t) || t.length !== expectLen * 2) {
+    throw new Error("expected " + expectLen * 2 + " hex characters");
+  }
+  const out = new Uint8Array(expectLen);
+  for (let i = 0; i < expectLen; i++) out[i] = parseInt(t.substr(i * 2, 2), 16);
+  return out;
+}
+
+function b64urlDecode(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function importSeed(seed) {
+  const pkcs8 = new Uint8Array(PKCS8_PREFIX.length + 32);
+  pkcs8.set(PKCS8_PREFIX, 0);
+  pkcs8.set(seed, PKCS8_PREFIX.length);
+  // extractable only so the public half can be read back via JWK.
+  const key = await crypto.subtle.importKey("pkcs8", pkcs8, { name: "Ed25519" }, true, ["sign"]);
+  pkcs8.fill(0);
+  return key;
+}
+
+async function deriveVerifyKey(seed) {
+  const key = await importSeed(seed);
+  const jwk = await crypto.subtle.exportKey("jwk", key);
+  const pub = b64urlDecode(jwk.x);
+  if (pub.length !== 32) throw new Error("unexpected public key length");
+  return pub;
+}
+
+// Same layout as tm_keys/src/pin.rs and gen_fingerprint.py build_blob().
+function buildBody(pubkey, notAfter) {
+  if (pubkey.length !== 32) throw new Error("control pubkey must be 32 bytes");
+  const body = new Uint8Array(BODY_LEN);
+  body.set(MAGIC, 0);
+  body[4] = VERSION;
+  body.set(pubkey, 5);
+  new DataView(body.buffer).setBigUint64(37, BigInt(notAfter), true);
+  return body;
+}
+
+async function signPin(seed, pubkey, notAfter) {
+  const body = buildBody(pubkey, notAfter);
+  const key = await importSeed(seed);
+  const sig = new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, key, body));
+  if (sig.length !== 64) throw new Error("unexpected signature length");
+  const blob = new Uint8Array(BLOB_LEN);
+  blob.set(body, 0);
+  blob.set(sig, BODY_LEN);
+  // Never hand out a blob that does not self-verify.
+  const pub = await deriveVerifyKey(seed);
+  const vk = await crypto.subtle.importKey("raw", pub, { name: "Ed25519" }, false, ["verify"]);
+  const ok = await crypto.subtle.verify({ name: "Ed25519" }, vk, sig, body);
+  if (!ok) throw new Error("internal error: blob failed self-verification");
+  return { blob: blob, verifyKey: pub };
+}
+
+function rustConst(pub) {
+  return "pub const PIN_VERIFY_KEY: [u8; 32] = [" + Array.from(pub, b => "0x" + b.toString(16).padStart(2, "0")).join(", ") + "];";
+}
+
+function parseControlKey(json) {
+  const field = json && json.publicKey;
+  if (typeof field !== "string" || !field.startsWith("mkey:")) {
+    throw new Error("unexpected publicKey format in /key response");
+  }
+  return fromHex(field.slice(5), 32);
+}
+
+async function ed25519Supported() {
+  try {
+    const k = await importSeed(new Uint8Array(32));
+    await crypto.subtle.sign({ name: "Ed25519" }, k, new Uint8Array(1));
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// ---- DOM wiring (skipped when run headless in node) ----
+if (typeof document !== "undefined") {
+  const $ = id => document.getElementById(id);
+  let fileSeed = null; // Uint8Array from the file picker or generator, memory only
+
+  function setStatus(msg, cls) {
+    const s = $("status");
+    s.textContent = msg;
+    s.className = cls || "";
+  }
+
+  function storageGet() {
+    try { return localStorage.getItem(STORE_KEY); } catch (e) { return null; }
+  }
+  function storageSet(hex) {
+    try { localStorage.setItem(STORE_KEY, hex); return true; } catch (e) { return false; }
+  }
+  function storageDel() {
+    try { localStorage.removeItem(STORE_KEY); } catch (e) { /* ignore */ }
+  }
+
+  function dropSeed() {
+    if (fileSeed) fileSeed.fill(0);
+    fileSeed = null;
+    $("seedHex").value = "";
+    $("seedFile").value = "";
+  }
+
+  function seedNote() {
+    const stored = storageGet();
+    $("seedNote").textContent = fileSeed ? "Seed held in memory."
+      : (stored && $("remember").checked ? "Using the seed remembered in this browser when the fields are empty." : "");
+  }
+
+  // Seed priority: file/generated, then hex field, then remembered.
+  function currentSeed() {
+    if (fileSeed) return new Uint8Array(fileSeed);
+    const hex = $("seedHex").value.trim();
+    if (hex) return fromHex(hex, 32);
+    if ($("remember").checked) {
+      const stored = storageGet();
+      if (stored) return fromHex(stored, 32);
+    }
+    throw new Error("no signing seed: pick the file, paste hex, or generate one");
+  }
+
+  function updateExpiry() {
+    const d = parseInt($("days").value, 10);
+    $("expiry").textContent = (d >= 1 && d <= 3650)
+      ? new Date(Date.now() + d * 86400000).toLocaleString() : "invalid";
+  }
+
+  function validHost(h) { return /^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:\d{1,5})?$/.test(h); }
+  function validDevice(h) { return /^([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:]+\])(:\d{1,5})?$/.test(h); }
+
+  $("seedFile").addEventListener("change", async ev => {
+    const f = ev.target.files[0];
+    if (!f) return;
+    try {
+      const buf = new Uint8Array(await f.arrayBuffer());
+      if (buf.length !== 32) {
+        buf.fill(0);
+        $("seedFile").value = "";
+        setStatus("Seed file must be exactly 32 bytes, got " + buf.length, "err");
+        return;
+      }
+      fileSeed = buf;
+      $("seedHex").value = "";
+      setStatus("Seed file loaded.", "");
+      seedNote();
+    } catch (e) {
+      setStatus("Could not read the seed file.", "err");
+    }
+  });
+
+  $("remember").addEventListener("change", () => {
+    $("rememberWarn").hidden = !$("remember").checked;
+    if (!$("remember").checked) storageDel();
+    seedNote();
+  });
+
+  $("forget").addEventListener("click", () => {
+    storageDel();
+    $("remember").checked = false;
+    $("rememberWarn").hidden = true;
+    seedNote();
+    setStatus("Remembered seed removed from this browser.", "ok");
+  });
+
+  $("clear").addEventListener("click", () => {
+    dropSeed();
+    $("genOut").hidden = true;
+    $("genKey").textContent = "";
+    seedNote();
+    setStatus("Seed cleared from memory and fields.", "");
+  });
+
+  $("gen").addEventListener("click", async () => {
+    try {
+      const seed = new Uint8Array(32);
+      crypto.getRandomValues(seed);
+      const pub = await deriveVerifyKey(seed);
+      const url = URL.createObjectURL(new Blob([seed], { type: "application/octet-stream" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "tm_signing_key.bin";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      dropSeed();
+      fileSeed = seed;
+      $("genKey").textContent = rustConst(pub);
+      $("genOut").hidden = false;
+      seedNote();
+      setStatus("New seed generated.", "ok");
+    } catch (e) {
+      setStatus("Could not generate a seed: " + e.message, "err");
+    }
+  });
+
+  $("days").addEventListener("input", updateExpiry);
+
+  $("copy").addEventListener("click", async () => {
+    const ta = $("pinHex");
+    try {
+      await navigator.clipboard.writeText(ta.value);
+    } catch (e) {
+      ta.select();
+      try { document.execCommand("copy"); } catch (e2) { /* user can copy by hand */ }
+    }
+    $("copied").textContent = "Copied";
+    setTimeout(() => { $("copied").textContent = ""; }, 2000);
+  });
+
+  $("sign").addEventListener("click", async () => {
+    const btn = $("sign");
+    $("out").hidden = true;
+    let seed = null;
+    try {
+      const host = $("host").value.trim();
+      const cap = parseInt($("cap").value, 10);
+      const days = parseInt($("days").value, 10);
+      const device = $("device").value.trim();
+      if (!validHost(host)) throw new Error("invalid control host");
+      if (!(cap >= 1)) throw new Error("invalid cap version");
+      if (!(days >= 1 && days <= 3650)) throw new Error("validity must be 1 to 3650 days");
+      if (device && !validDevice(device)) throw new Error("invalid device address");
+      seed = currentSeed();
+
+      btn.disabled = true;
+      setStatus("Fetching control key...", "");
+      const resp = await fetch("https://" + host + "/key?v=" + cap, {
+        cache: "no-store", credentials: "omit", referrerPolicy: "no-referrer"
+      });
+      if (!resp.ok) throw new Error("/key returned HTTP " + resp.status);
+      const pubkey = parseControlKey(await resp.json());
+
+      setStatus("Signing...", "");
+      const notAfter = Math.floor(Date.now() / 1000) + days * 86400;
+      const res = await signPin(seed, pubkey, notAfter);
+      const hex = toHex(res.blob);
+
+      $("ctrlKey").value = "mkey:" + toHex(pubkey);
+      $("pinHex").value = hex;
+      $("verifyKey").textContent = rustConst(res.verifyKey);
+      const link = $("pinLink");
+      if (device) {
+        const href = "http://" + device + "/ts#pin=" + hex;
+        link.href = href;
+        link.textContent = "http://" + device + "/ts#pin=" + hex.slice(0, 16) + "...";
+      }
+      $("linkWrap").hidden = !device;
+      $("linkNote").hidden = !device;
+      $("out").hidden = false;
+      setStatus("Signed. Expires " + new Date(notAfter * 1000).toLocaleString() + ".", "ok");
+
+      if ($("remember").checked && (fileSeed || $("seedHex").value.trim())) {
+        if (!storageSet(toHex(seed))) setStatus("Signed, but this browser refused to store the seed.", "err");
+      }
+      // Seed hygiene: nothing stays in fields after a successful signing.
+      dropSeed();
+      seedNote();
+    } catch (e) {
+      setStatus("Failed: " + (e && e.message ? e.message : "unknown error"), "err");
+    } finally {
+      if (seed) seed.fill(0);
+      seed = null;
+      btn.disabled = false;
+    }
+  });
+
+  (async () => {
+    updateExpiry();
+    if (!(await ed25519Supported())) {
+      $("unsupported").hidden = false;
+      for (const id of ["sign", "gen"]) $(id).disabled = true;
+    }
+    if (storageGet()) {
+      $("remember").checked = true;
+      $("rememberWarn").hidden = false;
+      seedNote();
+    }
+  })();
+}
+</script>
+</body>
+</html>
