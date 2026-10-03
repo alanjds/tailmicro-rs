@@ -58,6 +58,18 @@ impl Config {
         Ok(self)
     }
 
+    /// Use the control server's Noise public key directly, as fetched by the
+    /// application (for example by the user's browser from
+    /// `https://controlplane.tailscale.com/key?v=71`, whose TLS the browser
+    /// checks). Unlike `with_control_pin_hex` nothing is signed here: whoever
+    /// supplies the key is trusted to have obtained it over an authenticated
+    /// channel. A wrong key does not connect; `Device::connect` then fails
+    /// with `ControlError::ControlKeyRejected`.
+    pub fn with_control_key(mut self, key: [u8; 32]) -> Self {
+        self.control_pin = key;
+        self
+    }
+
     /// Choose which tailnet names resolve on this device (see
     /// [`MagicDns`](tm_netstack::names::MagicDns)). Default
     /// `MagicDns::Full`: the FQDN, plus short names when the tailnet has
@@ -206,6 +218,14 @@ impl Default for Config {
 mod tests {
     use super::*;
     use tm_netstack::names::Resolution;
+
+    #[test]
+    fn control_key_is_stored() {
+        let c = Config::default();
+        assert_eq!(c.control_pin, [0u8; 32]);
+        let c = c.with_control_key([7u8; 32]);
+        assert_eq!(c.control_pin, [7u8; 32]);
+    }
 
     #[test]
     fn link_check_and_dns_resolver_default_to_none_and_are_stored() {

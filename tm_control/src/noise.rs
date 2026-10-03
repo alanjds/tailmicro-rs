@@ -543,8 +543,17 @@ fn be_nonce(counter: u64) -> [u8; 12] {
     //   fresh byte for the response frame's type field below.
     // - anything else: it's already the response frame's type byte.
 
+    // The control server was measured (on device, with a wrong responder key)
+    // answering 101 and then closing cleanly before any Noise byte. That is
+    // the same verdict as a close before the 101, so it is reported alike.
     let mut first_byte = [0u8; 1];
-    crate::io::read_exact(stream, &mut first_byte).await?;
+    match crate::io::read_byte_or_eof(stream).await? {
+        Some(b) => first_byte[0] = b,
+        None => {
+            tracing::error!("ts2021: peer closed after the 101 without a Noise response");
+            return Err(ControlError::Noise(NoiseError::NoResponse));
+        }
+    }
 
     let msg_type = if first_byte[0] == EARLY_PAYLOAD_MAGIC_BYTE {
         // Read remaining 4 bytes of the 5-byte EarlyNoise header
