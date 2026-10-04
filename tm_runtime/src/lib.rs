@@ -835,6 +835,14 @@ async fn sync_disco_allowlist(
 /// its table temporary does not grow `event_router_task`'s poll state.
 #[inline(never)]
 fn install_map_names(map: &tm_control::MapState) {
+    let table = build_name_table(map);
+    info!("Runtime::join() - MagicDNS table: {} names, proxied={}", table.len(), map.names.proxied);
+    tm_netstack::names::install(table);
+}
+
+/// Our own label is entered with our own IP, so `<label>` (MagicDNS on) and
+/// `<label>.<suffix>` resolve to this device like any peer's name.
+fn build_name_table(map: &tm_control::MapState) -> tm_netstack::names::NameTable {
     use tm_netstack::names::NameTable;
     let n = &map.names;
     let mut table = NameTable::new();
@@ -847,9 +855,7 @@ fn install_map_names(map: &tm_control::MapState) {
             table.insert(p.name.label.as_str(), p.tailnet_ip.0);
         }
     }
-    info!("Runtime::join() - MagicDNS table: {} names, suffix '{}', proxied={}",
-        table.len(), n.suffix.as_str(), n.proxied);
-    tm_netstack::names::install(table);
+    table
 }
 
 async fn event_router_task(
@@ -1771,6 +1777,32 @@ mod tests {
         m.names.proxied = true;
         for p in peers { m.peers.push(p.clone()); }
         ControlEvent::MapUpdate(Box::new(m))
+    }
+
+    /// Our own name resolves to our own IP, by FQDN always and by label when
+    /// MagicDNS is on, the same rules as a peer's (and not under another
+    /// tailnet's suffix).
+    #[test]
+    fn our_own_name_resolves_to_our_ip_like_a_peers() {
+        use tm_netstack::names::MagicDns;
+        let suffix = "tailnet-xyz.ts.net";
+        let ControlEvent::MapUpdate(mut m) = snapshot(&[], tm_control::suffix_hash(suffix)) else { unreachable!() };
+        m.names.self_label.clear();
+        m.names.self_label.push_str("tasmolike-bfd518-5400").unwrap();
+        m.names.suffix.clear();
+        m.names.suffix.push_str(suffix).unwrap();
+        let ours = Some([100, 64, 0, 1]);
+        let t = build_name_table(&m);
+        for mode in [MagicDns::Full, MagicDns::FqdnOnly] {
+            assert_eq!(t.lookup("tasmolike-bfd518-5400.tailnet-xyz.ts.net", mode), ours, "{mode:?}");
+            assert_eq!(t.lookup("Tasmolike-BFD518-5400.Tailnet-XYZ.ts.net.", mode), ours, "{mode:?} case and dot");
+            assert_eq!(t.lookup("tasmolike-bfd518-5400.other.ts.net", mode), None, "{mode:?} other tailnet");
+        }
+        assert_eq!(t.lookup("tasmolike-bfd518-5400", MagicDns::Full), ours, "MagicDNS on: short name");
+        assert_eq!(t.lookup("tasmolike-bfd518-5400", MagicDns::FqdnOnly), None);
+        m.names.proxied = false;
+        assert_eq!(build_name_table(&m).lookup("tasmolike-bfd518-5400", MagicDns::Full), None, "MagicDNS off: no short name");
+        assert_eq!(build_name_table(&m).lookup("tasmolike-bfd518-5400.tailnet-xyz.ts.net", MagicDns::Full), ours);
     }
 
     async fn within<T>(f: impl Future<Output = T>) -> T {
