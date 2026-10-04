@@ -17,6 +17,7 @@ pub mod map_stream;
 pub mod roster;
 pub mod pin;
 pub mod login;
+pub mod rfc3339;
 mod io;
 
 use arrayvec::ArrayVec;
