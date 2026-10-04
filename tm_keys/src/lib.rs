@@ -233,16 +233,35 @@ impl NodeState {
     /// (the chip MAC), `generation` is appended big-endian to each label so
     /// bumping it yields entirely new keys (node-key rotation hook).
     pub fn derive_from_secret(secret: &[u8; 32], salt: &[u8], generation: u32) -> Self {
-        let key = |label: &[u8]| {
-            let mut info = [0u8; 48];
+        Self::derive_from_secret_rotated(secret, salt, generation, 0)
+    }
+
+    /// Like `derive_from_secret`, with a node rotation counter that renews the
+    /// node and disco keys while the machine key stays put (control ties the
+    /// node entry to the machine key, so keeping it lets a re-registration
+    /// with `OldNodeKey` renew the same node instead of creating a new one).
+    /// Rotation 0 derives exactly what `derive_from_secret` always did; for
+    /// r > 0 the info is `label || generation || r`, 4 bytes longer than the
+    /// rotation-0 form so the two can never collide.
+    pub fn derive_from_secret_rotated(
+        secret: &[u8; 32], salt: &[u8], generation: u32, rotation: u32,
+    ) -> Self {
+        let key = |label: &[u8], rotation: u32| {
+            let mut info = [0u8; 52];
             info[..label.len()].copy_from_slice(label);
-            info[label.len()..label.len() + 4].copy_from_slice(&generation.to_be_bytes());
-            StaticSecret::from(derive_scalar_salted(secret, salt, &info[..label.len() + 4]))
+            let mut n = label.len();
+            info[n..n + 4].copy_from_slice(&generation.to_be_bytes());
+            n += 4;
+            if rotation != 0 {
+                info[n..n + 4].copy_from_slice(&rotation.to_be_bytes());
+                n += 4;
+            }
+            StaticSecret::from(derive_scalar_salted(secret, salt, &info[..n]))
         };
         Self {
-            node_key:    NodePrivateKey(key(NODE_KEY_LABEL)),
-            machine_key: MachinePrivateKey(key(MACHINE_KEY_LABEL)),
-            disco_key:   DiscoPrivateKey(key(DISCO_KEY_LABEL)),
+            node_key:    NodePrivateKey(key(NODE_KEY_LABEL, rotation)),
+            machine_key: MachinePrivateKey(key(MACHINE_KEY_LABEL, 0)),
+            disco_key:   DiscoPrivateKey(key(DISCO_KEY_LABEL, rotation)),
         }
     }
 
@@ -365,6 +384,55 @@ mod tests {
         assert_ne!(p[0], p[1]);
         assert_ne!(p[0], p[2]);
         assert_ne!(p[1], p[2]);
+    }
+
+    /// The pre-rotation derivation, kept verbatim: rotation 0 must stay equal
+    /// to it or every deployed device would change identity on upgrade.
+    fn legacy_pubs(secret: &[u8; 32], salt: &[u8], generation: u32) -> [[u8; 32]; 3] {
+        let one = |label: &[u8]| {
+            let mut info = label.to_vec();
+            info.extend_from_slice(&generation.to_be_bytes());
+            let sk = StaticSecret::from(derive_scalar_salted(secret, salt, &info));
+            *PublicKey::from(&sk).as_bytes()
+        };
+        [one(NODE_KEY_LABEL), one(MACHINE_KEY_LABEL), one(DISCO_KEY_LABEL)]
+    }
+
+    #[test]
+    fn rotation_zero_derives_exactly_the_legacy_keys() {
+        for generation in [0u32, 1, 7] {
+            let want = legacy_pubs(&[3u8; 32], b"mac", generation);
+            let a = pubs(&NodeState::derive_from_secret(&[3u8; 32], b"mac", generation));
+            let b = pubs(&NodeState::derive_from_secret_rotated(&[3u8; 32], b"mac", generation, 0));
+            assert_eq!(a, want);
+            assert_eq!(b, want);
+        }
+    }
+
+    #[test]
+    fn rotation_changes_node_and_disco_but_never_the_machine_key() {
+        let r0 = pubs(&NodeState::derive_from_secret_rotated(&[3u8; 32], b"mac", 1, 0));
+        let r1 = pubs(&NodeState::derive_from_secret_rotated(&[3u8; 32], b"mac", 1, 1));
+        let r2 = pubs(&NodeState::derive_from_secret_rotated(&[3u8; 32], b"mac", 1, 2));
+        assert_ne!(r0[0], r1[0]);
+        assert_ne!(r0[2], r1[2]);
+        assert_ne!(r1[0], r2[0]);
+        assert_ne!(r1[2], r2[2]);
+        assert_eq!(r0[1], r1[1]);
+        assert_eq!(r1[1], r2[1]);
+        // A rotation is reproducible.
+        assert_eq!(r1, pubs(&NodeState::derive_from_secret_rotated(&[3u8; 32], b"mac", 1, 1)));
+    }
+
+    #[test]
+    fn a_new_generation_still_changes_every_key_whatever_the_rotation() {
+        for rotation in [0u32, 1] {
+            let g1 = pubs(&NodeState::derive_from_secret_rotated(&[3u8; 32], b"mac", 1, rotation));
+            let g2 = pubs(&NodeState::derive_from_secret_rotated(&[3u8; 32], b"mac", 2, rotation));
+            for i in 0..3 {
+                assert_ne!(g1[i], g2[i]);
+            }
+        }
     }
 
     #[test]
