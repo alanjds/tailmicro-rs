@@ -67,6 +67,12 @@ pub struct Roster {
     clock: u32,
     /// Something a snapshot shows changed since the last [`take_dirty`](Self::take_dirty).
     dirty: bool,
+    /// Our node key's expiry. Not in `MapNames`: a snapshot does not show it,
+    /// so it goes to [`selfnode`](crate::selfnode) instead.
+    self_key_expiry: Option<i64>,
+    self_dirty: bool,
+    /// Our `Node.Name` was seen on this connection; see [`Roster::set_self_name`].
+    suffix_known: bool,
 }
 
 impl Roster {
@@ -78,6 +84,9 @@ impl Roster {
             peers: ArrayVec::new(),
             clock: 0,
             dirty: false,
+            self_key_expiry: None,
+            self_dirty: false,
+            suffix_known: false,
         }
     }
 
@@ -126,7 +135,10 @@ impl Roster {
     /// Our own MagicDNS name, from `Node.Name`. An over-long suffix is
     /// dropped whole (names then stay unresolvable by FQDN) rather than kept
     /// truncated, which would mismatch.
-    pub(crate) fn set_self_name(&mut self, label: heapless::String<{ crate::MAX_NAME_LABEL }>, suffix: &str) {
+    ///
+    /// True when the suffix is not the one we had (including the first time),
+    /// which is when the app's suffix hook is due.
+    pub(crate) fn set_self_name(&mut self, label: heapless::String<{ crate::MAX_NAME_LABEL }>, suffix: &str) -> bool {
         let mut fitted: heapless::String<{ crate::MAX_NAME_SUFFIX }> = heapless::String::new();
         if fitted.push_str(suffix).is_err() {
             fitted.clear();
@@ -134,11 +146,32 @@ impl Roster {
         // Hashed over the real suffix even when it did not fit, so peers of
         // the same tailnet still match it.
         let hash = crate::suffix_hash(suffix);
+        let announce = !self.suffix_known || self.names.suffix_hash != hash;
+        self.suffix_known = true;
         if self.names.self_label != label || self.names.suffix != fitted || self.names.suffix_hash != hash {
             self.names.self_label = label;
             self.names.suffix = fitted;
             self.names.suffix_hash = hash;
             self.dirty = true;
+        }
+        announce
+    }
+
+    /// Our node key's expiry in unix seconds; `None` means it never expires.
+    pub(crate) fn set_self_key_expiry(&mut self, expiry: Option<i64>) {
+        if self.self_key_expiry != expiry {
+            self.self_key_expiry = expiry;
+            self.self_dirty = true;
+        }
+    }
+
+    pub fn self_key_expiry(&self) -> Option<i64> { self.self_key_expiry }
+
+    /// Copy our key expiry to [`selfnode`](crate::selfnode) if it changed.
+    /// Not part of `dirty`: a snapshot does not show it.
+    pub fn publish_self(&mut self) {
+        if core::mem::take(&mut self.self_dirty) {
+            crate::selfnode::publish_key_expiry(self.self_key_expiry);
         }
     }
 

@@ -145,6 +145,8 @@ pub struct MapStreamParser {
     /// Whether this message's `Node.Addresses` already supplied our IP.
     ip_set: bool,
     proxied_set: bool,
+    /// Whether the open `Node` object carried a `KeyExpiry`.
+    expiry_set: bool,
     /// Set once a fatal parse/overflow error is seen; further input is ignored
     /// and surfaced from `finish`.
     failed: Option<StreamError>,
@@ -164,6 +166,7 @@ impl MapStreamParser {
             staged: ArrayVec::new(),
             ip_set: false,
             proxied_set: false,
+            expiry_set: false,
             failed: None,
         }
     }
@@ -285,6 +288,7 @@ impl MapStreamParser {
                     Ctx::Patch => self.patch = PeerPatch::default(),
                     Ctx::NodeAddresses => self.ip_set = false,
                     Ctx::DnsConfig => self.proxied_set = false,
+                    Ctx::Node => self.expiry_set = false,
                     Ctx::Region => {
                         // The Regions object is keyed by region-id; that key is the
                         // field name that introduced this object.
@@ -319,6 +323,13 @@ impl MapStreamParser {
                         }
                     }
                     Ctx::Region => self.commit_region(),
+                    // The self Node is always sent whole and the zero time may
+                    // be omitted, so no `KeyExpiry` in it means no expiry.
+                    Ctx::Node => {
+                        if !self.expiry_set {
+                            roster.set_self_key_expiry(None);
+                        }
+                    }
                     Ctx::DnsConfig => {
                         // `Proxied` is omitted from the wire when false.
                         if !self.proxied_set {
@@ -457,7 +468,17 @@ impl MapStreamParser {
             Ctx::Node => {
                 if self.name_is("Name") {
                     let (label, suffix) = split_node_name(val);
-                    roster.set_self_name(label, suffix);
+                    if roster.set_self_name(label, suffix) {
+                        // `suffix` is borrowed from `val`, our scratch copy: the
+                        // app hook gets it and nothing here keeps it.
+                        crate::selfnode::announce_suffix(suffix);
+                    }
+                } else if self.name_is("KeyExpiry") {
+                    // Unparseable: keep what we had rather than claim a state.
+                    if let Ok(exp) = crate::rfc3339::parse_key_expiry(val) {
+                        roster.set_self_key_expiry(exp);
+                    }
+                    self.expiry_set = true;
                 }
             }
             Ctx::PeerAddresses => {
@@ -727,6 +748,119 @@ mod tests {
         assert_eq!(m.names.self_label.as_str(), "solo");
         assert_eq!(m.names.suffix.as_str(), "");
         assert!(!m.names.proxied);
+    }
+
+    /// The self Node as Tailscale SaaS sends it (fields we skip included).
+    fn ts_self(name: &str, expiry: &str) -> String {
+        format!(
+            r#"{{"ID":7,"StableID":"nSELF","Name":"{name}","User":5,
+            "Key":"nodekey:{k}","KeyExpiry":"{expiry}","Machine":"mkey:{k}",
+            "Addresses":["100.64.0.9/32","fd7a:115c:a1e0::9/128"],"Hostinfo":{{"Hostname":"tasmolike"}},
+            "Created":"2026-01-01T00:00:00Z","MachineAuthorized":true}}"#,
+            k = hexk(7),
+        )
+    }
+
+    #[test]
+    fn key_expiry_comes_from_the_self_node() {
+        let name = "tasmolike-bfd518-5400.tailnet-xyz.ts.net.";
+        let body = format!(r#"{{"KeepAlive":false,"Node":{},"DNSConfig":{{"Proxied":true}}}}"#,
+                           ts_self(name, "2026-12-01T00:00:00.5Z"));
+        sweep("", Mode::Full, &body, |r, chunk| {
+            assert_eq!(r.self_key_expiry(), Some(1_796_083_200), "chunk={}", chunk);
+            assert_eq!(snap(r).names.self_label.as_str(), "tasmolike-bfd518-5400", "chunk={}", chunk);
+        });
+    }
+
+    std::thread_local! {
+        static SEEN: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Per-thread, so parallel tests that parse a map do not see each other's
+    /// calls (the hook itself is process-wide).
+    fn record(suffix: &str) {
+        SEEN.with(|s| s.borrow_mut().push(suffix.to_owned()));
+    }
+
+    #[test]
+    fn suffix_hook_gets_our_suffix_once_per_connection_and_on_rename() {
+        crate::selfnode::set_suffix_hook(Some(record));
+        let map = |name: &str| format!(r#"{{"Node":{}}}"#, ts_self(name, "0001-01-01T00:00:00Z"));
+        let take = || SEEN.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        for chunk in CHUNKS {
+            take();
+            let mut r = Roster::new();
+            feed(Mode::Full, &mut r, &map("me.Tailnet-XYZ.ts.net."), chunk).unwrap();
+            assert_eq!(take(), ["Tailnet-XYZ.ts.net"], "chunk={}: first map, case as sent, no dot", chunk);
+            // The same suffix again (a re-poll, a Node delta) is not news.
+            feed(Mode::Full, &mut r, &map("me.Tailnet-XYZ.ts.net."), chunk).unwrap();
+            feed(Mode::Delta, &mut r, &map("me2.tailnet-xyz.ts.net."), chunk).unwrap();
+            assert_eq!(take(), Vec::<String>::new(), "chunk={}", chunk);
+            feed(Mode::Delta, &mut r, &map("me.other.ts.net."), chunk).unwrap();
+            assert_eq!(take(), ["other.ts.net"], "chunk={}: renamed tailnet", chunk);
+            // A new connection starts from an empty roster and announces again.
+            r.clear();
+            feed(Mode::Full, &mut r, &map("solo"), chunk).unwrap();
+            assert_eq!(take(), [""], "chunk={}: bare label has an empty suffix", chunk);
+            // A suffix tailmicro cannot keep is still handed out whole.
+            let long = format!("{}.ts.net", "a".repeat(60));
+            feed(Mode::Delta, &mut r, &map(&format!("me.{long}.")), chunk).unwrap();
+            assert_eq!(take(), [long], "chunk={}", chunk);
+            assert_eq!(snap(&r).names.suffix.as_str(), "", "chunk={}", chunk);
+        }
+        crate::selfnode::set_suffix_hook(None);
+    }
+
+    #[test]
+    fn zero_key_expiry_means_none_and_a_later_map_overwrites() {
+        let none = format!(r#"{{"Node":{}}}"#, ts_self("me.t.ts.net.", "0001-01-01T00:00:00Z"));
+        sweep("", Mode::Full, &none, |r, chunk| {
+            assert_eq!(r.self_key_expiry(), None, "chunk={}", chunk);
+        });
+        let seed = format!(r#"{{"Node":{}}}"#, ts_self("me.t.ts.net.", "2026-12-01T00:00:00Z"));
+        sweep(&seed, Mode::Full, &none, |r, chunk| {
+            assert_eq!(r.self_key_expiry(), None, "full map clears an expiry, chunk={}", chunk);
+        });
+        sweep(&none, Mode::Full, &seed, |r, chunk| {
+            assert_eq!(r.self_key_expiry(), Some(1_796_083_200), "chunk={}", chunk);
+        });
+    }
+
+    #[test]
+    fn key_expiry_follows_node_deltas_and_ignores_other_messages() {
+        let seed = format!(r#"{{"Node":{},"Peers":[]}}"#, ts_self("me.t.ts.net.", "2026-12-01T00:00:00Z"));
+        // A delta without a Node leaves the expiry alone.
+        sweep(&seed, Mode::Delta, r#"{"DNSConfig":{"Proxied":true}}"#, |r, chunk| {
+            assert_eq!(r.self_key_expiry(), Some(1_796_083_200), "chunk={}", chunk);
+        });
+        // A peer's KeyExpiry is not ours.
+        let peer = format!(r#"{{"PeersChanged":[{}]}}"#, ts_peer(10, 1, "100.64.0.10", 1, true));
+        sweep(&seed, Mode::Delta, &peer, |r, chunk| {
+            assert_eq!(r.self_key_expiry(), Some(1_796_083_200), "chunk={}", chunk);
+        });
+        // A key renewed in the admin console arrives as a new Node.
+        let renewed = format!(r#"{{"Node":{}}}"#, ts_self("me.t.ts.net.", "2027-06-01T00:00:00Z"));
+        sweep(&seed, Mode::Delta, &renewed, |r, chunk| {
+            assert_eq!(r.self_key_expiry(), Some(1_811_808_000), "chunk={}", chunk);
+        });
+    }
+
+    #[test]
+    fn garbage_key_expiry_keeps_the_old_value() {
+        let seed = format!(r#"{{"Node":{}}}"#, ts_self("me.t.ts.net.", "2026-12-01T00:00:00Z"));
+        let bad = format!(r#"{{"Node":{}}}"#, ts_self("me.t.ts.net.", "soon"));
+        sweep(&seed, Mode::Delta, &bad, |r, chunk| {
+            assert_eq!(r.self_key_expiry(), Some(1_796_083_200), "chunk={}", chunk);
+        });
+    }
+
+    #[test]
+    fn publish_self_reaches_the_process_wide_status() {
+        let mut r = Roster::new();
+        let body = format!(r#"{{"Node":{}}}"#, ts_self("pub.t.ts.net.", "2026-12-01T00:00:00Z"));
+        feed(Mode::Full, &mut r, &body, 64).unwrap();
+        r.publish_self();
+        assert_eq!(crate::selfnode::key_expiry(), Some(1_796_083_200));
     }
 
     #[test]

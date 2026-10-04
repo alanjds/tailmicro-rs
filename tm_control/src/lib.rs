@@ -18,6 +18,7 @@ pub mod roster;
 pub mod pin;
 pub mod login;
 pub mod rfc3339;
+pub mod selfnode;
 mod io;
 
 use arrayvec::ArrayVec;
@@ -1490,6 +1491,9 @@ impl ControlActor {
                         // Complete message: finish the parse, then act on it.
                         let parsed = slot.parser.take().map(|p| p.finish(roster));
                         slot.reset_message();
+                        // Before OurIpAssigned below, so an app woken by the
+                        // connect already sees its FQDN.
+                        roster.publish_self();
                         match parsed {
                             Some(Ok(())) => {
                                 if emit_events && !our_ip_sent && roster.our_ip().0 != [0u8; 4] {
