@@ -53,7 +53,7 @@ pub use config::Config;
 pub use error::Error;
 pub use tm_netstack::names::{MagicDns, Resolution, Resolver};
 pub use tm_control::{Service, ServiceProto, MAX_SERVICES, MAX_SERVICE_DESC};
-pub use tm_control::login::{control_key_rejected, login_url, LoginUrl, LOGIN_URL_MAX};
+pub use tm_control::login::{control_key_rejected, login_url, refusal, LoginUrl, Refusal, LOGIN_URL_MAX};
 pub use tm_keys::NodeState;
 pub use tm_runtime::{tokio_freertos_yield, OurIpReceiver, OurIpSender};
 
@@ -121,7 +121,12 @@ impl Device {
     ///   node needs neither a key nor a login.
     ///
     /// Fails with `Error::Control(ControlError::ControlKeyRejected)` when the
-    /// pinned control key does not match the server.
+    /// pinned control key does not match the server, with
+    /// `Error::Control(ControlError::LoginRequired)` when control wants a login
+    /// and `Config::with_login_allowed(false)` forbids waiting for it, and with
+    /// `Error::Control(ControlError::NodeKeyExpired)` when control says the node
+    /// key expired and offers no login (renew it with `with_node_rotation` and
+    /// `with_previous_node_rotation`, login allowed).
     pub async fn connect(
         config: &Config,
         auth_key: Option<String>,
@@ -161,7 +166,11 @@ impl Device {
             if control_key_rejected() {
                 Error::Control(tm_control::ControlError::ControlKeyRejected)
             } else {
-                Error::NotConnected
+                match refusal() {
+                    Some(Refusal::LoginRequired) => Error::Control(tm_control::ControlError::LoginRequired),
+                    Some(Refusal::NodeKeyExpired) => Error::Control(tm_control::ControlError::NodeKeyExpired),
+                    None => Error::NotConnected,
+                }
             }
         })?;
         Ok((Self { runtime, our_ip }, driver))

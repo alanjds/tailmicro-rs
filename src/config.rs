@@ -37,6 +37,8 @@ pub struct Config {
     pub(crate) node_rotation: u32,
     /// Rotation being renewed from; see `with_previous_node_rotation`.
     pub(crate) previous_node_rotation: Option<u32>,
+    /// Whether to wait for an interactive login; see `with_login_allowed`.
+    pub(crate) login_allowed: bool,
 }
 
 impl Config {
@@ -105,6 +107,16 @@ impl Config {
     /// existing node. Pair it with `with_node_rotation` set to the new counter.
     pub fn with_previous_node_rotation(mut self, prev: u32) -> Self {
         self.previous_node_rotation = Some(prev);
+        self
+    }
+
+    /// Whether `Device::connect` may wait for a person to approve a login
+    /// (default `true`). With `false`, control answering with a login URL makes
+    /// `connect` fail with `ControlError::LoginRequired` at once, with no URL
+    /// published, so a silent key renewal cannot leave the device waiting
+    /// for an approval. See also `ControlError::NodeKeyExpired`.
+    pub fn with_login_allowed(mut self, allowed: bool) -> Self {
+        self.login_allowed = allowed;
         self
     }
 
@@ -241,6 +253,7 @@ impl Config {
             // socket is bound; the app config has no say in it.
             lan_udp_port: None,
             old_node_key: self.old_node_key(),
+            login_allowed: self.login_allowed,
             hostname: self.hostname,
             os_version: self.os_version.clone(),
             services: self.services,
@@ -266,6 +279,7 @@ impl Default for Config {
             identity_seed: None,
             node_rotation: 0,
             previous_node_rotation: None,
+            login_allowed: true,
         }
     }
 }
@@ -331,6 +345,12 @@ mod tests {
         assert!(cc.old_node_key == Some(r1));
         // No seed, no rotation.
         assert!(Config::default().with_previous_node_rotation(0).control_config().old_node_key.is_none());
+    }
+
+    #[test]
+    fn login_is_allowed_by_default_and_the_flag_reaches_control() {
+        assert!(Config::default().control_config().login_allowed);
+        assert!(!Config::default().with_login_allowed(false).control_config().login_allowed);
     }
 
     #[test]
