@@ -30,6 +30,7 @@ pub struct Config {
     pub(crate) magicdns: tm_netstack::names::MagicDns,
     pub(crate) dns_resolver: Option<tm_netstack::names::Resolver>,
     pub(crate) link_check: Option<fn() -> bool>,
+    pub(crate) tailnet_suffix_hook: Option<fn(&str)>,
     /// App-held random secret and generation for the node identity; see
     /// `with_identity_seed`. `None` falls back to the insecure MAC derivation.
     pub(crate) identity_seed: Option<([u8; 32], u32)>,
@@ -106,6 +107,24 @@ impl Config {
     /// cannot `.await`. Default: none.
     pub fn with_dns_resolver(mut self, resolver: tm_netstack::names::Resolver) -> Self {
         self.dns_resolver = Some(resolver);
+        self
+    }
+
+    /// Be handed the tailnet suffix (`tailnet-xyz.ts.net`) of this node's own
+    /// name, so the app can show the FQDN as `<label>.<suffix>`. tailmicro
+    /// keeps only a hash of it for MagicDNS matching, so this is the one way
+    /// to read it.
+    ///
+    /// `hook` runs on the control task, once per control connection (and
+    /// again if the tailnet is renamed), after the netmap that carries our
+    /// name is parsed and before `Device::connect` returns on a first
+    /// connect. The `&str` has no leading or trailing dot, keeps the case
+    /// control sent, is empty when control names nodes with a bare label,
+    /// and is at most 127 bytes. It is valid only during the call: copy it,
+    /// for example into a `heapless::String<48>`. The hook must not block,
+    /// await or panic. Default: none.
+    pub fn with_tailnet_suffix_hook(mut self, hook: fn(&str)) -> Self {
+        self.tailnet_suffix_hook = Some(hook);
         self
     }
 
@@ -228,6 +247,7 @@ impl Default for Config {
             magicdns:     tm_netstack::names::MagicDns::default(),
             dns_resolver: None,
             link_check:   None,
+            tailnet_suffix_hook: None,
             identity_seed: None,
         }
     }
@@ -257,6 +277,13 @@ mod tests {
         assert_ne!(g0, fallback);
         assert_eq!(g0, key(&Config::default().with_identity_seed([5u8; 32], 0)));
         assert_ne!(g0, key(&Config::default().with_identity_seed([5u8; 32], 1)));
+    }
+
+    #[test]
+    fn tailnet_suffix_hook_defaults_to_none_and_is_stored() {
+        fn hook(_: &str) {}
+        assert!(Config::default().tailnet_suffix_hook.is_none());
+        assert!(Config::default().with_tailnet_suffix_hook(hook).tailnet_suffix_hook.is_some());
     }
 
     #[test]

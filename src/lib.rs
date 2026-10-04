@@ -130,6 +130,7 @@ impl Device {
 
         tm_netstack::names::set_mode(config.magicdns);
         tm_netstack::names::set_resolver(config.dns_resolver);
+        tm_control::selfnode::set_suffix_hook(config.tailnet_suffix_hook);
         tm_buf::link::set_check(config.link_check);
         let node_state = config.load_or_generate_keys().await?;
         tracing::debug!("Device::connect() - keys loaded, node_state generated");
@@ -183,6 +184,15 @@ impl Device {
     /// `TcpStream::connect("bospill:8080")` needs no call to this.
     pub fn resolve(&self, name: &str) -> Option<Ipv4Addr> {
         tm_netstack::names::resolve(name)
+    }
+
+    /// When this node's key expires, in unix seconds, as of the last netmap.
+    /// `None` means it never expires (key expiry disabled for the node), or
+    /// no netmap has been seen yet. The key is renewed by logging in again;
+    /// the value follows later netmaps, so renewing in the admin console
+    /// shows up without reconnecting.
+    pub fn node_key_expiry(&self) -> Option<i64> {
+        tm_control::selfnode::key_expiry()
     }
 
     /// Whether this device is connected to the tailnet.
