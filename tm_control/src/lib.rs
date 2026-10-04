@@ -259,6 +259,11 @@ pub struct Config {
     /// advertised once `PUBLISH_LAN_ENDPOINT` is on (Step 5, D4), because
     /// peers must not be pointed at a socket that cannot answer yet.
     pub lan_udp_port: Option<u16>,
+    /// Public node key this node is renewing from. When set, every register
+    /// request carries it as `OldNodeKey`, so control swaps the key on the
+    /// existing node (same machine key, name and IP) instead of adding a node.
+    /// `None` omits the field.
+    pub old_node_key: Option<tm_keys::NodePublicKey>,
     /// Node name sent in every `Hostinfo`; control derives the MagicDNS name
     /// from it. Must satisfy [`valid_hostname`].
     pub hostname: &'static str,
@@ -694,9 +699,12 @@ fn is_false(b: &bool) -> bool { !*b }
 fn register_body(config: &Config, node_key_hex: &str, auth_key: &str, followup: &str)
     -> Result<heapless::Vec<u8, REQUEST_BODY_CAP>, JsonError>
 {
+    // Public key only: nothing secret reaches the body, which is never logged
+    // anyway because it carries the auth key.
+    let old_hex = config.old_node_key.as_ref().map(|k| k.to_hex());
     to_json_buf(&RegisterRequest {
         version: CAPABILITY_VERSION, node_key: node_key_hex,
-        old_node_key: None,
+        old_node_key: old_hex.as_deref(),
         auth: RegisterAuth { auth_key },
         hostinfo: host_info(config, None),
         followup,
@@ -2115,6 +2123,7 @@ mod tests {
             connect_timeout: Some(Duration::from_millis(50)),
             refresh_interval: None,
             lan_udp_port: None,
+            old_node_key: None,
             hostname: "esp32c3",
             os_version: heapless::String::new(),
             services: &[],
@@ -2147,6 +2156,7 @@ mod tests {
             connect_timeout: None,
             refresh_interval: None,
             lan_udp_port: None,
+            old_node_key: None,
             hostname: "esp32c3",
             os_version: heapless::String::new(),
             services: &[],
@@ -2166,7 +2176,7 @@ mod tests {
     fn cfg(services: &'static [Service]) -> Config {
         Config {
             control_host: "localhost", control_port: 80, control_pin: [0u8; 32],
-            connect_timeout: None, refresh_interval: None, lan_udp_port: None, hostname: "esp32c3",
+            connect_timeout: None, refresh_interval: None, lan_udp_port: None, old_node_key: None, hostname: "esp32c3",
             os_version: heapless::String::new(), services,
         }
     }
@@ -2350,6 +2360,28 @@ mod tests {
             assert!(!o.contains_key(k), "{k} must be omitted");
         }
         assert!(o.contains_key("Hostinfo"));
+    }
+
+    /// A renewal names the key it replaces, as the public `nodekey:` form, and
+    /// nothing else about the request changes; no private key is in the body.
+    #[test]
+    fn renewal_register_carries_the_old_node_key() {
+        let old = tm_keys::NodePrivateKey::derive_from_seed(b"old", b"label").public();
+        let c = Config { old_node_key: Some(old.clone()), ..cfg(&[]) };
+        let body = register_body(&c, NODE_HEX, "tskey-auth-x", "").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["OldNodeKey"], old.to_hex().as_str());
+        assert_eq!(v["NodeKey"], NODE_HEX);
+        assert_eq!(v["Auth"], serde_json::json!({"AuthKey": "tskey-auth-x"}));
+        let text = core::str::from_utf8(&body).unwrap();
+        assert_eq!(text.matches("nodekey:").count(), 2, "only the two public keys");
+        // Without a renewal the field stays omitted.
+        assert!(reg_json("tskey-auth-x", "").get("OldNodeKey").is_none());
+        // Also on the keyless and followup forms.
+        let c = Config { old_node_key: Some(old.clone()), ..cfg(&[]) };
+        let body = register_body(&c, NODE_HEX, "", "https://x/a/1").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["OldNodeKey"], old.to_hex().as_str());
     }
 
     /// The auth-key path is byte-for-byte what it was: `Auth.AuthKey`, no `Followup`.

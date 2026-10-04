@@ -35,6 +35,8 @@ pub struct Config {
     pub(crate) identity_seed: Option<([u8; 32], u32)>,
     /// Node key rotation counter; see `with_node_rotation`.
     pub(crate) node_rotation: u32,
+    /// Rotation being renewed from; see `with_previous_node_rotation`.
+    pub(crate) previous_node_rotation: Option<u32>,
 }
 
 impl Config {
@@ -94,6 +96,15 @@ impl Config {
     /// `with_identity_seed`: the MAC-only fallback has no rotation.
     pub fn with_node_rotation(mut self, rotation: u32) -> Self {
         self.node_rotation = rotation;
+        self
+    }
+
+    /// Mark this connect as a renewal from node rotation `prev` (the one the
+    /// device registered with so far). Registration then sends the public key
+    /// of that rotation as `OldNodeKey`, so control replaces the key on the
+    /// existing node. Pair it with `with_node_rotation` set to the new counter.
+    pub fn with_previous_node_rotation(mut self, prev: u32) -> Self {
+        self.previous_node_rotation = Some(prev);
         self
     }
 
@@ -182,6 +193,15 @@ impl Config {
         Ok(self)
     }
 
+    /// Public node key of `previous_node_rotation`, if a renewal is set and
+    /// the identity seed exists (the MAC-only fallback has no rotation).
+    fn old_node_key(&self) -> Option<tm_keys::NodePublicKey> {
+        let prev = self.previous_node_rotation?;
+        let (secret, generation) = self.identity_seed.as_ref()?;
+        let st = NodeState::derive_from_secret_rotated(secret, &tm_keys::chip_mac(), *generation, prev);
+        Some(st.node_key.public())
+    }
+
     fn node_state(&self) -> NodeState {
         match &self.identity_seed {
             Some((secret, generation)) => {
@@ -220,6 +240,7 @@ impl Config {
             // Filled in by tm_runtime once (and if) its lan-direct UDP
             // socket is bound; the app config has no say in it.
             lan_udp_port: None,
+            old_node_key: self.old_node_key(),
             hostname: self.hostname,
             os_version: self.os_version.clone(),
             services: self.services,
@@ -244,6 +265,7 @@ impl Default for Config {
             link_check:   None,
             identity_seed: None,
             node_rotation: 0,
+            previous_node_rotation: None,
         }
     }
 }
@@ -291,6 +313,24 @@ mod tests {
         assert_eq!(r0[1], r1[1]);
         let g2 = keys(&Config::default().with_identity_seed([5u8; 32], 2).with_node_rotation(1));
         assert!(r1.iter().zip(&g2).all(|(a, b)| a != b));
+    }
+
+    #[test]
+    fn previous_rotation_names_the_old_node_key_in_the_control_config() {
+        let seeded = || Config::default().with_identity_seed([5u8; 32], 1);
+        assert!(seeded().control_config().old_node_key.is_none());
+        let pub_of = |c: &Config| c.node_state().node_key.public();
+        let old = pub_of(&seeded());
+        let renewing = seeded().with_node_rotation(1).with_previous_node_rotation(0);
+        let cc = renewing.control_config();
+        assert!(cc.old_node_key == Some(old.clone()));
+        assert!(pub_of(&renewing) != old, "the new key differs from the old one");
+        // A chain: rotation 2 replaces rotation 1.
+        let r1 = pub_of(&seeded().with_node_rotation(1));
+        let cc = seeded().with_node_rotation(2).with_previous_node_rotation(1).control_config();
+        assert!(cc.old_node_key == Some(r1));
+        // No seed, no rotation.
+        assert!(Config::default().with_previous_node_rotation(0).control_config().old_node_key.is_none());
     }
 
     #[test]
