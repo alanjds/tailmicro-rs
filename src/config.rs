@@ -30,6 +30,9 @@ pub struct Config {
     pub(crate) magicdns: tm_netstack::names::MagicDns,
     pub(crate) dns_resolver: Option<tm_netstack::names::Resolver>,
     pub(crate) link_check: Option<fn() -> bool>,
+    /// App-held random secret and generation for the node identity; see
+    /// `with_identity_seed`. `None` falls back to the insecure MAC derivation.
+    pub(crate) identity_seed: Option<([u8; 32], u32)>,
 }
 
 impl Config {
@@ -67,6 +70,18 @@ impl Config {
     /// with `ControlError::ControlKeyRejected`.
     pub fn with_control_key(mut self, key: [u8; 32]) -> Self {
         self.control_pin = key;
+        self
+    }
+
+    /// Supply the app's random 32-byte identity secret (generated on first
+    /// boot and kept in the app's NVS) and a generation counter (use 0
+    /// by default). The node, machine and disco keys are derived from the
+    /// secret with the chip MAC as a per-device salt, so the public MAC alone
+    /// reveals nothing. Bumping `generation` yields entirely new keys. Without
+    /// this call the keys come from the MAC alone, which anyone on the LAN can
+    /// compute, so apps should always call it.
+    pub fn with_identity_seed(mut self, secret: [u8; 32], generation: u32) -> Self {
+        self.identity_seed = Some((secret, generation));
         self
     }
 
@@ -155,24 +170,27 @@ impl Config {
         Ok(self)
     }
 
+    fn node_state(&self) -> NodeState {
+        match &self.identity_seed {
+            Some((secret, generation)) => {
+                NodeState::derive_from_secret(secret, &tm_keys::chip_mac(), *generation)
+            }
+            None => {
+                tracing::warn!(
+                    "No identity seed set: node keys derive from the public chip MAC and can be forged from the LAN; call Config::with_identity_seed"
+                );
+                NodeState::derive_from_chip()
+            }
+        }
+    }
+
     pub(crate) async fn load_or_generate_keys(&self) -> Result<NodeState, Error> {
-        // K2 (docs/stable-node-identity-plan.md): derive the node identity
-        // deterministically from the chip's eFuse MAC via HKDF-SHA256, so
-        // the SAME physical device always registers with the SAME identity
-        // -- even across NVS erase and reflash, with nothing to persist.
-        //
-        // Root cause this replaces: this used to be `NodeState::generate()`,
-        // called unconditionally on every `Device::connect()`. That's the
-        // actual reason the node key churned every boot: the app layer
-        // (tasmolike-rs's `TailscaleService::load_or_generate_keys`, which
-        // reads/writes NVS) loaded or generated a key and logged "Loaded
-        // existing Tailscale node keys" -- but never passed that key here.
-        // `Device::connect` doesn't take a `NodeState` argument at all, so
-        // the app's NVS round-trip was live but entirely disconnected from
-        // what actually got registered with the control plane.
-        let node_state = NodeState::derive_from_chip();
+        // The app used to load keys from NVS that never reached here, which
+        // churned the node key every boot; the identity is now derived
+        // deterministically (docs/stable-node-identity-plan.md).
+        let node_state = self.node_state();
         tracing::info!(
-            "Derived stable per-chip node identity, registering public key {}",
+            "Derived stable node identity, registering public key {}",
             node_state.node_key.public().to_hex()
         );
         Ok(node_state)
@@ -210,6 +228,7 @@ impl Default for Config {
             magicdns:     tm_netstack::names::MagicDns::default(),
             dns_resolver: None,
             link_check:   None,
+            identity_seed: None,
         }
     }
 }
@@ -225,6 +244,19 @@ mod tests {
         assert_eq!(c.control_pin, [0u8; 32]);
         let c = c.with_control_key([7u8; 32]);
         assert_eq!(c.control_pin, [7u8; 32]);
+    }
+
+    #[test]
+    fn identity_seed_replaces_the_mac_only_default() {
+        let key = |c: &Config| *c.node_state().node_key.public().as_bytes();
+        let c = Config::default();
+        let fallback = key(&c);
+        let c = c.with_identity_seed([5u8; 32], 0);
+        assert_eq!(c.identity_seed, Some(([5u8; 32], 0)));
+        let g0 = key(&c);
+        assert_ne!(g0, fallback);
+        assert_eq!(g0, key(&Config::default().with_identity_seed([5u8; 32], 0)));
+        assert_ne!(g0, key(&Config::default().with_identity_seed([5u8; 32], 1)));
     }
 
     #[test]

@@ -25,6 +25,16 @@ fn derive_scalar(seed: &[u8], label: &[u8]) -> [u8; 32] {
     okm
 }
 
+/// Salted variant for `NodeState::derive_from_secret`: `secret` is the IKM,
+/// `salt` a per-device pepper, `label` already carries the generation.
+fn derive_scalar_salted(secret: &[u8], salt: &[u8], label: &[u8]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(salt), secret);
+    let mut okm = [0u8; 32];
+    hk.expand(label, &mut okm)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    okm
+}
+
 // ── Node key ─────────────────────────────────────────────────────────────────
 
 /// The long-lived identity key of a Tailscale node.
@@ -217,6 +227,27 @@ impl NodeState {
         }
     }
 
+    /// Derive the identity from an app-held random secret (never the MAC
+    /// alone: the MAC is visible on the LAN, so a MAC-only derivation lets
+    /// anyone compute the node private key). `salt` is a per-device pepper
+    /// (the chip MAC), `generation` is appended big-endian to each label so
+    /// bumping it yields entirely new keys (node-key rotation hook).
+    pub fn derive_from_secret(secret: &[u8; 32], salt: &[u8], generation: u32) -> Self {
+        let key = |label: &[u8]| {
+            let mut info = [0u8; 48];
+            info[..label.len()].copy_from_slice(label);
+            info[label.len()..label.len() + 4].copy_from_slice(&generation.to_be_bytes());
+            StaticSecret::from(derive_scalar_salted(secret, salt, &info[..label.len() + 4]))
+        };
+        Self {
+            node_key:    NodePrivateKey(key(NODE_KEY_LABEL)),
+            machine_key: MachinePrivateKey(key(MACHINE_KEY_LABEL)),
+            disco_key:   DiscoPrivateKey(key(DISCO_KEY_LABEL)),
+        }
+    }
+
+    /// Insecure fallback: derives everything from the public chip MAC, so
+    /// anyone on the LAN can recompute the keys. Prefer `derive_from_secret`.
     /// K2: stable per-chip identity (see docs/stable-node-identity-plan.md).
     /// On ESP-IDF, seeds the derivation from the ESP32-C3 factory eFuse MAC
     /// (`esp_efuse_mac_get_default`, 6 bytes, unique per chip and
@@ -225,6 +256,12 @@ impl NodeState {
     pub fn derive_from_chip() -> Self {
         Self::derive_from_seed(&chip_seed())
     }
+}
+
+/// The factory eFuse MAC (fixed test value on host); public, so only fit
+/// as a salt, never as secret key material.
+pub fn chip_mac() -> [u8; 6] {
+    chip_seed()
 }
 
 #[cfg(target_os = "espidf")]
@@ -290,6 +327,54 @@ mod tests {
         // And node/machine/disco still differ from each other.
         assert_ne!(a.node_key.public().as_bytes(), a.machine_key.public().as_bytes());
         assert_ne!(a.node_key.public().as_bytes(), a.disco_key.public().as_bytes());
+    }
+
+    fn pubs(s: &NodeState) -> [[u8; 32]; 3] {
+        [
+            *s.node_key.public().as_bytes(),
+            *s.machine_key.public().as_bytes(),
+            *s.disco_key.public().as_bytes(),
+        ]
+    }
+
+    #[test]
+    fn derive_from_secret_is_reproducible() {
+        let a = NodeState::derive_from_secret(&[1u8; 32], b"mac", 0);
+        let b = NodeState::derive_from_secret(&[1u8; 32], b"mac", 0);
+        assert_eq!(pubs(&a), pubs(&b));
+    }
+
+    #[test]
+    fn derive_from_secret_changes_with_every_input_per_kind() {
+        let base = pubs(&NodeState::derive_from_secret(&[1u8; 32], b"mac", 0));
+        for other in [
+            NodeState::derive_from_secret(&[2u8; 32], b"mac", 0),
+            NodeState::derive_from_secret(&[1u8; 32], b"mbc", 0),
+            NodeState::derive_from_secret(&[1u8; 32], b"mac", 1),
+        ] {
+            let o = pubs(&other);
+            for i in 0..3 {
+                assert_ne!(base[i], o[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn derive_from_secret_kinds_differ() {
+        let p = pubs(&NodeState::derive_from_secret(&[1u8; 32], b"mac", 0));
+        assert_ne!(p[0], p[1]);
+        assert_ne!(p[0], p[2]);
+        assert_ne!(p[1], p[2]);
+    }
+
+    #[test]
+    fn mac_only_derivation_does_not_match_secret_derivation() {
+        let mac = chip_mac();
+        let old = pubs(&NodeState::derive_from_seed(&mac));
+        let new = pubs(&NodeState::derive_from_secret(&[0u8; 32], &mac, 0));
+        for i in 0..3 {
+            assert_ne!(old[i], new[i]);
+        }
     }
 
     #[test]

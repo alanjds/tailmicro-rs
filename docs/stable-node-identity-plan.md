@@ -155,3 +155,23 @@ first job of this plan is to find out **why**, not to re-add persistence.
 Land (b) first. With a stable `our_ip`, plan (a)'s netif setup becomes a
 one-time bring-up (no address-change handling), and the exposed
 `http://<node>/` endpoint has a durable address.
+
+## Update: app-held secret seed (MAC alone is not enough)
+
+K2 derived the keys from the factory eFuse MAC alone. The MAC is public (it
+is visible on the LAN), so anyone could recompute the node private key and
+impersonate the node on the tailnet.
+
+Current scheme: the app generates a random 32-byte secret on first boot and
+keeps it in its own NVS (tailmicro never stores it), plus a `u32` generation
+counter (0 by default). `Config::with_identity_seed(secret, generation)`
+makes `NodeState::derive_from_secret` run HKDF-SHA256 with ikm = secret,
+salt = chip MAC (per-device pepper), info = the per-key label followed by the
+generation as 4 big-endian bytes. Bumping the generation yields entirely new
+node, machine and disco keys, which is the hook for node-key rotation.
+
+Without `with_identity_seed`, the old MAC-only derivation is used as an
+insecure fallback and a warning is logged.
+
+Consequence: an NVS wipe loses the secret, so the device gets a new identity.
+The old node stays listed (offline) in the admin console until it is deleted.
