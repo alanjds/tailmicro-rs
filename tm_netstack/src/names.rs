@@ -72,6 +72,12 @@ impl NameTable {
         self.proxied = proxied;
     }
 
+    /// The tailnet suffix set by [`set_domain`](Self::set_domain); empty when
+    /// none, or when it was too long to keep.
+    pub fn suffix(&self) -> &str {
+        &self.suffix
+    }
+
     /// Add `label` (stored lowercased). False if it is empty, a duplicate, or
     /// the table or arena is full; the first entry for a label wins.
     pub fn insert(&mut self, label: &str, ip: [u8; 4]) -> bool {
@@ -186,6 +192,11 @@ pub fn install(table: NameTable) {
     shared().table = table;
 }
 
+/// Copy of the process-wide table's tailnet suffix (see [`NameTable::suffix`]).
+pub fn suffix() -> heapless::String<MAX_SUFFIX> {
+    shared().table.suffix.clone()
+}
+
 /// Resolve a tailnet name with the process-wide table. `None` means "not a
 /// tailnet name here": the caller should use its normal resolver.
 pub fn resolve(name: &str) -> Option<Ipv4Addr> {
@@ -259,7 +270,9 @@ mod tests {
         }
         set_resolver(None);
         assert_eq!(answer("printer.local"), Resolution::Pass, "no resolver: normal DNS");
+        assert_eq!(suffix().as_str(), "", "nothing installed yet");
         install(table("tailnet-xyz.ts.net", true));
+        assert_eq!(suffix().as_str(), "tailnet-xyz.ts.net", "the installed table's suffix, as given");
         set_resolver(Some(app));
         let tail = Ipv4Addr::new(100, 85, 218, 10);
         assert_eq!(answer("bospill"), Resolution::Found(tail), "MagicDNS wins");
@@ -355,6 +368,18 @@ mod tests {
         t.set_domain(&"a".repeat(MAX_SUFFIX + 1), true);
         t.insert("p", [1; 4]);
         assert!(t.lookup(&format!("p.{}", "a".repeat(MAX_SUFFIX + 1)), MagicDns::Full).is_none());
+    }
+
+    #[test]
+    fn suffix_is_kept_as_given_and_empty_when_too_long() {
+        let mut t = NameTable::new();
+        assert_eq!(t.suffix(), "");
+        t.set_domain("Tailnet-XYZ.ts.net", true);
+        assert_eq!(t.suffix(), "Tailnet-XYZ.ts.net");
+        t.set_domain(&"a".repeat(MAX_SUFFIX), true);
+        assert_eq!(t.suffix().len(), MAX_SUFFIX);
+        t.set_domain(&"a".repeat(MAX_SUFFIX + 1), true);
+        assert_eq!(t.suffix(), "", "dropped whole, never truncated");
     }
 
     #[test]

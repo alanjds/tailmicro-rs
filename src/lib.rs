@@ -194,6 +194,16 @@ impl Device {
         tm_control::selfnode::key_expiry()
     }
 
+    /// The tailnet suffix of this node's name (`tailnet-xyz.ts.net`, no dots at
+    /// the ends, case as control sent it), so an app can show the FQDN as
+    /// `<label>.<suffix>`. A copy of the one stored by tailmicro, from the
+    /// last netmap; empty when not yet known, when control names nodes with a
+    /// bare label, or when it is longer than `MAX_NAME_SUFFIX` (48 bytes), as a
+    /// longer suffix is dropped whole rather than truncated.
+    pub fn tailnet_suffix(&self) -> heapless::String<{ tm_control::MAX_NAME_SUFFIX }> {
+        tm_netstack::names::suffix()
+    }
+
     /// Whether this device is connected to the tailnet.
     ///
     /// Always `true` for a `Device` obtained from `Device::connect` — its

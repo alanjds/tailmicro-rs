@@ -840,6 +840,10 @@ fn install_map_names(map: &tm_control::MapState) {
     tm_netstack::names::install(table);
 }
 
+// The name table drops a suffix longer than its cap; the roster's cap must be
+// the same or `Device::tailnet_suffix` would disagree with MapNames.
+const _: () = assert!(tm_control::MAX_NAME_SUFFIX == tm_netstack::names::MAX_SUFFIX);
+
 /// Our own label is entered with our own IP, so `<label>` (MagicDNS on) and
 /// `<label>.<suffix>` resolve to this device like any peer's name.
 fn build_name_table(map: &tm_control::MapState) -> tm_netstack::names::NameTable {
@@ -1803,6 +1807,7 @@ mod tests {
         m.names.proxied = false;
         assert_eq!(build_name_table(&m).lookup("tasmolike-bfd518-5400", MagicDns::Full), None, "MagicDNS off: no short name");
         assert_eq!(build_name_table(&m).lookup("tasmolike-bfd518-5400.tailnet-xyz.ts.net", MagicDns::Full), ours);
+        assert_eq!(build_name_table(&m).suffix(), suffix, "the installed table carries MapNames.suffix");
     }
 
     async fn within<T>(f: impl Future<Output = T>) -> T {
