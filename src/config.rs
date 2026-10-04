@@ -33,6 +33,8 @@ pub struct Config {
     /// App-held random secret and generation for the node identity; see
     /// `with_identity_seed`. `None` falls back to the insecure MAC derivation.
     pub(crate) identity_seed: Option<([u8; 32], u32)>,
+    /// Node key rotation counter; see `with_node_rotation`.
+    pub(crate) node_rotation: u32,
 }
 
 impl Config {
@@ -82,6 +84,16 @@ impl Config {
     /// compute, so apps should always call it.
     pub fn with_identity_seed(mut self, secret: [u8; 32], generation: u32) -> Self {
         self.identity_seed = Some((secret, generation));
+        self
+    }
+
+    /// Renew the node key without becoming a new device. The counter changes
+    /// only the node and disco keys; the machine key (and so the node entry,
+    /// name and IP that control ties to it) stays. Rotation 0, the default,
+    /// derives the same keys as before this existed. Needs
+    /// `with_identity_seed`: the MAC-only fallback has no rotation.
+    pub fn with_node_rotation(mut self, rotation: u32) -> Self {
+        self.node_rotation = rotation;
         self
     }
 
@@ -173,7 +185,9 @@ impl Config {
     fn node_state(&self) -> NodeState {
         match &self.identity_seed {
             Some((secret, generation)) => {
-                NodeState::derive_from_secret(secret, &tm_keys::chip_mac(), *generation)
+                NodeState::derive_from_secret_rotated(
+                    secret, &tm_keys::chip_mac(), *generation, self.node_rotation,
+                )
             }
             None => {
                 tracing::warn!(
@@ -229,6 +243,7 @@ impl Default for Config {
             dns_resolver: None,
             link_check:   None,
             identity_seed: None,
+            node_rotation: 0,
         }
     }
 }
@@ -257,6 +272,25 @@ mod tests {
         assert_ne!(g0, fallback);
         assert_eq!(g0, key(&Config::default().with_identity_seed([5u8; 32], 0)));
         assert_ne!(g0, key(&Config::default().with_identity_seed([5u8; 32], 1)));
+    }
+
+    #[test]
+    fn node_rotation_changes_node_and_disco_but_not_machine_key() {
+        let keys = |c: &Config| {
+            let n = c.node_state();
+            [*n.node_key.public().as_bytes(), *n.machine_key.public().as_bytes(),
+             *n.disco_key.public().as_bytes()]
+        };
+        let base = Config::default().with_identity_seed([5u8; 32], 1);
+        let r0 = keys(&base);
+        // Rotation 0 is the default and must equal what the device derived before.
+        assert_eq!(r0, keys(&Config::default().with_identity_seed([5u8; 32], 1).with_node_rotation(0)));
+        let r1 = keys(&Config::default().with_identity_seed([5u8; 32], 1).with_node_rotation(1));
+        assert_ne!(r0[0], r1[0]);
+        assert_ne!(r0[2], r1[2]);
+        assert_eq!(r0[1], r1[1]);
+        let g2 = keys(&Config::default().with_identity_seed([5u8; 32], 2).with_node_rotation(1));
+        assert!(r1.iter().zip(&g2).all(|(a, b)| a != b));
     }
 
     #[test]
