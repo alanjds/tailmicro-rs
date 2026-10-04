@@ -19,12 +19,24 @@ pub const LOGIN_URL_MAX: usize = 160;
 /// An interactive-login URL for the user to open in a browser.
 pub type LoginUrl = heapless::String<LOGIN_URL_MAX>;
 
+/// Why bring-up stopped on a control answer the application can act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Control asked for an interactive login, which `Config::login_allowed`
+    /// forbids. Nothing was published to [`login_url`] and nothing waits.
+    LoginRequired,
+    /// Control says the node key expired and offered no login to renew it.
+    NodeKeyExpired,
+}
+
 struct State {
     url: LoginUrl,
     key_rejected: bool,
+    refusal: Option<Refusal>,
 }
 
-static STATE: Mutex<State> = Mutex::new(State { url: heapless::String::new(), key_rejected: false });
+static STATE: Mutex<State> =
+    Mutex::new(State { url: heapless::String::new(), key_rejected: false, refusal: None });
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     // A poisoned lock only means another thread panicked mid-update of two
@@ -46,6 +58,12 @@ pub fn control_key_rejected() -> bool {
     with(|s| s.key_rejected)
 }
 
+/// The control answer that ended bring-up, when it is one of [`Refusal`].
+/// Cleared when a new `ControlCmd::Start` begins.
+pub fn refusal() -> Option<Refusal> {
+    with(|s| s.refusal)
+}
+
 /// Store the pending URL. Returns false (and clears any old URL) if it does
 /// not fit, so the application never shows a truncated link.
 pub(crate) fn set_login_url(url: &str) -> bool {
@@ -61,4 +79,8 @@ pub(crate) fn clear_login_url() {
 
 pub(crate) fn set_control_key_rejected(v: bool) {
     with(|s| s.key_rejected = v);
+}
+
+pub(crate) fn set_refusal(v: Option<Refusal>) {
+    with(|s| s.refusal = v);
 }

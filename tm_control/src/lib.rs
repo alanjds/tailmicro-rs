@@ -264,6 +264,11 @@ pub struct Config {
     /// existing node (same machine key, name and IP) instead of adding a node.
     /// `None` omits the field.
     pub old_node_key: Option<tm_keys::NodePublicKey>,
+    /// Whether an interactive login may be waited for. With `false` an
+    /// `AuthURL` answer ends bring-up at once with `ControlError::LoginRequired`
+    /// and publishes no URL, so a silent renewal never leaves the device
+    /// waiting for an approval.
+    pub login_allowed: bool,
     /// Node name sent in every `Hostinfo`; control derives the MagicDNS name
     /// from it. Must satisfy [`valid_hostname`].
     pub hostname: &'static str,
@@ -372,7 +377,17 @@ pub enum ControlError { Tls, Noise(NoiseError), Http, H2(H2Error), Json(JsonErro
                         /// closed the connection without answering the Noise
                         /// initiation on two consecutive dials. See
                         /// `NoiseError::NoResponse` and [`login::control_key_rejected`].
-                        ControlKeyRejected }
+                        ControlKeyRejected,
+                        /// Control asked for an interactive login while
+                        /// `Config::login_allowed` is false (a silent renewal
+                        /// that cannot be done without a person). Also left in
+                        /// [`login::refusal`].
+                        LoginRequired,
+                        /// Control reports the node key as expired and offers
+                        /// no login URL. Renewing needs a new node key sent
+                        /// with `Config::old_node_key`, this time with login
+                        /// allowed. Also left in [`login::refusal`].
+                        NodeKeyExpired }
 #[derive(Debug)]
 pub enum NoiseError {
     Handshake, Decrypt, Encrypt,
@@ -736,8 +751,27 @@ fn classify_register(reg: &RegisterResponse) -> Result<RegisterOutcome, ControlE
     }
     // Expired with no way to log in: rotating the node key (OldNodeKey) is
     // what would be needed, and that key belongs to the application's storage.
-    if reg.node_key_expired { return Err(ControlError::RegistrationFailed); }
+    if reg.node_key_expired { return Err(ControlError::NodeKeyExpired); }
     Ok(RegisterOutcome::Authorized)
+}
+
+/// A fresh AuthURL answer may only start a login wait when the app allows it;
+/// a followup round is a wait the app already agreed to.
+fn check_login_allowed(config: &Config, in_followup: bool) -> Result<(), ControlError> {
+    if config.login_allowed || in_followup {
+        return Ok(());
+    }
+    tracing::warn!("Tailscale login required but not allowed; giving up");
+    Err(ControlError::LoginRequired)
+}
+
+/// The part of a control failure the app can read back from [`login::refusal`].
+fn refusal_of(e: &ControlError) -> Option<login::Refusal> {
+    match e {
+        ControlError::LoginRequired => Some(login::Refusal::LoginRequired),
+        ControlError::NodeKeyExpired => Some(login::Refusal::NodeKeyExpired),
+        _ => None,
+    }
 }
 
 /// Longest a single held-open followup request is waited on before it is
@@ -859,8 +893,10 @@ impl ControlActor {
                     // A restart must not show the previous attempt's verdict.
                     login::clear_login_url();
                     login::set_control_key_rejected(false);
+                    login::set_refusal(None);
                     if let Err(e) = self.connect_and_poll(auth_key.as_str(), &events, &cmds).await {
                         tracing::error!("Control error: {:?}", e);
+                        login::set_refusal(refusal_of(&e));
                         let _ = events.send(ControlEvent::Error(e)).await;
                         // No retry (v2 follow-up, see docs/wg-dataplane-notes.md
                         // "Bring-up timeout"): end run() so `events` is
@@ -1131,6 +1167,9 @@ impl ControlActor {
                     RegisterOutcome::LoginNeeded(url) => {
                         // Free the Noise buffers before the next dial.
                         drop((conn, noise, h2));
+                        // A silent attempt stops here: no URL is published and
+                        // no followup is held open.
+                        check_login_allowed(&self.config, followup.is_some())?;
                         gate.pause();
                         failures = 0;
                         if followup.as_deref() != Some(url.as_str()) {
@@ -2124,6 +2163,7 @@ mod tests {
             refresh_interval: None,
             lan_udp_port: None,
             old_node_key: None,
+            login_allowed: true,
             hostname: "esp32c3",
             os_version: heapless::String::new(),
             services: &[],
@@ -2157,6 +2197,7 @@ mod tests {
             refresh_interval: None,
             lan_udp_port: None,
             old_node_key: None,
+            login_allowed: true,
             hostname: "esp32c3",
             os_version: heapless::String::new(),
             services: &[],
@@ -2176,7 +2217,7 @@ mod tests {
     fn cfg(services: &'static [Service]) -> Config {
         Config {
             control_host: "localhost", control_port: 80, control_pin: [0u8; 32],
-            connect_timeout: None, refresh_interval: None, lan_udp_port: None, old_node_key: None, hostname: "esp32c3",
+            connect_timeout: None, refresh_interval: None, lan_udp_port: None, old_node_key: None, login_allowed: true, hostname: "esp32c3",
             os_version: heapless::String::new(), services,
         }
     }
@@ -2435,14 +2476,44 @@ mod tests {
     fn refusals_and_expiry_are_not_logins() {
         let bad = |j: &str| classify_register(&parse_register_response(j.as_bytes()).unwrap());
         assert!(matches!(bad(r#"{"Error":"invalid key"}"#), Err(ControlError::RegistrationFailed)));
-        // Expired with no URL to log in at: still a failure (see classify_register).
-        assert!(matches!(bad(r#"{"NodeKeyExpired":true}"#), Err(ControlError::RegistrationFailed)));
+        // Expired with no URL to log in at: a distinct, recognizable error so
+        // the app can start a renewal (see classify_register).
+        assert!(matches!(bad(r#"{"NodeKeyExpired":true}"#), Err(ControlError::NodeKeyExpired)));
         // Expired but control offered a URL: that is a login.
         assert!(matches!(
             bad(r#"{"NodeKeyExpired":true,"AuthURL":"https://x/a/1"}"#),
             Ok(RegisterOutcome::LoginNeeded(_))
         ));
         assert!(parse_register_response(b"not json").is_err());
+    }
+
+    /// With login allowed (the default) an AuthURL starts the usual wait; with
+    /// it off the same answer ends bring-up with `LoginRequired`, before any
+    /// URL is published.
+    #[test]
+    fn login_not_allowed_ends_a_fresh_login_answer() {
+        assert!(cfg(&[]).login_allowed, "default is to allow");
+        assert!(check_login_allowed(&cfg(&[]), false).is_ok());
+        let silent = Config { login_allowed: false, ..cfg(&[]) };
+        assert!(matches!(check_login_allowed(&silent, false), Err(ControlError::LoginRequired)));
+        assert!(check_login_allowed(&silent, true).is_ok(), "a followup is a wait already agreed to");
+        // The AuthURL answer that triggers it (also on a rotation, with OldNodeKey).
+        let reg = parse_register_response(LOGIN_RESPONSE.as_bytes()).unwrap();
+        assert!(matches!(classify_register(&reg), Ok(RegisterOutcome::LoginNeeded(_))));
+    }
+
+    #[test]
+    fn app_visible_refusal_follows_the_error() {
+        use login::Refusal;
+        assert_eq!(refusal_of(&ControlError::LoginRequired), Some(Refusal::LoginRequired));
+        assert_eq!(refusal_of(&ControlError::NodeKeyExpired), Some(Refusal::NodeKeyExpired));
+        assert_eq!(refusal_of(&ControlError::RegistrationFailed), None);
+        assert_eq!(refusal_of(&ControlError::Io), None);
+        let _serial = RUN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        login::set_refusal(Some(Refusal::NodeKeyExpired));
+        assert_eq!(login::refusal(), Some(Refusal::NodeKeyExpired));
+        login::set_refusal(None);
+        assert_eq!(login::refusal(), None);
     }
 
     /// A server that reads our Noise initiation, cannot decrypt it, and hangs
