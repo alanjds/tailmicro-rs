@@ -1492,7 +1492,7 @@ impl ControlActor {
                         let parsed = slot.parser.take().map(|p| p.finish(roster));
                         slot.reset_message();
                         // Before OurIpAssigned below, so an app woken by the
-                        // connect already sees its FQDN.
+                        // connect already sees its key expiry.
                         roster.publish_self();
                         match parsed {
                             Some(Ok(())) => {

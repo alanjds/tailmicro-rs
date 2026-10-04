@@ -71,8 +71,6 @@ pub struct Roster {
     /// so it goes to [`selfnode`](crate::selfnode) instead.
     self_key_expiry: Option<i64>,
     self_dirty: bool,
-    /// Our `Node.Name` was seen on this connection; see [`Roster::set_self_name`].
-    suffix_known: bool,
 }
 
 impl Roster {
@@ -86,7 +84,6 @@ impl Roster {
             dirty: false,
             self_key_expiry: None,
             self_dirty: false,
-            suffix_known: false,
         }
     }
 
@@ -135,10 +132,7 @@ impl Roster {
     /// Our own MagicDNS name, from `Node.Name`. An over-long suffix is
     /// dropped whole (names then stay unresolvable by FQDN) rather than kept
     /// truncated, which would mismatch.
-    ///
-    /// True when the suffix is not the one we had (including the first time),
-    /// which is when the app's suffix hook is due.
-    pub(crate) fn set_self_name(&mut self, label: heapless::String<{ crate::MAX_NAME_LABEL }>, suffix: &str) -> bool {
+    pub(crate) fn set_self_name(&mut self, label: heapless::String<{ crate::MAX_NAME_LABEL }>, suffix: &str) {
         let mut fitted: heapless::String<{ crate::MAX_NAME_SUFFIX }> = heapless::String::new();
         if fitted.push_str(suffix).is_err() {
             fitted.clear();
@@ -146,15 +140,12 @@ impl Roster {
         // Hashed over the real suffix even when it did not fit, so peers of
         // the same tailnet still match it.
         let hash = crate::suffix_hash(suffix);
-        let announce = !self.suffix_known || self.names.suffix_hash != hash;
-        self.suffix_known = true;
         if self.names.self_label != label || self.names.suffix != fitted || self.names.suffix_hash != hash {
             self.names.self_label = label;
             self.names.suffix = fitted;
             self.names.suffix_hash = hash;
             self.dirty = true;
         }
-        announce
     }
 
     /// Our node key's expiry in unix seconds; `None` means it never expires.

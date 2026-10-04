@@ -130,7 +130,6 @@ impl Device {
 
         tm_netstack::names::set_mode(config.magicdns);
         tm_netstack::names::set_resolver(config.dns_resolver);
-        tm_control::selfnode::set_suffix_hook(config.tailnet_suffix_hook);
         tm_buf::link::set_check(config.link_check);
         let node_state = config.load_or_generate_keys().await?;
         tracing::debug!("Device::connect() - keys loaded, node_state generated");

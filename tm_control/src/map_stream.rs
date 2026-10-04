@@ -468,11 +468,7 @@ impl MapStreamParser {
             Ctx::Node => {
                 if self.name_is("Name") {
                     let (label, suffix) = split_node_name(val);
-                    if roster.set_self_name(label, suffix) {
-                        // `suffix` is borrowed from `val`, our scratch copy: the
-                        // app hook gets it and nothing here keeps it.
-                        crate::selfnode::announce_suffix(suffix);
-                    }
+                    roster.set_self_name(label, suffix);
                 } else if self.name_is("KeyExpiry") {
                     // Unparseable: keep what we had rather than claim a state.
                     if let Ok(exp) = crate::rfc3339::parse_key_expiry(val) {
@@ -770,45 +766,6 @@ mod tests {
             assert_eq!(r.self_key_expiry(), Some(1_796_083_200), "chunk={}", chunk);
             assert_eq!(snap(r).names.self_label.as_str(), "tasmolike-bfd518-5400", "chunk={}", chunk);
         });
-    }
-
-    std::thread_local! {
-        static SEEN: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-
-    /// Per-thread, so parallel tests that parse a map do not see each other's
-    /// calls (the hook itself is process-wide).
-    fn record(suffix: &str) {
-        SEEN.with(|s| s.borrow_mut().push(suffix.to_owned()));
-    }
-
-    #[test]
-    fn suffix_hook_gets_our_suffix_once_per_connection_and_on_rename() {
-        crate::selfnode::set_suffix_hook(Some(record));
-        let map = |name: &str| format!(r#"{{"Node":{}}}"#, ts_self(name, "0001-01-01T00:00:00Z"));
-        let take = || SEEN.with(|s| std::mem::take(&mut *s.borrow_mut()));
-        for chunk in CHUNKS {
-            take();
-            let mut r = Roster::new();
-            feed(Mode::Full, &mut r, &map("me.Tailnet-XYZ.ts.net."), chunk).unwrap();
-            assert_eq!(take(), ["Tailnet-XYZ.ts.net"], "chunk={}: first map, case as sent, no dot", chunk);
-            // The same suffix again (a re-poll, a Node delta) is not news.
-            feed(Mode::Full, &mut r, &map("me.Tailnet-XYZ.ts.net."), chunk).unwrap();
-            feed(Mode::Delta, &mut r, &map("me2.tailnet-xyz.ts.net."), chunk).unwrap();
-            assert_eq!(take(), Vec::<String>::new(), "chunk={}", chunk);
-            feed(Mode::Delta, &mut r, &map("me.other.ts.net."), chunk).unwrap();
-            assert_eq!(take(), ["other.ts.net"], "chunk={}: renamed tailnet", chunk);
-            // A new connection starts from an empty roster and announces again.
-            r.clear();
-            feed(Mode::Full, &mut r, &map("solo"), chunk).unwrap();
-            assert_eq!(take(), [""], "chunk={}: bare label has an empty suffix", chunk);
-            // A suffix tailmicro cannot keep is still handed out whole.
-            let long = format!("{}.ts.net", "a".repeat(60));
-            feed(Mode::Delta, &mut r, &map(&format!("me.{long}.")), chunk).unwrap();
-            assert_eq!(take(), [long], "chunk={}", chunk);
-            assert_eq!(snap(&r).names.suffix.as_str(), "", "chunk={}", chunk);
-        }
-        crate::selfnode::set_suffix_hook(None);
     }
 
     #[test]
