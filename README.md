@@ -13,48 +13,62 @@ incorporating the best strategies from
 
 | Goal | Approach |
 |---|---|
-| No OOM on MapResponse | H/2 frame-by-frame streaming JSON parse — max 4 KB buffer |
-| No heap surprises | `ArrayVec` / `heapless::Vec` peer tables, bounded channels |
-| Source-compat with tailscale-rs | Same `Device`, `Config`, `netstack::*` types |
-| No extra OS tasks | Tokio `current_thread` + `tokio::join!` — one FreeRTOS task |
-| No CA bundle (saves 30 KB) | TLS fingerprint verification (from MicroLink) |
-| WireGuard without reimplementation | FFI to `wireguard-lwip` ESP-IDF component |
+| No OOM on MapResponse | H/2 frame-by-frame streaming parse into a bounded roster |
+| No heap fragmentation | Pooled packet buffers (`tm_buf`), bounded channels, persistent scratch (see `ALLOCATIONS.md`) |
+| Source-compat with tailscale-rs | Same `Device`, `Config`, `netstack::*` names where practical |
+| No extra OS tasks | One `Driver` future folding every actor into a single `tokio::join!`, run on a `current_thread` runtime |
+| No CA bundle | Control key pinned via a signed blob; DERP TLS leg skips certificate checks (traffic is already end-to-end encrypted) |
+| No C dependencies for WireGuard | Pure-Rust data plane, crypto core vendored from `ts_tunnel` |
 
 ---
 
 ## What changed vs tailscale-rs
 
-### `tm_h2` replaces the `h2` crate
-- ~200 lines, single-file, zero heap allocation
-- Handles exactly one stream (stream 1) — the MapResponse long-poll
-- Negotiates `SETTINGS_MAX_FRAME_SIZE = 4096` so the server sends in 4 KB chunks
-- Sends proactive `WINDOW_UPDATE` (MicroLink technique) to prevent stalls
+Most of the official Tailscale lib API is kept (`Device`, `Config`, `netstack`),
+but `Device::connect()` also returns a `Driver` future that you must include
+in your async loop (e.g. `tokio::join!`): it is the data plane, not a task.
+Inside, `h2` and smoltcp give way to `tm_h2` and lwIP, with bounded peer tables and pooled packet buffers.
+Control uses a pinned key instead of a CA bundle, with DERP/DISCO ideas borrowed from MicroLink.
 
-### `tm_control` — streaming MapResponse parser
-- Receives H/2 DATA frames one at a time
-- Feeds each 4 KB chunk to an incremental JSON state machine
-- **Total heap for MapResponse: one 4 KB frame buffer + ~512 B parser state**
-- MapState uses `ArrayVec<PeerInfo, 8>` — no `Vec<>` heap growth
+---
 
-### `tm_netstack` replaces `ts_netstack_smoltcp`
-- No smoltcp — lwIP is already present in ESP-IDF
-- `wireguard-lwip` injects decrypted packets directly into lwIP
-- On host: delegates to `tokio::net` for tests
+## Crates
 
-### `tm_wg` — WireGuard via FFI
-- Wraps `wireguard-lwip` C library (ESP-IDF component)
-- Peer table: `ArrayVec<WgPeerState, 8>` — static, no heap
-- LRU eviction with optional priority peer (from MicroLink)
+| Crate | Role |
+|---|---|
+| `tailmicro` (root) | Public API: `Device`, `Config`, `Error`, `netstack`, `keys` |
+| `tm_runtime` | Wires the actors and event router together; returns `Runtime` + `Driver`; optional LAN-only direct UDP path (`lan-direct`, on by default) |
+| `tm_control` | Control client: pinned-key Noise IK, registration, interactive login, streaming netmap parse, node-key expiry |
+| `tm_h2` | Minimal single-stream HTTP/2 frame reader/writer |
+| `tm_derp` | DERP relay transport (optional on-device TLS 1.3 via the `etls` feature) |
+| `tm_disco` | Passive DISCO responder (PING -> PONG, peer allowlist, rate limit) |
+| `tm_wg` | WireGuard actor and bounded `WgEndpoint` (vendored `ts_tunnel` crypto, no FFI) |
+| `tm_netstack` | Sockets over lwIP/`tokio::net`, tailnet netif, MagicDNS name table and lwIP resolver hook |
+| `tm_keys` | Key types, pin verification, and node identity (seed-derived keys, rotation counters) |
+| `tm_buf` | Shared packet buffer pool, channel helpers, network-link hint |
+| `tm_time` | Runtime-agnostic clock |
 
-### `tm_disco` — passive DISCO responder
-- Responds to PING with PONG (mandatory for peers to reach us)
-- Peer allowlist — only process DISCO from known WG peers
-- PONG rate-limit: 1 per peer per 100 ms (from dj-oyu / MicroLink)
+---
 
-### Actor model (from tailscale-rs)
-- All subsystems are actors with `mpsc::channel(4)` mailboxes
-- `tokio::select!` instead of separate TX/RX FreeRTOS tasks
-- Channel capacity of 4 = bounded memory, natural backpressure
+## Features
+
+- **Control-key pinning**: `Config::with_control_pin_hex` verifies an
+  Ed25519-signed blob made by `tools/gen_fingerprint.py` (see `tools/README.md`;
+  `tools/pin_signer.html` signs in the browser). Without a pin, `Device::connect`
+  cannot reach control. `with_control_key` supplies a raw key instead.
+- **Login**: auth key, or interactive login when none is given; read the URL
+  with `tailmicro::login_url()`. `with_login_allowed(false)` makes it fail with
+  `LoginRequired` instead. An expired node key yields `NodeKeyExpired`;
+  renew it with `with_node_rotation` / `with_previous_node_rotation`.
+- **Stable identity**: `with_identity_seed` derives node and disco keys from an
+  app-held secret instead of the public MAC.
+- **MagicDNS**: `Device::resolve`, `Config::with_magicdns`, `with_dns_resolver`;
+  on ESP32 lwIP's `getaddrinfo` consults the same table.
+- **Netmap refresh**: periodic re-poll (`with_refresh_interval`) and streamed deltas.
+- **Services**: `with_services` advertises services to the tailnet.
+- **Link awareness**: `with_link_check` defers reconnects while WiFi is down.
+- **Direct LAN path**: peers on the same LAN talk UDP directly, with DERP as fallback.
+  STUN, hole punching and port mapping are out of scope.
 
 ---
 
@@ -70,47 +84,53 @@ The rest of the SRAM is left for ESP-IDF, the WiFi stack and the application.
 
 ---
 
-## Usage (identical to tailscale-rs)
+## Usage
 
 ```rust
-// ESP32-C3: use current_thread runtime!
+// ESP32-C3: use a current_thread runtime!
 let rt = tokio::runtime::Builder::new_current_thread()
     .enable_all().build().unwrap();
 
 rt.block_on(async {
-    let dev = tailmicro::Device::new(
-        &tailmicro::Config::new("tskey-auth-..."),
+    let config = tailmicro::Config::new("tskey-auth-...")
+        .with_control_pin_hex("<hex blob from tools/gen_fingerprint.py>")?;
+
+    let (dev, driver) = tailmicro::Device::connect(
+        &config,
         Some("tskey-auth-...".to_owned()),
     ).await?;
+    println!("tailnet address: {}", dev.ipv4_addr());
 
-    let sock = dev.udp_bind((dev.ipv4_addr().await?, 9000).into()).await?;
-
-    loop {
-        let mut buf = [0u8; 1500];
-        let (n, from) = sock.recv_from(&mut buf).await?;
-        sock.send_to(from, &buf[..n]).await?;
-    }
+    // `driver` IS the data plane. Keep polling it alongside your own work;
+    // never await it alone and never drop it (that takes the node offline).
+    tokio::join!(driver, async { /* your application */ });
     Ok::<_, tailmicro::Error>(())
 });
 ```
+
+`Device::connect` returns once control assigns a tailnet IP, bounded by
+`Config::with_connect_timeout`. Sockets live in `tailmicro::netstack`
+(`UdpSocket`, `TcpStream`, `TcpListener`). On ESP32 the tailnet also appears as
+an lwIP netif, so an existing server bound to `0.0.0.0` is reachable on the
+tailnet IP unchanged.
 
 ---
 
 ## Implementation status
 
-| Component | Status |
+The control plane, DERP, DISCO responder, WireGuard data plane, MagicDNS and
+the LAN direct path are implemented and run on hardware. Remaining:
+
+| Item | Status |
 |---|---|
-| `tm_h2` frame parser | ✅ Complete |
-| `tm_keys` key types  | ✅ Complete |
-| `tm_disco` PING responder | ✅ Skeleton complete |
-| `tm_wg` FFI wrapper  | ✅ Skeleton complete |
-| `tm_control` Noise IK + registration | 🔧 Stub — Phase 1 |
-| `tm_control` MapResponse streaming parse | 🔧 Skeleton — Phase 1 |
-| `tm_derp` relay transport | 🔧 Stub — Phase 2 |
-| `tm_netstack` ESP-IDF socket | 🔧 Stub — Phase 2 |
-| NVS key persistence | 🔧 Phase 3 |
-| TLS fingerprint verification | 🔧 Phase 3 |
-| STUN / direct paths | ⏳ Phase 4 |
+| STUN / NAT traversal / port mapping | Not planned (see `docs/lan-direct-path-plan.md`) |
+| DERP certificate verification | Deliberately off (see `tm_derp/src/tls.rs`) |
+| `etls` DERP TLS feature | Off by default; enable per build |
+| Active DISCO probing (`CallMeMaybe`) | Deferred |
+| `Device::shutdown` | Currently a no-op |
+
+Design notes and investigations are in `docs/`; heap-allocation work is in
+`ALLOCATIONS.md`.
 
 ---
 
