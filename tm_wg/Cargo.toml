@@ -5,9 +5,19 @@ version.workspace = true
 # rest of the workspace stays 2021. Mixed editions in one workspace are fine.
 edition = "2024"
 
+[features]
+# ALLOCATIONS.md Step 7: link heapdiag's trace windows against ESP-IDF's
+# standalone heap tracer (needs CONFIG_HEAP_TRACING_STANDALONE=y and
+# CONFIG_HEAP_TRACING_STACK_DEPTH=6 in the app sdkconfig). Off by default.
+# Also turns on the per-packet heap/channel log lines (heapdiag::ENABLED):
+# they cost ~1.5 KB of blocking console output per packet (Step 8).
+heap-trace = []
+
 [dependencies]
 tm_keys.workspace    = true
+tm_buf.workspace = true
 tm_control.workspace = true
+tm_time.workspace = true
 arrayvec  = { workspace = true }
 heapless  = { workspace = true }
 tokio     = { workspace = true, features = ["sync", "time", "macros"] }
@@ -20,6 +30,18 @@ chacha20poly1305 = { workspace = true, features = ["alloc"] }
 blake2           = { workspace = true }
 hkdf             = { workspace = true }
 aead             = { version = "0.5", default-features = false, features = ["alloc"] }
-rand             = { version = "0.8", features = ["getrandom"] }
-rand_core        = "0.6"
+rand_core        = { workspace = true }
 zerocopy         = { version = "0.8", features = ["derive"] }
+
+# Heap probes bracketing recv_one_into/drain_recv (round 6 of the
+# tailmicro-rs heap-fragmentation investigation, ALLOCATIONS.md Step 5:
+# root-causing the 20480-vs-8192 mismatch). Device-only, same pattern as
+# tm_disco's Cargo.toml block: esp-idf-sys is a shared sys crate already
+# pulled in by tm_runtime, so this only affects the espidf target, not host
+# builds/tests.
+[target.'cfg(target_os = "espidf")'.dependencies]
+esp-idf-sys = { workspace = true }
+
+[dev-dependencies]
+# The actor-level test drives WgActor::run on a current-thread runtime.
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }

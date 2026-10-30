@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 tm_keys.workspace   = true
+tm_buf.workspace = true
+tm_time.workspace = true
 # NaCl crypto_box (X25519 + XSalsa20-Poly1305) — the actual primitive real
 # Tailscale disco uses, replacing the previous (wrong) XChaCha20Poly1305.
 # Version pinned to match the authoritative `ts_disco_protocol` /
@@ -15,3 +17,20 @@ heapless            = { workspace = true }
 arrayvec            = { workspace = true }
 tokio               = { workspace = true, features = ["sync"] }
 async-channel = { workspace = true }
+# A fresh random nonce per sealed PONG (OsRng).
+rand_core           = { workspace = true }
+tracing             = { workspace = true }
+
+# Heap probes bracketing AllowPeer / build_sealed_pong (round 6 of the
+# tailmicro-rs heap-fragmentation investigation, ALLOCATIONS.md "Fix plan:
+# DERP TLS handshake heap collapse" -> Step 4). Device-only, same pattern as
+# tm_derp's Cargo.toml comment above this block: esp-idf-sys is a shared sys
+# crate already pulled in by tm_runtime, so this only affects the espidf
+# target, not host builds/tests.
+[target.'cfg(target_os = "espidf")'.dependencies]
+esp-idf-sys = { workspace = true }
+
+[features]
+# Per-packet DiscoActor heap-blocks lines (ALLOCATIONS.md Step 9). Off by
+# default: they are blocking UART writes inside the PING->PONG path.
+heap-trace = []

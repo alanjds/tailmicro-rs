@@ -10,38 +10,37 @@ edition.workspace = true
 etls = [
     "dep:embedded-tls", "dep:embedded-io-async", "dep:embedded-io-adapters",
     "dep:chacha20poly1305", "dep:crypto_box", "dep:sha2", "dep:digest",
-    "dep:typenum", "dep:rand_core", "dep:rand",
+    "dep:typenum", "dep:rand_core",
     "tokio/net",
 ]
 
 [dependencies]
 tm_keys.workspace = true
+tm_buf.workspace = true
 heapless  = { workspace = true }
-arrayvec  = { workspace = true }
-tokio     = { workspace = true, features = ["sync", "macros"] }
+tokio     = { workspace = true, features = ["sync", "macros", "time"] }
 async-channel = { workspace = true }
 tracing   = { workspace = true }
-thiserror = { workspace = true }
 
 # ── embedded-tls DERP TLS leg (feature = "etls") ──────────────────────────────
 # TLS 1.3-only, no_std, smallest-RAM. Custom ChaCha20-Poly1305 suite reuses the
 # RustCrypto AEAD/hash already compiled for Noise/WireGuard.
 embedded-tls          = { version = "0.19", default-features = false, optional = true }
-embedded-io-async     = { version = "0.7", optional = true }
-embedded-io-adapters  = { version = "0.7", optional = true, features = ["tokio-1"] }
+embedded-io-async     = { workspace = true, optional = true }
+embedded-io-adapters  = { workspace = true, optional = true }
 chacha20poly1305      = { version = "0.10", default-features = false, optional = true }
 crypto_box            = { version = "0.9", default-features = false, features = ["alloc", "salsa20"], optional = true }
 sha2                  = { version = "0.10", default-features = false, optional = true }
 digest                = { version = "0.10", default-features = false, features = ["core-api"], optional = true }
 typenum               = { version = "1", optional = true }
-rand_core             = { version = "0.6", optional = true }
-# OsRng (getrandom-backed; on ESP32-C3 getrandom is served by esp_fill_random,
-# the same source tm_wg already uses). Supplies the CryptoRng for embedded-tls
-# and the ClientInfo NaCl box nonce.
-rand                  = { workspace = true, features = ["getrandom"], optional = true }
+# Supplies OsRng as the CryptoRng for embedded-tls and the ClientInfo NaCl box nonce.
+rand_core             = { workspace = true, optional = true }
 
 # Heap probes around DerpTls::connect (Task 5) are device-only. esp-idf-sys is
 # a shared sys crate (tm_runtime already depends on it); pulled only when
 # building for the espidf target, so host builds/tests are unaffected.
 [target.'cfg(target_os = "espidf")'.dependencies]
 esp-idf-sys = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }

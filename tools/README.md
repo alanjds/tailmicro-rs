@@ -42,3 +42,40 @@ trust. It is saved with restrictive permissions on creation, and it is
 listed in this repo's `.gitignore`. Never commit it, even for a PoC --
 anyone who obtains it can sign a pin pointing devices at an attacker's
 control key.
+
+# tools/pin_signer.html
+
+A single self-contained page that does what `gen_fingerprint.py` does, in the
+browser, so pins can be renewed (they expire, default 35 days) without Python
+and without rebuilding firmware.
+
+## How to use it
+
+- Open it straight from disk (`file://`), or put it on a static HTTPS server
+  you control. No external scripts or fonts, so it works offline except for
+  the `GET https://<host>/key?v=<cap>` fetch (the control server sends
+  `access-control-allow-origin: *`, so cross-origin `fetch()` works).
+- Give it the signing seed (`tm_signing_key.bin` or 64 hex chars), the
+  validity, and the device address, then "Fetch key and sign". It prints the
+  pin hex and a link `http://<device>/ts#pin=<hex>`. The pin is in the URL
+  fragment so it is never sent to the server or logged; the device page reads
+  it with JavaScript.
+- "Generate new signing seed" downloads a fresh `tm_signing_key.bin` and shows
+  the matching `PIN_VERIFY_KEY` Rust constant. Changing the verify key needs a
+  firmware rebuild.
+- For renewals it replaces running `gen_fingerprint.py`; the blob format and
+  signature are byte for byte the same (Ed25519 is deterministic).
+
+## Notes
+
+- Needs WebCrypto Ed25519: Chrome 137+, Firefox 129+, Safari 17+. Otherwise
+  the page says so; use `gen_fingerprint.py` instead.
+- Signing happens here, not on the device, because the device serves plain
+  HTTP, which is not a secure context and has no `crypto.subtle`.
+- Trust the host: whoever serves the page can alter its code and steal the
+  seed. Use a copy you control, or open it from a local file.
+- The page never stores the seed (no localStorage, cookies or IndexedDB). It
+  stays in memory only and is cleared after a successful signing and by the
+  Clear button.
+- Keep your seed file and pick it each time. The firmware's verify key is fixed
+  at build time, so a different seed would not be trusted by the device.

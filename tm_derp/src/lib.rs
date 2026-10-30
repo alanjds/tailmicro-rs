@@ -13,7 +13,6 @@
 //! ## tailscale-rs patterns used
 //!
 //! * Actor with `mpsc::channel` mailbox.
-//! * `IoStream` trait for platform-independent I/O.
 //! * Strongly-typed message enums.
 
 use tm_keys::NodePublicKey;
@@ -24,7 +23,7 @@ use async_channel;
 /// the serial log. Device-only (esp-idf-sys); a no-op elsewhere.
 #[cfg(feature = "etls")]
 #[inline(never)]
-fn heap_probe(tag: &str) {
+pub(crate) fn heap_probe(tag: &str) {
     #[cfg(target_os = "espidf")]
     unsafe {
         let total_free = esp_idf_sys::esp_get_free_heap_size();
@@ -39,6 +38,38 @@ fn heap_probe(tag: &str) {
     }
     #[cfg(not(target_os = "espidf"))]
     tracing::info!("DerpActor heap [{}]: (host build; probe is device-only)", tag);
+}
+
+/// TEMPORARY instrumentation (2026-09-26 heap-collapse investigation, see
+/// tailmicro-rs ALLOCATIONS.md "Fix plan: DERP TLS handshake heap collapse",
+/// step 2): finer-grained probe than [`heap_probe`], using
+/// `heap_caps_get_info` instead of just `heap_caps_get_largest_free_block`,
+/// to tell apart "many small blocks churned" (consistent with lwIP TCP-RX
+/// pbuf fragmentation, the lead hypothesis) from "one big thing allocated"
+/// (something TLS-internal). Bracketing `tls.open()` with this and comparing
+/// `free_blocks`/`total_blocks` before vs. after is the confirmation step the
+/// fix plan calls for before touching any lwIP sdkconfig. Not meant to ship;
+/// strip once the question is settled.
+#[cfg(feature = "etls")]
+#[inline(never)]
+pub(crate) fn heap_probe_blocks(tag: &str) {
+    #[cfg(target_os = "espidf")]
+    unsafe {
+        let mut info: esp_idf_sys::multi_heap_info_t = core::mem::zeroed();
+        esp_idf_sys::heap_caps_get_info(&mut info, esp_idf_sys::MALLOC_CAP_INTERNAL);
+        tracing::info!(
+            "DerpActor heap-blocks [{}]: total_free={} largest_free={} \
+             free_blocks={} allocated_blocks={} total_blocks={}",
+            tag,
+            info.total_free_bytes,
+            info.largest_free_block,
+            info.free_blocks,
+            info.allocated_blocks,
+            info.total_blocks,
+        );
+    }
+    #[cfg(not(target_os = "espidf"))]
+    tracing::info!("DerpActor heap-blocks [{}]: (host build; probe is device-only)", tag);
 }
 
 // ── DERP frame types (from Tailscale DERP spec) ───────────────────────────────
@@ -130,7 +161,10 @@ impl DerpHeader {
 
 /// Maximum WireGuard packet size + DERP header.
 /// WG max is 1500 (Ethernet MTU), DERP overhead is 32 bytes.
-pub const MAX_DERP_PAYLOAD: usize = 1500 + 32;
+///
+/// Deliberately equal to `tm_buf::PKT_CAP`, the one capacity shared by every
+/// packet buffer that crosses an inter-actor channel (see `tm_buf`).
+pub const MAX_DERP_PAYLOAD: usize = tm_buf::PKT_CAP;
 
 // ── Message types ─────────────────────────────────────────────────────────────
 
@@ -147,14 +181,10 @@ pub enum DerpCmd {
     /// Send a WireGuard packet to a peer identified by their node public key.
     SendPacket {
         dst_key: NodePublicKey,
-        /// Caller-owned buffer; actor copies out of it before returning.
-        ///
-        /// Boxed: async_channel's ring buffer (concurrent-queue) reserves 31
-        /// slots per block and returns each block by value, so an unboxed
-        /// MAX_DERP_PAYLOAD-sized buffer here balloons the caller's combined
-        /// async stack frame by 31x (see the ESP32-C3 stack overflow at
-        /// Runtime::join()'s tokio::join! entry).
-        payload: Box<heapless::Vec<u8, MAX_DERP_PAYLOAD>>,
+        /// The shared channel packet buffer (`tm_buf`), moved here as-is
+        /// from `tm_wg`'s `WgEvent::OutboundPacket` by the event router --
+        /// no copy, no re-box.
+        payload: tm_buf::PktBuf,
     },
     Disconnect,
     Shutdown,
@@ -167,8 +197,9 @@ pub enum DerpEvent {
     /// A WireGuard packet arrived from a peer.
     PacketReceived {
         src_key: NodePublicKey,
-        /// Boxed for the same reason as DerpCmd::SendPacket's payload above.
-        payload: Box<heapless::Vec<u8, MAX_DERP_PAYLOAD>>,
+        /// The shared channel packet buffer (`tm_buf`). The event router
+        /// forwards this same buffer to `tm_wg`/`tm_disco` without copying.
+        payload: tm_buf::PktBuf,
     },
     /// Server sent PING — we respond automatically, but surface it for metrics.
     PingReceived,
@@ -180,8 +211,21 @@ pub enum DerpEvent {
 pub enum DerpError {
     Tls,
     Io,
+    /// The dial failed because there is no route (interface down, radio off).
+    NoNetwork,
     FrameTooLarge(u32),
     HandshakeFailed,
+}
+
+/// Poll period while parked waiting for the link to come back.
+const LINK_POLL_MS: u64 = 1_000;
+/// Poll period while waiting for the heavy-dial exclusion
+/// (`tm_buf::link::try_dial`) held by the control actor's bring-up.
+const DIAL_POLL_MS: u64 = 100;
+
+fn is_no_network(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{HostUnreachable, NetworkDown, NetworkUnreachable};
+    matches!(e.kind(), NetworkUnreachable | HostUnreachable | NetworkDown)
 }
 
 // ── DerpActor ─────────────────────────────────────────────────────────────────
@@ -193,31 +237,216 @@ pub struct DerpActor {
     node_priv: [u8; 32],
 }
 
+/// Why [`DerpActor::run_connection`] returned without an I/O error.
+///
+/// Distinguishing these matters to [`DerpActor::run`]'s redial loop: an
+/// explicit `Disconnect` means "go idle, wait for the next `Connect`" (no
+/// retry), while `Shutdown` means "end the actor" -- neither should be
+/// treated as a transient failure worth backing off and redialing, which is
+/// reserved for `run_connection` returning `Err` (see the caller).
+enum StopReason {
+    /// `DerpCmd::Disconnect` was received.
+    Disconnected,
+    /// `DerpCmd::Shutdown` was received, or the command channel closed.
+    Shutdown,
+}
+
+/// Initial redial delay after a DERP connection drops with an error.
+const RECONNECT_INITIAL_MS: u64 = 1_000;
+/// Cap on the exponential redial backoff.
+const RECONNECT_MAX_MS: u64 = 30_000;
+
+/// Pure doubling-with-cap step of the redial backoff, pulled out of
+/// `DerpActor::run` so it's unit-testable without spinning up an actor or
+/// a tokio runtime.
+fn next_backoff_ms(current_ms: u64) -> u64 {
+    current_ms.saturating_mul(2).min(RECONNECT_MAX_MS)
+}
+
 impl DerpActor {
     pub fn new(our_key: NodePublicKey, node_priv: [u8; 32]) -> Self {
         Self { our_key, node_priv }
     }
 
+    /// Drives the DERP connection lifecycle: dial the last `Connect` target,
+    /// service it until it ends, and react to *why* it ended.
+    ///
+    /// Bug fix (2026-09, confirmed live): `run_connection` returning `Err`
+    /// (a TCP reset, a TLS read error, any `frame?` failure) used to be
+    /// treated as terminal -- `run` sent `Disconnected` and then just idled
+    /// on `cmds.recv()`, waiting for a fresh `Connect` that, on a quiet
+    /// tailnet, might never come (nothing but a `MapUpdate` delta sends
+    /// `Connect`, and empty-snapshot keepalives are skipped upstream in
+    /// `tm_control`). The device would go permanently deaf on the DERP data
+    /// plane after any drop, with the control-plane connection looking
+    /// perfectly healthy. Confirmed with `tailscale status --json`: a
+    /// peer's `TxBytes` climbing (repeated handshake attempts) while
+    /// `RxBytes` stayed flat for 10+ minutes, recovering only after a
+    /// manual reboot.
+    ///
+    /// Fix: on `Err`, redial the SAME target with exponential backoff
+    /// (starting at `RECONNECT_INITIAL_MS`, capped at `RECONNECT_MAX_MS`),
+    /// indefinitely, until either a reconnection succeeds (backoff resets)
+    /// or a new `Connect`/`Shutdown` command interrupts the backoff sleep.
     pub async fn run(
         self,
-        mut cmds:  async_channel::Receiver<DerpCmd>,
+        cmds:  async_channel::Receiver<DerpCmd>,
         events:    async_channel::Sender<DerpEvent>,
     ) {
-        loop {
-            match cmds.recv().await {
-                Ok(DerpCmd::Connect { host, port, cert_fingerprint }) => {
-                    let _ = self.run_connection(
-                        &host, port, cert_fingerprint, &mut cmds, &events,
-                    ).await;
-                    let _ = events.send(DerpEvent::Disconnected).await;
+        let mut cmds = core::pin::pin!(cmds);
+        // The most recent dial target, kept so a connection error can
+        // redial it without needing a fresh `Connect` command.
+        let mut target: Option<(heapless::String<64>, u16, Option<[u8; 32]>)> = None;
+        let mut backoff_ms: u64 = RECONNECT_INITIAL_MS;
+        // True once a NoNetwork failure has been announced, so a dead link
+        // yields one `Disconnected`, not one per skipped redial.
+        let mut no_network_reported = false;
+
+        'outer: loop {
+            if target.is_none() {
+                match cmds.recv().await {
+                    Ok(DerpCmd::Connect { host, port, cert_fingerprint }) => {
+                        target = Some((host, port, cert_fingerprint));
+                        backoff_ms = RECONNECT_INITIAL_MS;
+                    }
+                    Ok(DerpCmd::Shutdown) | Err(_) => break,
+                    Ok(_) => continue,
                 }
-                Ok(DerpCmd::Shutdown) | Err(_) => break,
-                Ok(_) => {}
+            }
+
+            // Don't dial while the application says the link is down.
+            if !tm_buf::link::is_up() {
+                tracing::info!("DerpActor: link down; parked until it returns");
+                while !tm_buf::link::is_up() {
+                    tokio::select! {
+                        _ = tokio::time::sleep(core::time::Duration::from_millis(LINK_POLL_MS)) => {}
+                        cmd = tm_buf::chan::recv_next(cmds.as_mut()) => match cmd {
+                            Ok(DerpCmd::Connect { host, port, cert_fingerprint }) => {
+                                target = Some((host, port, cert_fingerprint));
+                            }
+                            Ok(DerpCmd::Disconnect) => {
+                                target = None;
+                                continue 'outer;
+                            }
+                            Ok(DerpCmd::Shutdown) | Err(_) => break 'outer,
+                            Ok(DerpCmd::SendPacket { .. }) => {}
+                        }
+                    }
+                }
+                tracing::info!("DerpActor: link up; resuming");
+                backoff_ms = RECONNECT_INITIAL_MS;
+            }
+
+            // One heavy dial at a time (see `tm_buf::link`): never overlap
+            // control's bring-up. Polled like the park loop so Connect /
+            // Disconnect / Shutdown stay live while we wait.
+            let dial_guard = match tm_buf::link::try_dial() {
+                Some(g) => g,
+                None => {
+                    tracing::info!("DerpActor: another actor is dialing; deferring");
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(core::time::Duration::from_millis(DIAL_POLL_MS)) => {
+                                if let Some(g) = tm_buf::link::try_dial() { break g; }
+                            }
+                            cmd = tm_buf::chan::recv_next(cmds.as_mut()) => match cmd {
+                                Ok(DerpCmd::Connect { host, port, cert_fingerprint }) => {
+                                    target = Some((host, port, cert_fingerprint));
+                                }
+                                Ok(DerpCmd::Disconnect) => {
+                                    target = None;
+                                    continue 'outer;
+                                }
+                                Ok(DerpCmd::Shutdown) | Err(_) => break 'outer,
+                                Ok(DerpCmd::SendPacket { .. }) => {}
+                            }
+                        }
+                    }
+                }
+            };
+
+            let (host, port, cert_fingerprint) = target.clone().expect("checked above");
+            let result = self.run_connection(
+                &host, port, cert_fingerprint, dial_guard, &mut cmds, &events,
+            ).await;
+            // Raised from debug to info (2026-09 DERP-reconnect fix): a DERP
+            // drop used to be visible only in debug builds, which hid the
+            // very outage this fix addresses from normal serial logs.
+            match &result {
+                Ok(StopReason::Disconnected) => tracing::info!(
+                    "DerpActor: connection to {}:{} ended: Disconnect requested", host, port),
+                Ok(StopReason::Shutdown) => tracing::info!(
+                    "DerpActor: connection to {}:{} ended: Shutdown requested", host, port),
+                Err(e) => tracing::info!(
+                    "DerpActor: connection to {}:{} ended with error: {:?}", host, port, e),
+            }
+            let no_network = matches!(result, Err(DerpError::NoNetwork));
+            if !(no_network && no_network_reported) {
+                let _ = events.send(DerpEvent::Disconnected).await;
+            }
+            no_network_reported = no_network;
+
+            match result {
+                Ok(StopReason::Shutdown) => break,
+                Ok(StopReason::Disconnected) => {
+                    target = None;
+                }
+                Err(_) => {
+                    // Transient failure: redial `target` (unchanged) after a
+                    // backoff, unless a new command interrupts the wait.
+                    tracing::info!(
+                        "DerpActor: reconnecting to {}:{} in {} ms",
+                        host, port, backoff_ms
+                    );
+                    let sleep = tokio::time::sleep(core::time::Duration::from_millis(backoff_ms));
+                    tokio::pin!(sleep);
+                    let mut interrupted = false;
+                    loop {
+                        tokio::select! {
+                            _ = &mut sleep => break,
+                            cmd = tm_buf::chan::recv_next(cmds.as_mut()) => match cmd {
+                                Ok(DerpCmd::Connect { host: h, port: p, cert_fingerprint: f }) => {
+                                    // The runtime re-sends the current target on every
+                                    // Disconnected; honoring that would skip the backoff.
+                                    let unchanged = h.as_str() == host.as_str()
+                                        && p == port && f == cert_fingerprint;
+                                    if !unchanged {
+                                        target = Some((h, p, f));
+                                        interrupted = true;
+                                        break;
+                                    }
+                                }
+                                Ok(DerpCmd::Disconnect) => {
+                                    target = None;
+                                    interrupted = true;
+                                    break;
+                                }
+                                Ok(DerpCmd::Shutdown) | Err(_) => break 'outer,
+                                Ok(DerpCmd::SendPacket { .. }) => {
+                                    // Nothing to send to while disconnected; drop
+                                    // and keep waiting out the backoff.
+                                }
+                            }
+                        }
+                    }
+                    if interrupted {
+                        backoff_ms = RECONNECT_INITIAL_MS;
+                    } else {
+                        backoff_ms = next_backoff_ms(backoff_ms);
+                    }
+                }
             }
         }
     }
 
     /// Real DERP connection over embedded-tls (feature `etls`).
+    ///
+    /// `dial_guard` (the process-wide heavy-dial exclusion, see
+    /// `tm_buf::link`) is held through connect + TLS handshake only and
+    /// dropped before `Connected`; any `?` or a cancelled future drops it too.
+    /// Connect/handshake have no timeout of their own (pre-existing), so a
+    /// hung handshake holds it until the peer or OS gives up; control bounds
+    /// its own wait for that reason.
     ///
     /// Dials plain TCP via tokio, wraps it in the embedded-io adapter, runs the
     /// TLS 1.3 + DERP handshake ([`tls::DerpTls::connect`]), then services the
@@ -233,16 +462,17 @@ impl DerpActor {
         host:             &str,
         port:             u16,
         _fingerprint:     Option<[u8; 32]>,
-        cmds:             &mut async_channel::Receiver<DerpCmd>,
+        dial_guard:       tm_buf::link::DialGuard,
+        cmds:             &mut core::pin::Pin<&mut async_channel::Receiver<DerpCmd>>,
         events:           &async_channel::Sender<DerpEvent>,
-    ) -> Result<(), DerpError> {
+    ) -> Result<StopReason, DerpError> {
         use embedded_io_adapters::tokio_1::FromTokio;
         use tls::{DerpTls, RECORD_READ_BUF, RECORD_WRITE_BUF};
 
         tracing::info!("DerpActor: dialing {}:{}", host, port);
         let tcp = tokio::net::TcpStream::connect((host, port))
             .await
-            .map_err(|_| DerpError::Io)?;
+            .map_err(|e| if is_no_network(&e) { DerpError::NoNetwork } else { DerpError::Io })?;
         let socket = FromTokio::new(tcp);
 
         // Probe BEFORE any TLS allocation so the delta captures the full DERP
@@ -262,9 +492,12 @@ impl DerpActor {
             host,
             &our_pub,
             &self.node_priv,
-            rand::rngs::OsRng,
+            rand_core::OsRng,
         )
         .await?;
+        // Handshake done: control may dial now. The session itself keeps its
+        // buffers, but the big contiguous request has been served.
+        drop(dial_guard);
         heap_probe("after DerpTls::connect");
         tracing::info!("DerpActor: DERP handshake complete with {}", host);
 
@@ -273,17 +506,18 @@ impl DerpActor {
         // What the select! resolved to. Kept deliberately tls-free so no branch
         // handler borrows `tls` while the other branch's future still holds it.
         enum Decision {
-            Send(NodePublicKey, Box<heapless::Vec<u8, MAX_DERP_PAYLOAD>>),
+            Send(NodePublicKey, tm_buf::PktBuf),
             Frame(u8, usize),
-            Stop,
+            Stop(StopReason),
         }
 
         loop {
             let decision = tokio::select! {
                 biased;
-                cmd = cmds.recv() => match cmd {
+                cmd = tm_buf::chan::recv_next(cmds.as_mut()) => match cmd {
                     Ok(DerpCmd::SendPacket { dst_key, payload }) => Decision::Send(dst_key, payload),
-                    Ok(DerpCmd::Disconnect) | Ok(DerpCmd::Shutdown) | Err(_) => Decision::Stop,
+                    Ok(DerpCmd::Disconnect) => Decision::Stop(StopReason::Disconnected),
+                    Ok(DerpCmd::Shutdown) | Err(_) => Decision::Stop(StopReason::Shutdown),
                     Ok(DerpCmd::Connect { .. }) => continue, // already connected
                 },
                 frame = tls.read_frame_buffered() => {
@@ -293,7 +527,7 @@ impl DerpActor {
             };
 
             match decision {
-                Decision::Stop => return Ok(()),
+                Decision::Stop(reason) => return Ok(reason),
                 Decision::Send(dst_key, payload) => {
                     tls.send_packet(dst_key.as_bytes(), &payload).await?;
                 }
@@ -303,21 +537,24 @@ impl DerpActor {
                         if n >= 32 {
                             let mut src = [0u8; 32];
                             src.copy_from_slice(&tls.frame()[..32]);
-                            tracing::info!(
+                            tracing::trace!(
                                 "DerpActor: RecvPacket {} bytes from {:02x}{:02x}..",
                                 n - 32,
                                 src[0],
                                 src[1]
                             );
-                            let mut payload: heapless::Vec<u8, MAX_DERP_PAYLOAD> =
-                                heapless::Vec::new();
-                            let _ = payload.extend_from_slice(&tls.frame()[32..n]);
-                            let _ = events
-                                .send(DerpEvent::PacketReceived {
-                                    src_key: NodePublicKey::from_bytes(src),
-                                    payload: Box::new(payload),
-                                })
-                                .await;
+                            // Copied straight into the heap-resident channel
+                            // buffer (no stack temporary). The frame buffer is
+                            // MAX_DERP_PAYLOAD == PKT_CAP, so the 32-byte-shorter
+                            // body always fits.
+                            if let Some(payload) = tm_buf::PktBuf::from_slice(&tls.frame()[32..n]) {
+                                let _ = events
+                                    .send(DerpEvent::PacketReceived {
+                                        src_key: NodePublicKey::from_bytes(src),
+                                        payload,
+                                    })
+                                    .await;
+                            }
                         }
                     } else if ft == DerpFrameType::Ping as u8 {
                         let body: heapless::Vec<u8, 8> = {
@@ -347,63 +584,236 @@ impl DerpActor {
         _host:            &str,
         _port:            u16,
         _fingerprint:     Option<[u8; 32]>,
-        cmds:             &mut async_channel::Receiver<DerpCmd>,
+        dial_guard:       tm_buf::link::DialGuard,
+        cmds:             &mut core::pin::Pin<&mut async_channel::Receiver<DerpCmd>>,
         _events:          &async_channel::Sender<DerpEvent>,
-    ) -> Result<(), DerpError> {
+    ) -> Result<StopReason, DerpError> {
+        // The stub dials nothing: release the exclusion at once.
+        drop(dial_guard);
         loop {
             match cmds.recv().await {
-                Ok(DerpCmd::Disconnect) | Ok(DerpCmd::Shutdown) | Err(_) => return Ok(()),
+                Ok(DerpCmd::Disconnect) => return Ok(StopReason::Disconnected),
+                Ok(DerpCmd::Shutdown) | Err(_) => return Ok(StopReason::Shutdown),
                 Ok(_) => {}
             }
         }
     }
+}
 
-    async fn send_packet_frame<S: crate::IoStream>(
-        stream:  &mut S,
-        dst_key: &NodePublicKey,
-        payload: &[u8],
-    ) -> Result<(), DerpError> {
-        // Frame: type(1) + length(4) + dst_pubkey(32) + payload
-        let body_len = 32 + payload.len();
-        let mut hdr = [0u8; 5];
-        DerpHeader {
-            frame_type: DerpFrameType::SendPacket,
-            length: body_len as u32,
-        }.to_bytes(&mut hdr);
+// ── DERP reconnect-with-backoff tests (2026-09 fix) ─────────────────────────
+//
+// `run_connection` under `feature = "etls"` is the only path that can
+// actually return `Err` (a real TCP/TLS failure), so the redial-after-error
+// branch itself is only exercised on real hardware / a Wokwi run with a
+// forced disconnect. What IS host-testable in isolation, and covered here:
+//
+//   1. The pure backoff arithmetic (`next_backoff_ms`): doubles, caps at
+//      `RECONNECT_MAX_MS`, never panics on overflow.
+//   2. The actor-level state machine around `StopReason`, using the
+//      `not(feature = "etls")` stub `run_connection`: an explicit
+//      `Disconnect` resets `target` to `None` (idle, no redial) rather than
+//      looping forever or dropping a subsequent `Connect`, and `Shutdown`
+//      ends the actor task.
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
 
-        stream.write_all(&hdr).await.map_err(|_| DerpError::Io)?;
-        stream.write_all(dst_key.as_bytes()).await.map_err(|_| DerpError::Io)?;
-        stream.write_all(payload).await.map_err(|_| DerpError::Io)?;
-        Ok(())
+    #[test]
+    fn next_backoff_ms_doubles_and_caps() {
+        let mut ms = RECONNECT_INITIAL_MS;
+        assert_eq!(ms, 1_000);
+        ms = next_backoff_ms(ms);
+        assert_eq!(ms, 2_000);
+        ms = next_backoff_ms(ms);
+        assert_eq!(ms, 4_000);
+        ms = next_backoff_ms(ms);
+        assert_eq!(ms, 8_000);
+        ms = next_backoff_ms(ms);
+        assert_eq!(ms, 16_000);
+        ms = next_backoff_ms(ms);
+        assert_eq!(ms, RECONNECT_MAX_MS, "must cap at 30s");
+        ms = next_backoff_ms(ms);
+        assert_eq!(ms, RECONNECT_MAX_MS, "must stay capped, not overflow past it");
     }
 
-    async fn recv_frame<S: crate::IoStream>(
-        stream:     &mut S,
-        frame_buf:  &mut [u8; MAX_DERP_PAYLOAD],
-    ) -> Result<(DerpFrameType, usize), DerpError> {
-        let mut hdr_bytes = [0u8; 5];
-        stream.read_exact(&mut hdr_bytes).await.map_err(|_| DerpError::Io)?;
-        let hdr = DerpHeader::from_bytes(&hdr_bytes)
-            .ok_or(DerpError::Io)?;
+    #[test]
+    fn next_backoff_ms_never_panics_near_u64_max() {
+        // saturating_mul must not panic even from a pathological start.
+        assert_eq!(next_backoff_ms(u64::MAX), RECONNECT_MAX_MS);
+    }
 
-        if hdr.length as usize > frame_buf.len() {
-            return Err(DerpError::FrameTooLarge(hdr.length));
-        }
-        let body_len = hdr.length as usize;
-        stream.read_exact(&mut frame_buf[..body_len]).await
-            .map_err(|_| DerpError::Io)?;
+    /// Explicit `Disconnect` must go idle (no redial target) rather than
+    /// exiting the actor -- a subsequent `Connect` must still be honoured.
+    /// This is the "belt-and-suspenders" half of the fix: even without any
+    /// I/O error, the actor's own command handling must not get stuck.
+    #[cfg(not(feature = "etls"))]
+    #[tokio::test]
+    async fn disconnect_then_reconnect_is_honoured() {
+        let our_key = NodePublicKey::from_bytes([0x11; 32]);
+        let actor = DerpActor::new(our_key, [0x22; 32]);
+        let (cmd_tx, cmd_rx) = async_channel::bounded::<DerpCmd>(4);
+        let (ev_tx, ev_rx) = async_channel::bounded::<DerpEvent>(4);
 
-        Ok((hdr.frame_type, body_len))
+        let run_task = tokio::spawn(actor.run(cmd_rx, ev_tx));
+
+        cmd_tx.send(DerpCmd::Connect {
+            host: heapless::String::try_from("example.derp").unwrap(),
+            port: 443,
+            cert_fingerprint: None,
+        }).await.unwrap();
+        // Stub `run_connection` does no I/O; it just waits on the next
+        // command, so the actor is now "connected" (idle in run_connection).
+        cmd_tx.send(DerpCmd::Disconnect).await.unwrap();
+        assert!(matches!(ev_rx.recv().await, Ok(DerpEvent::Disconnected)),
+            "Disconnect must surface a Disconnected event");
+
+        // A fresh Connect after the Disconnect must be accepted, not ignored
+        // -- proves `target` was really reset to `None`, not left dangling.
+        cmd_tx.send(DerpCmd::Connect {
+            host: heapless::String::try_from("example2.derp").unwrap(),
+            port: 443,
+            cert_fingerprint: None,
+        }).await.unwrap();
+        cmd_tx.send(DerpCmd::Shutdown).await.unwrap();
+        assert!(matches!(ev_rx.recv().await, Ok(DerpEvent::Disconnected)));
+
+        tokio::time::timeout(core::time::Duration::from_secs(5), run_task)
+            .await
+            .expect("actor must end after Shutdown, not hang")
+            .unwrap();
     }
 }
 
-// ── IoStream (same trait as tm_control) ──────────────────────────────────────
-// Defined here so tm_derp doesn't depend on tm_control.
-// Platform code should implement this trait for their TLS type.
+#[cfg(all(test, feature = "etls"))]
+mod link_down_tests {
+    use super::*;
+    use core::time::Duration;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-pub trait IoStream: Send {
-    fn read_exact<'a>(&'a mut self, buf: &'a mut [u8])
-        -> impl core::future::Future<Output = Result<(), ()>> + 'a;
-    fn write_all<'a>(&'a mut self, buf: &'a [u8])
-        -> impl core::future::Future<Output = Result<(), ()>> + 'a;
+    static LINK_UP: AtomicBool = AtomicBool::new(true);
+    /// The link predicate and the dial exclusion are both process-wide:
+    /// tests in this module take turns.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    fn link() -> bool {
+        LINK_UP.load(Ordering::SeqCst)
+    }
+
+    fn connect_cmd(port: u16) -> DerpCmd {
+        DerpCmd::Connect {
+            host: heapless::String::try_from("127.0.0.1").unwrap(),
+            port,
+            cert_fingerprint: None,
+        }
+    }
+
+    /// One sequential test: the link predicate is process-wide, so splitting
+    /// this up would let parallel tests see each other's link state.
+    #[tokio::test]
+    async fn parks_while_link_down_and_backoff_survives_same_target_nudges() {
+        let _serial = SERIAL.lock().await;
+        tm_buf::link::set_check(Some(link));
+        // A port that nothing listens on: every dial is refused at once.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+
+        let actor = DerpActor::new(NodePublicKey::from_bytes([0x11; 32]), [0x22; 32]);
+        let (cmd_tx, cmd_rx) = async_channel::bounded::<DerpCmd>(64);
+        let (ev_tx, ev_rx) = async_channel::bounded::<DerpEvent>(64);
+
+        LINK_UP.store(false, Ordering::SeqCst);
+        let local = tokio::task::LocalSet::new();
+        let run_task = local.spawn_local(actor.run(cmd_rx, ev_tx));
+        local.run_until(async {
+        cmd_tx.send(connect_cmd(port)).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(ev_rx.is_empty(), "must not dial while the link is down");
+
+        LINK_UP.store(true, Ordering::SeqCst);
+        let ev = tokio::time::timeout(Duration::from_secs(5), ev_rx.recv()).await
+            .expect("must dial once the link is back").unwrap();
+        assert!(matches!(ev, DerpEvent::Disconnected));
+
+        // The actor is now in its 1 s redial backoff. Same-target nudges, as
+        // the runtime sends on every Disconnected, must not cut it short.
+        for _ in 0..40 {
+            cmd_tx.send(connect_cmd(port)).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(ev_rx.is_empty(), "same-target Connect must not skip the backoff");
+
+        cmd_tx.send(DerpCmd::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), run_task).await
+            .expect("actor must end after Shutdown").unwrap();
+        }).await;
+    }
+
+    /// The actor must not start its heavy dial while another actor holds the
+    /// exclusion, must stay responsive to `Disconnect` meanwhile, must dial
+    /// as soon as it is released, and must release it again after a failed
+    /// handshake / when the actor ends.
+    #[tokio::test]
+    async fn defers_dial_while_exclusion_held_then_releases() {
+        let _serial = SERIAL.lock().await;
+        tm_buf::link::set_check(Some(link));
+        LINK_UP.store(true, Ordering::SeqCst);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let actor = DerpActor::new(NodePublicKey::from_bytes([0x11; 32]), [0x22; 32]);
+        let (cmd_tx, cmd_rx) = async_channel::bounded::<DerpCmd>(64);
+        let (ev_tx, ev_rx) = async_channel::bounded::<DerpEvent>(64);
+
+        let local = tokio::task::LocalSet::new();
+        let run_task = local.spawn_local(actor.run(cmd_rx, ev_tx));
+        local.run_until(async {
+            // Another actor (control) is mid-bring-up.
+            let guard = tm_buf::link::try_dial().expect("exclusion free at start");
+            cmd_tx.send(connect_cmd(port)).await.unwrap();
+
+            // A dial would sit in the listen backlog and accept at once.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await.is_err(),
+                "must not dial while the exclusion is held"
+            );
+
+            // Still responsive: Disconnect while deferred ends the wait.
+            cmd_tx.send(DerpCmd::Disconnect).await.unwrap();
+            // (Like the link-down park, this goes idle without an event.)
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), listener.accept()).await.is_err(),
+                "Disconnect must cancel the pending dial"
+            );
+
+            // Released with the actor idle: no dial; a fresh Connect now dials.
+            drop(guard);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), listener.accept()).await.is_err(),
+                "idle actor must not dial after release"
+            );
+            cmd_tx.send(connect_cmd(port)).await.unwrap();
+            let (peer, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
+                .expect("must dial once the exclusion is released").unwrap();
+
+            // The silent peer leaves the TLS handshake pending: DERP holds
+            // the exclusion for exactly that phase.
+            assert!(tm_buf::link::try_dial().is_none(), "held during the handshake");
+
+            // Handshake fails -> guard released, actor in redial backoff.
+            drop(peer);
+            let ev = tokio::time::timeout(Duration::from_secs(5), ev_rx.recv()).await
+                .expect("failed handshake must surface").unwrap();
+            assert!(matches!(ev, DerpEvent::Disconnected));
+
+            cmd_tx.send(DerpCmd::Shutdown).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), run_task).await
+                .expect("actor must end after Shutdown").unwrap();
+            let g = tm_buf::link::try_dial().expect("exclusion must be free once the actor ends");
+            drop(g);
+        }).await;
+        tm_buf::link::set_check(None);
+    }
 }

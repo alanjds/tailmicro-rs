@@ -6,7 +6,13 @@ edition.workspace = true
 [dependencies]
 x25519-dalek = { workspace = true, features = ["getrandom", "static_secrets"] }
 ed25519-dalek = { workspace = true }
-rand      = { version = "0.8", features = ["getrandom"] }
-rand_core = "0.6"
+rand_core = { workspace = true }
 heapless  = { workspace = true }
 serde     = { workspace = true }
+hkdf      = { workspace = true }
+sha2      = { workspace = true }
+
+# eFuse MAC read for chip-derived identity (K2). Target-gated so host
+# builds/tests (cargo test -p tm_keys) never try to pull this in.
+[target.'cfg(target_os = "espidf")'.dependencies]
+esp-idf-sys = { workspace = true }

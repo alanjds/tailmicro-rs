@@ -3,16 +3,37 @@ name = "tm_runtime"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["lan-direct"]
+# LAN-only direct UDP path (docs/lan-direct-path-plan.md, D5). On by default,
+# so an app that depends on tm_runtime plainly gets it and a rebuild cannot
+# silently fall back to DERP-only. To opt out, depend with
+# `default-features = false`: then there is no UDP socket, no receive task,
+# and nothing about the control-plane publish or the data plane changes.
+lan-direct = []
+# TEST ONLY (docs/lan-direct-path-plan.md, Step 6.2): periodically drop every
+# datagram the device sends over the LAN socket, as a peer-side
+# `iptables -I INPUT -p udp --sport 41641 -j DROP` would, while still
+# receiving. Never enable in a shipped build.
+lan-direct-fault-test = ["lan-direct"]
+# DIAGNOSTIC ONLY (ALLOCATIONS.md Step 9): per-hop latency stamps for the
+# LAN round trip, one serial line per ping plus a 10 s router summary.
+latency-trace = ["tm_buf/latency-trace"]
+
 [dependencies]
 tm_control.workspace = true
 tm_derp.workspace    = true
 tm_disco.workspace   = true
 tm_wg.workspace      = true
 tm_keys.workspace    = true
+tm_buf.workspace = true
+tm_netstack.workspace = true
+tm_time.workspace = true
 heapless  = { workspace = true }
 async-channel.workspace = true
 log.workspace = true
-esp-idf-svc = { workspace = true }
-esp-idf-sys = { workspace = true }
 tokio     = { workspace = true, features = ["sync", "rt", "macros"] }
 tracing   = { workspace = true }
+
+[target.'cfg(target_os = "espidf")'.dependencies]
+esp-idf-sys = { workspace = true }

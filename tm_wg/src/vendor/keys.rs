@@ -11,8 +11,7 @@
 //!
 //! See `docs/wg-dataplane-notes.md`, port decision #1.
 
-use rand::rngs::OsRng;
-use rand_core::RngCore;
+use rand_core::{OsRng, RngCore};
 
 /// A node's long-lived X25519 private key (raw scalar bytes).
 #[derive(Copy, Clone)]

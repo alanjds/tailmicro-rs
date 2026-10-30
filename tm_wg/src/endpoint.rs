@@ -15,9 +15,9 @@
 //!   * transport endpoint modelled as a Rust `enum Endpoint` (no 127.3.3.40
 //!     fake-IP hack); authenticated-only endpoint roaming, skipped for DERP.
 
-use core::net::SocketAddr;
+use core::net::{SocketAddr, SocketAddrV4};
 use core::time::Duration;
-use std::time::Instant;
+use tm_time::Instant;
 
 use arrayvec::ArrayVec;
 use zerocopy::{IntoBytes, TryFromBytes};
@@ -68,6 +68,11 @@ const OUT_CAP: usize = 2;
 /// due when the buffer fills are serviced on the next tick.
 const DISPATCH_CAP: usize = 4;
 
+/// The type [`WgEndpoint::dispatch`] returns, named so callers (e.g.
+/// `WgActor::on_tick`) can hold a persistent, reusable scratch buffer of this
+/// exact type instead of `Box::new`-ing a fresh one every tick.
+pub type DispatchOut = ArrayVec<(PeerId, Packet), DISPATCH_CAP>;
+
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Handshake-retry jitter upper bound (prevents synchronized fleet storms).
@@ -82,10 +87,35 @@ pub enum Endpoint {
     Derp { region_id: u16, node_key: [u8; 32] },
 }
 
-impl Endpoint {
-    fn is_derp(&self) -> bool {
-        matches!(self, Endpoint::Derp { .. })
-    }
+/// How long a direct UDP path stays usable after the last authenticated
+/// evidence from it. Matches tailscaled's `trustUDPAddrDuration`: an active
+/// tailscaled peer heartbeats its best path about every 3 s, so trust stays
+/// warm while the path works and lapses on its own when the peer goes idle,
+/// leaves the LAN or changes address (docs/lan-direct-path-plan.md D3).
+pub const DIRECT_TRUST: Duration = Duration::from_millis(6500);
+
+/// How long WireGuard from a peer over DERP keeps our sends to it on DERP,
+/// whatever the direct path's trust says.
+///
+/// tailscaled sends WireGuard *only* to its best UDP address while it trusts
+/// it, and to both that address and DERP once the trust has lapsed
+/// (magicsock `addrForSendLocked`). So WireGuard over DERP from a peer means
+/// the peer does not currently trust the direct path, typically because our
+/// PONGs stopped reaching it. Its UDP copies keep arriving (and would keep
+/// refreshing our trust) even though our datagrams to it are being lost.
+/// Found on hardware in Step 6 (docs/lan-direct-path-plan.md): without this,
+/// a one-way break (peer receives nothing from us over UDP) black-holed every
+/// reply from the device for as long as the break lasted. The UDP copy of a
+/// pair usually lands first on a LAN, hence a hold-off rather than a one-shot
+/// clear. Equal to `DIRECT_TRUST` so it outlasts the peer's heartbeat gaps.
+pub const DERP_HOLDOFF: Duration = DIRECT_TRUST;
+
+/// A LAN path to a peer, proven by authenticated traffic from exactly
+/// `addr`. Sends use it only while `now < trust_until`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectPath {
+    pub addr: SocketAddrV4,
+    pub trust_until: Instant,
 }
 
 type Queue = ArrayVec<Packet, QUEUE_DEPTH>;
@@ -234,7 +264,13 @@ impl SessionState {
 struct Peer {
     id: PeerId,
     config: PeerConfig,
-    endpoint: Endpoint,
+    /// Always the DERP route. It is never torn down, because it is where
+    /// sends go whenever the direct path is absent or untrusted.
+    derp: Endpoint,
+    /// Optional LAN path, trust-windowed (D3).
+    direct: Option<DirectPath>,
+    /// Sends stay on DERP until then; see `DERP_HOLDOFF`.
+    derp_holdoff_until: Option<Instant>,
     session: SessionState,
     handshake: Handshake,
     last_seen_timestamp: Option<crate::vendor::tai64n::TAI64N>,
@@ -244,12 +280,14 @@ struct Peer {
 }
 
 impl Peer {
-    fn new(id: PeerId, config: PeerConfig, endpoint: Endpoint) -> Self {
+    fn new(id: PeerId, config: PeerConfig, derp: Endpoint) -> Self {
         let cookie_sender = MACSender::new(&config.key);
         Self {
             id,
             config,
-            endpoint,
+            derp,
+            direct: None,
+            derp_holdoff_until: None,
             session: SessionState::None(Queue::new()),
             handshake: Handshake::None,
             last_seen_timestamp: None,
@@ -278,6 +316,69 @@ pub struct RecvOut {
     pub handshook: bool,
     /// The peer this packet belonged to, if identified.
     pub peer: Option<PeerId>,
+}
+
+impl RecvOut {
+    /// Clear all fields in place so a caller-owned `RecvOut` can be reused
+    /// across calls instead of being freed and re-`Box::new`'d (which was
+    /// measured to fragment the ESP32-C3 heap under sustained traffic: this
+    /// struct is exactly the ~6 KB block that recurs in `memory allocation
+    /// of 6052 bytes failed` aborts). See ALLOCATIONS.md.
+    pub fn reset(&mut self) {
+        self.to_peer.clear();
+        self.decrypted.clear();
+        self.handshook = false;
+        self.peer = None;
+    }
+}
+
+/// Hand out a `&'static mut RecvOut` backed by `.bss`, once. Unlike
+/// `WgEndpoint::new_static`, `RecvOut` has no runtime-dependent fields (both
+/// `ArrayVec`s are const-constructible via `new_const()`, and `handshook`/
+/// `peer` have trivial const defaults), so the whole value can be a directly
+/// const-initialized `static mut` -- no `MaybeUninit`/field-by-field write
+/// needed. Same rationale as `WgEndpoint::new_static`: one instance, held
+/// forever, so a static removes its ~6 KB one-time heap contribution
+/// entirely (ALLOCATIONS.md Step 5).
+///
+/// # Panics
+/// Panics if called more than once, for the same aliasing reason as
+/// `WgEndpoint::new_static`.
+#[inline(never)]
+pub fn recv_out_static() -> &'static mut RecvOut {
+    static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static mut STORAGE: RecvOut = RecvOut {
+        to_peer: ArrayVec::new_const(),
+        decrypted: ArrayVec::new_const(),
+        handshook: false,
+        peer: None,
+    };
+
+    if TAKEN.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        panic!("recv_out_static called more than once");
+    }
+    // SAFETY: the swap above guarantees exactly one caller, ever, reaches
+    // this point, so this is the only `&'static mut` that will ever be
+    // created to this function-local static.
+    unsafe { &mut *core::ptr::addr_of_mut!(STORAGE) }
+}
+
+/// Hand out a `&'static mut DispatchOut` backed by `.bss`, once. Same
+/// rationale and safety argument as [`recv_out_static`]; `DispatchOut` is a
+/// plain `ArrayVec` type alias, const-constructible via `new_const()`.
+///
+/// # Panics
+/// Panics if called more than once.
+#[inline(never)]
+pub fn dispatch_out_static() -> &'static mut DispatchOut {
+    static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static mut STORAGE: DispatchOut = ArrayVec::new_const();
+
+    if TAKEN.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        panic!("dispatch_out_static called more than once");
+    }
+    // SAFETY: same argument as `recv_out_static` above.
+    unsafe { &mut *core::ptr::addr_of_mut!(STORAGE) }
 }
 
 struct EndpointState {
@@ -336,53 +437,64 @@ impl WgEndpoint {
         }
     }
 
-    /// Construct directly on the heap, field-by-field, via a raw pointer
-    /// into an uninitialized `Box` allocation.
+    /// Construct directly into a static `.bss` slot, field-by-field, via a
+    /// raw pointer.
     ///
-    /// `Self` is ~28 KB (`peers: ArrayVec<Peer, MAX_PEERS>` dominates).
-    /// `Box::new(WgEndpoint::new(..))` builds the whole ~28 KB value as a
-    /// temporary, THEN copies it into the heap allocation -- at this
-    /// workspace's `opt-level = "z"` + `lto = true` dev profile the
-    /// compiler was not eliding that temporary (observed as two ~28 KB
-    /// copies, a ~55 KB frame, wherever the call ended up after inlining).
+    /// `Self` is ~6 KB (`peers: ArrayVec<Peer, MAX_PEERS>` dominates).
+    /// `WgEndpoint::new(..)` builds that whole value as a stack temporary and
+    /// moves it into place; at this workspace's `opt-level = "z"` +
+    /// `lto = true` dev profile the compiler does not elide the temporary
+    /// (observed as multiple copies, a ~55 KB frame, wherever the call ended
+    /// up after inlining). Even `addr_of_mut!(..).write(ArrayVec::new())`
+    /// materialized a stack-sized "empty" `ArrayVec` first, because
+    /// `ArrayVec::new` is not `const`. Sourcing the empty value from an
+    /// `ArrayVec::new_const()` `static` (the pattern arrayvec's docs
+    /// recommend) makes it a fixed rodata address that `memcpy` copies FROM,
+    /// eliminating the stack temporary.
     ///
-    /// Even writing the field directly via `addr_of_mut!(..).write(..)`
-    /// with `ArrayVec::new()` as the source measured ~27 KB here: the
-    /// compiler still materialized an "empty" `ArrayVec` as a genuine
-    /// stack-sized value before `memcpy`-ing it into place (`ArrayVec::new`
-    /// is not `const`, so nothing forces it into rodata). Using
-    /// `ArrayVec::new_const()` into a top-level `static` instead -- exactly
-    /// the pattern arrayvec's own docs recommend for this ("place a large
-    /// ArrayVec in a static to avoid stack overflow") -- makes the "empty"
-    /// value a fixed rodata/bss address that `memcpy` sources FROM,
-    /// eliminating the stack temporary entirely.
+    /// There is exactly one `WgEndpoint` for the lifetime of this firmware
+    /// (one `WgActor`, built once by `Runtime::build`), allocated lazily on
+    /// first use and then held forever -- exactly the shape a `static` is
+    /// for, and exactly the same "fixed-size, single instance, never freed"
+    /// pattern already applied to `tm_buf::PktBuf`. Moving it off the heap
+    /// removes its ~6 KB one-time contribution to heap fragmentation
+    /// entirely (ALLOCATIONS.md, "Fix plan: DERP TLS handshake heap
+    /// collapse", Step 5), at the cost of ~6 KB of permanent `.bss` --
+    /// the same heap-cost-for-no-fragmentation tradeoff already accepted
+    /// for `tm_buf::PKT_CAP`.
+    ///
+    /// # Panics
+    /// Panics if called more than once: a second call would hand out a
+    /// second `&'static mut` aliasing the same storage as the first, which
+    /// would be unsound. This is enforced with an atomic flag rather than
+    /// relied upon by convention. Callers (just `WgActor::endpoint()`) only
+    /// ever call this once, guarded by their own `Option`.
     #[inline(never)]
-    pub fn new_boxed(my_key: NodeKeyPair) -> Box<Self> {
+    pub fn new_static(my_key: NodeKeyPair) -> &'static mut WgEndpoint {
         static EMPTY_PEERS: ArrayVec<Peer, MAX_PEERS> = ArrayVec::new_const();
         static EMPTY_SESSIONS: ArrayVec<(SessionId, PeerId), SESSION_MAP_CAP> = ArrayVec::new_const();
+        static STORAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static mut ENDPOINT_STORAGE: core::mem::MaybeUninit<WgEndpoint> =
+            core::mem::MaybeUninit::uninit();
 
-        let mut b = Box::<Self>::new_uninit();
-        let ptr = b.as_mut_ptr();
-        // SAFETY: `ptr` is a valid, suitably-aligned pointer to
-        // uninitialized memory sized for `Self`. Each field is written
-        // exactly once, in full, before `assume_init()`, so every field of
-        // `Self` ends up initialized and no field is read before its write.
+        if STORAGE.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            panic!("WgEndpoint::new_static called more than once");
+        }
+        // SAFETY: the swap above guarantees exactly one caller, ever,
+        // reaches this point, so this is the only reference to
+        // ENDPOINT_STORAGE that will ever exist (it is a function-local
+        // static, unreachable from anywhere else). Each field is written
+        // exactly once, in full, before `assume_init_mut()`, with the same
+        // per-field safety argument as below.
         unsafe {
-            // Raw `copy_nonoverlapping` (not `.clone()`/`.write(value)`):
-            // both sources are fixed `static` addresses, so this lowers to
-            // a plain memcpy with no intermediate Rust value to construct
-            // -- `Clone::clone` or moving `EMPTY_PEERS` by value would
-            // reintroduce exactly the stack temporary this function exists
-            // to avoid. Safe because both fields are POD-ish "all bytes
-            // valid" data (`MaybeUninit` elements, a `len` of 0): the byte
-            // copy fully initializes them and no live resource is aliased.
+            let ptr = core::ptr::addr_of_mut!(ENDPOINT_STORAGE).cast::<WgEndpoint>();
             core::ptr::addr_of_mut!((*ptr).state.sessions).copy_from_nonoverlapping(&EMPTY_SESSIONS, 1);
             core::ptr::addr_of_mut!((*ptr).state.my_key).write(my_key);
             core::ptr::addr_of_mut!((*ptr).state.my_cookie).write(MACReceiver::new(&my_key.public));
             core::ptr::addr_of_mut!((*ptr).state.timestamps).write(TAI64NClock::new());
             core::ptr::addr_of_mut!((*ptr).state.next_peer_id).write(0);
             core::ptr::addr_of_mut!((*ptr).peers).copy_from_nonoverlapping(&EMPTY_PEERS, 1);
-            b.assume_init()
+            &mut *ptr
         }
     }
 
@@ -401,15 +513,15 @@ impl WgEndpoint {
         self.peers.iter().position(|p| p.config.key == *key)
     }
 
-    /// Add a peer. Returns its id, or None if the table is full or the key is
-    /// already present.
-    pub fn add_peer(&mut self, cfg: PeerConfig, endpoint: Endpoint) -> Option<PeerId> {
+    /// Add a peer reachable over `derp` (its fallback route). Returns its id,
+    /// or None if the table is full or the key is already present.
+    pub fn add_peer(&mut self, cfg: PeerConfig, derp: Endpoint) -> Option<PeerId> {
         if self.peer_index_by_key(&cfg.key).is_some() || self.peers.is_full() {
             return None;
         }
         self.state.next_peer_id += 1;
         let id = PeerId(self.state.next_peer_id);
-        self.peers.push(Peer::new(id, cfg, endpoint));
+        self.peers.push(Peer::new(id, cfg, derp));
         Some(id)
     }
 
@@ -427,12 +539,64 @@ impl WgEndpoint {
         true
     }
 
+    /// Ids of all current peers, in table order. Ids are never reused (the
+    /// counter only grows), so callers must not probe a numeric range: after
+    /// enough peer churn live ids exceed any fixed bound.
+    pub fn peer_ids(&self) -> ArrayVec<PeerId, MAX_PEERS> {
+        self.peers.iter().map(|p| p.id).collect()
+    }
+
+    /// Replace the peer's DERP (fallback) route, for when control moves the
+    /// peer's home region. The session, direct path and timers are untouched:
+    /// only where DERP-bound sends are addressed changes. Returns false for an
+    /// unknown peer.
+    pub fn set_derp(&mut self, id: PeerId, derp: Endpoint) -> bool {
+        match self.peer_index(id) {
+            Some(i) => { self.peers[i].derp = derp; true }
+            None => false,
+        }
+    }
+
     pub fn peer_key(&self, id: PeerId) -> Option<NodePublicKey> {
         self.peer_index(id).map(|i| self.peers[i].config.key)
     }
 
+    /// The peer's DERP (fallback) route.
     pub fn peer_endpoint(&self, id: PeerId) -> Option<Endpoint> {
-        self.peer_index(id).map(|i| self.peers[i].endpoint.clone())
+        self.peer_index(id).map(|i| self.peers[i].derp.clone())
+    }
+
+    /// The peer's direct path record, trusted or not.
+    pub fn peer_direct(&self, id: PeerId) -> Option<DirectPath> {
+        self.peer_index(id).and_then(|i| self.peers[i].direct)
+    }
+
+    /// Where to send to `id` right now: `Some(addr)` for the direct path
+    /// while it is trusted, `None` for DERP. One rule for handshakes,
+    /// keepalives and data, so they never split across paths.
+    ///
+    /// DERP while a `DERP_HOLDOFF` is running, even if the direct path is
+    /// trusted: the peer itself is not using the direct path then.
+    pub fn path_for(&self, id: PeerId, now: Instant) -> Option<SocketAddrV4> {
+        let p = &self.peers[self.peer_index(id)?];
+        if p.derp_holdoff_until.is_some_and(|h| now < h) {
+            return None;
+        }
+        let d = p.direct?;
+        (now < d.trust_until).then_some(d.addr)
+    }
+
+    /// A disco PING from `addr` opened under this peer's allowlisted disco
+    /// key (tm_disco checked the node-key pairing), which is authenticated
+    /// evidence that `addr` reaches the peer. Returns false for an unknown
+    /// peer.
+    pub fn direct_path_seen(&mut self, node_key: &[u8; 32], addr: SocketAddrV4, now: Instant) -> bool {
+        let k = NodePublicKey::from_bytes(*node_key);
+        let Some(idx) = self.peer_index_by_key(&k) else {
+            return false;
+        };
+        trust_direct(&mut self.peers[idx], addr, now);
+        true
     }
 
     pub fn peer_id_by_key(&self, key: &[u8; 32]) -> Option<PeerId> {
@@ -527,8 +691,9 @@ impl WgEndpoint {
     }
 
     /// Process one inbound packet, writing results into a caller-provided
-    /// `out` (which should be freshly [`RecvOut::default`] and, on device,
-    /// heap-allocated so the ~12 KB never touches the stack).
+    /// `out`, which must be empty (freshly [`RecvOut::default`] or reset via
+    /// [`RecvOut::reset`]) and, on device, heap-allocated so the buffer never
+    /// touches the stack.
     pub fn recv_one_into(&mut self, raw: &[u8], from: Endpoint, now: Instant, out: &mut RecvOut) {
         // Disco-demux belt-and-suspenders: only WireGuard type bytes 1..=4
         // reach here. (Primary disco split happens at the runtime edge.)
@@ -545,15 +710,32 @@ impl WgEndpoint {
             return;
         };
 
+        // The DERP server vouches for the sender's node key (== its
+        // WireGuard static key), and the only effect is falling back to
+        // DERP, which always delivers. So this needs no decryption first,
+        // and a replayed duplicate counts too (see `DERP_HOLDOFF`).
+        if let Endpoint::Derp { node_key, .. } = &from {
+            let k = NodePublicKey::from_bytes(*node_key);
+            if let Some(idx) = self.peer_index_by_key(&k) {
+                let peer = &mut self.peers[idx];
+                if peer.direct.is_some_and(|d| now < d.trust_until)
+                    && !peer.derp_holdoff_until.is_some_and(|h| now < h)
+                {
+                    tracing::debug!("peer sends over DERP; holding our sends on DERP");
+                }
+                peer.derp_holdoff_until = Some(now + DERP_HOLDOFF);
+            }
+        }
+
         match msg {
-            Message::HandshakeInitiation(_) => self.recv_init(raw, &from, now, out),
-            Message::HandshakeResponse(_) => self.recv_response(raw, now, out),
+            Message::HandshakeInitiation(_) => self.recv_init(raw, now, out),
+            Message::HandshakeResponse(_) => self.recv_response(raw, &from, now, out),
             Message::CookieReply(_) => self.recv_cookie(raw, out),
             Message::TransportDataHeader(_) => self.recv_transport(raw, &from, now, out),
         }
     }
 
-    fn recv_init(&mut self, raw: &[u8], from: &Endpoint, now: Instant, out: &mut RecvOut) {
+    fn recv_init(&mut self, raw: &[u8], now: Instant, out: &mut RecvOut) {
         let Ok(init) = HandshakeInitiation::try_ref_from_bytes(raw) else {
             return;
         };
@@ -569,9 +751,15 @@ impl WgEndpoint {
         let peer_id = self.peers[idx].id;
         out.peer = Some(peer_id);
 
-        // Replay: reject an initiation whose timestamp is older than the last.
+        // Replay: reject an initiation whose timestamp is not newer than the
+        // last one (WireGuard's rule; wireguard-go `!timestamp.After(last)`).
+        // Equal matters: tailscaled sends each packet over both UDP and DERP
+        // while its direct-path trust has lapsed, so the same initiation
+        // arrives twice. Answering the copy replaced the handshake the peer
+        // was completing with our first response, and its data then failed
+        // to decrypt until it retried (Step 6, docs/lan-direct-path-plan.md).
         if let Some(last) = self.peers[idx].last_seen_timestamp
-            && hs.timestamp < last
+            && hs.timestamp <= last
         {
             tracing::warn!("handshake replay detected");
             return;
@@ -580,8 +768,10 @@ impl WgEndpoint {
 
         let session_id = self.state.alloc_session(peer_id);
         let peer = &mut self.peers[idx];
-        // Roaming: adopt sender address only for authenticated, non-DERP src.
-        maybe_roam(peer, from);
+        // No roaming on an initiation: it proves nothing about the sender's
+        // address (an initiation seen once can be re-sent from anywhere). The path
+        // is adopted when the handshake completes, on the confirming
+        // transport packet in recv_transport.
         let pkt = peer.handshake.respond(
             session_id,
             hs,
@@ -592,7 +782,7 @@ impl WgEndpoint {
         let _ = out.to_peer.try_push(pkt);
     }
 
-    fn recv_response(&mut self, raw: &[u8], now: Instant, out: &mut RecvOut) {
+    fn recv_response(&mut self, raw: &[u8], from: &Endpoint, now: Instant, out: &mut RecvOut) {
         let Ok(resp) = HandshakeResponse::try_ref_from_bytes(raw) else {
             return;
         };
@@ -616,6 +806,8 @@ impl WgEndpoint {
         };
         self.peers[idx].handshake_timeout = None;
         out.handshook = true;
+        // `finish` authenticated the response, so its source is proven.
+        maybe_roam(&mut self.peers[idx], from, now);
 
         let freed = self.peers[idx].session.activate(session, &mut out.to_peer);
         for sid in freed {
@@ -678,7 +870,7 @@ impl WgEndpoint {
                 .unwrap()
                 .decrypt_one(&mut pkt);
             if ok {
-                maybe_roam(&mut self.peers[idx], from);
+                maybe_roam(&mut self.peers[idx], from, now);
                 self.peers[idx].schedule_keepalive(now);
                 let _ = out.decrypted.try_push(pkt);
             }
@@ -690,7 +882,7 @@ impl WgEndpoint {
             .handshake
             .confirm(session_id, vec![Packet::from_wire(raw)]);
         if let Some((session, decrypted)) = confirmed {
-            maybe_roam(&mut self.peers[idx], from);
+            maybe_roam(&mut self.peers[idx], from, now);
             self.peers[idx].schedule_keepalive(now);
             for p in decrypted {
                 let _ = out.decrypted.try_push(p);
@@ -782,25 +974,27 @@ impl WgEndpoint {
     }
 }
 
-/// Adopt a peer's source address from an authenticated (post-decrypt) packet.
-/// Explicitly skipped for DERP-sourced packets and non-UDP endpoints.
-fn maybe_roam(peer: &mut Peer, from: &Endpoint) {
-    if from.is_derp() {
-        return; // never roam based on DERP-relayed source
+/// Called only after a packet from `from` authenticated (decrypted, or
+/// completed a handshake). UDP evidence sets or refreshes the direct path,
+/// adopting a new address if the peer moved (D3). DERP-relayed packets say
+/// nothing about any LAN address, so they never touch it. IPv6 is ignored:
+/// the device's UDP socket is v4-only.
+fn maybe_roam(peer: &mut Peer, from: &Endpoint, now: Instant) {
+    if let Endpoint::Udp(SocketAddr::V4(addr)) = from {
+        trust_direct(peer, *addr, now);
     }
-    if let Endpoint::Udp(new_addr) = from
-        && peer.endpoint != *from
-        && !peer.endpoint.is_derp()
-    {
-        tracing::debug!(?new_addr, "peer roamed to new udp endpoint");
-        peer.endpoint = Endpoint::Udp(*new_addr);
+}
+
+fn trust_direct(peer: &mut Peer, addr: SocketAddrV4, now: Instant) {
+    if peer.direct.map(|d| d.addr) != Some(addr) {
+        tracing::debug!(%addr, "peer direct path set");
     }
+    peer.direct = Some(DirectPath { addr, trust_until: now + DIRECT_TRUST });
 }
 
 /// A small, cheap jitter source in `[0, HANDSHAKE_JITTER_MS)`.
 fn handshake_jitter_ms() -> u64 {
-    use rand::rngs::OsRng;
-    use rand_core::RngCore;
+    use rand_core::{OsRng, RngCore};
     OsRng.next_u64() % HANDSHAKE_JITTER_MS
 }
 
@@ -1075,5 +1269,260 @@ mod tests {
                 }
             )
             .is_none(), "table should be full at MAX_PEERS");
+    }
+
+    // ── Step 4 of docs/lan-direct-path-plan.md: dual-path peers ──
+
+    fn udp(s: &str) -> Endpoint {
+        Endpoint::Udp(s.parse().unwrap())
+    }
+    fn v4(s: &str) -> SocketAddrV4 {
+        s.parse().unwrap()
+    }
+
+    struct Pair {
+        a: WgEndpoint,
+        b: WgEndpoint,
+        a_kp: NodeKeyPair,
+        b_kp: NodeKeyPair,
+        /// B as seen from A, and A as seen from B.
+        a_peer: PeerId,
+        b_peer: PeerId,
+    }
+
+    fn pair() -> Pair {
+        let a_kp = NodeKeyPair::new();
+        let b_kp = NodeKeyPair::new();
+        let mut a = WgEndpoint::new(a_kp);
+        let mut b = WgEndpoint::new(b_kp);
+        let a_peer = a.add_peer(PeerConfig { key: b_kp.public, psk: Psk::zero() }, a_derp(&b_kp)).unwrap();
+        let b_peer = b.add_peer(PeerConfig { key: a_kp.public, psk: Psk::zero() }, b_derp(&a_kp)).unwrap();
+        Pair { a, b, a_kp, b_kp, a_peer, b_peer }
+    }
+
+    /// A initiates. Every packet B sends reaches A over `to_a`, and every
+    /// packet A sends reaches B over `to_b`. Returns once both sessions are
+    /// active.
+    fn handshake(p: &mut Pair, to_a: &Endpoint, to_b: &Endpoint, now: Instant) {
+        let init = p.a.initiate(p.a_peer, now, now_unix()).unwrap();
+        let resp = p.b.recv_one(init.as_slice(), to_b.clone(), now);
+        assert_eq!(resp.to_peer.len(), 1);
+        let conf = p.a.recv_one(resp.to_peer[0].as_slice(), to_a.clone(), now);
+        assert!(conf.handshook);
+        let done = p.b.recv_one(conf.to_peer[0].as_slice(), to_b.clone(), now);
+        assert_eq!(done.decrypted.len(), 1, "B confirms the session");
+    }
+
+    /// One app-data packet from B to A, as wire bytes.
+    fn b_to_a_data(p: &mut Pair, now: Instant) -> Packet {
+        let mut out = RecvOut::default();
+        assert!(p.b.send_data(&p.a_kp.public.to_bytes(), &[0x45, 0, 0, 20], now, &mut out));
+        out.to_peer[0].clone()
+    }
+
+    #[test]
+    fn udp_path_is_adopted_from_authenticated_packets_and_used_for_replies() {
+        let mut p = pair();
+        let t = Instant::now();
+        // A's address as B sees it, and B's as A sees it.
+        let (xa, xb) = ("192.168.15.74:41641", "192.168.15.70:41641");
+
+        let init = p.a.initiate(p.a_peer, t, now_unix()).unwrap();
+        let resp = p.b.recv_one(init.as_slice(), udp(xa), t);
+        assert_eq!(p.b.path_for(p.b_peer, t), None,
+                   "an initiation alone proves nothing about the sender's address");
+
+        let conf = p.a.recv_one(resp.to_peer[0].as_slice(), udp(xb), t);
+        assert!(conf.handshook);
+        assert_eq!(p.a.path_for(p.a_peer, t), Some(v4(xb)),
+                   "an authenticated response over UDP sets the direct path, \
+                    so A's confirmation goes back over it");
+
+        let done = p.b.recv_one(conf.to_peer[0].as_slice(), udp(xa), t);
+        assert_eq!(done.decrypted.len(), 1);
+        assert_eq!(p.b.path_for(p.b_peer, t), Some(v4(xa)),
+                   "the confirming transport packet completes the handshake and proves A's address");
+
+        // Data from the same address keeps it trusted; silence lets it lapse.
+        let later = t + KEEPALIVE_TIMEOUT + Duration::from_millis(1);
+        let data = b_to_a_data(&mut p, t);
+        let r = p.a.recv_one(data.as_slice(), udp(xb), t);
+        assert_eq!(r.decrypted.len(), 1);
+        assert_eq!(r.peer, Some(p.a_peer));
+        assert_eq!(p.a.path_for(p.a_peer, t + Duration::from_secs(6)), Some(v4(xb)));
+        assert_eq!(p.a.path_for(p.a_peer, later), None, "no traffic for 10 s -> trust has lapsed");
+    }
+
+    #[test]
+    fn forged_or_undecryptable_udp_never_changes_the_path() {
+        let mut p = pair();
+        let t = Instant::now();
+        let (x, y) = ("192.168.15.70:41641", "192.168.15.66:41641");
+        let to_b = b_derp(&p.a_kp);
+        handshake(&mut p, &udp(x), &to_b, t);
+        assert_eq!(p.a.path_for(p.a_peer, t), Some(v4(x)));
+        let before = p.a.peer_direct(p.a_peer);
+
+        let t1 = t + Duration::from_secs(1);
+        // A genuine packet, delivered from x, then replayed from y: the replay
+        // window rejects the second copy, so y gains nothing.
+        let data = b_to_a_data(&mut p, t1);
+        assert_eq!(p.a.recv_one(data.as_slice(), udp(x), t1).decrypted.len(), 1);
+        let after_x = p.a.peer_direct(p.a_peer);
+        assert_eq!(p.a.recv_one(data.as_slice(), udp(y), t1).decrypted.len(), 0);
+        assert_eq!(p.a.peer_direct(p.a_peer), after_x, "replayed packet from y");
+
+        // Same header (right receiver id), corrupted ciphertext.
+        let mut forged = b_to_a_data(&mut p, t1).as_slice().to_vec();
+        let last = forged.len() - 1;
+        forged[last] ^= 0xff;
+        assert_eq!(p.a.recv_one(&forged, udp(y), t1).decrypted.len(), 0);
+        assert_eq!(p.a.peer_direct(p.a_peer), after_x, "undecryptable packet from y");
+
+        // A captured initiation re-sent from y.
+        let init = p.b.initiate(p.b_peer, t1, now_unix()).unwrap();
+        let _ = p.a.recv_one(init.as_slice(), udp(y), t1);
+        assert_eq!(p.a.peer_direct(p.a_peer), after_x, "initiation from y");
+
+        // Junk that is not WireGuard at all.
+        let _ = p.a.recv_one(&[4, 0, 0, 0, 1, 2, 3], udp(y), t1);
+        let _ = p.a.recv_one(&[9; 64], udp(y), t1);
+        assert_eq!(p.a.peer_direct(p.a_peer), after_x, "junk from y");
+
+        assert_eq!(before.map(|d| d.addr), Some(v4(x)));
+        assert_eq!(after_x.map(|d| d.addr), Some(v4(x)));
+    }
+
+    #[test]
+    fn trust_expires_after_6_5_s_and_sends_revert_to_derp() {
+        let mut p = pair();
+        let t = Instant::now();
+        let to_b = b_derp(&p.a_kp);
+        handshake(&mut p, &udp("192.168.15.70:41641"), &to_b, t);
+        assert_eq!(DIRECT_TRUST, Duration::from_millis(6500));
+        assert!(p.a.path_for(p.a_peer, t + Duration::from_millis(6400)).is_some());
+        assert_eq!(p.a.path_for(p.a_peer, t + Duration::from_millis(6600)), None);
+        assert_eq!(p.a.peer_endpoint(p.a_peer), Some(a_derp(&p.b_kp)),
+                   "the DERP route is still there to fall back to");
+    }
+
+    #[test]
+    fn authenticated_packet_from_a_new_address_moves_the_path() {
+        let mut p = pair();
+        let t = Instant::now();
+        let (x, z) = ("192.168.15.70:41641", "192.168.15.99:41641");
+        let to_b = b_derp(&p.a_kp);
+        handshake(&mut p, &udp(x), &to_b, t);
+        assert_eq!(p.a.path_for(p.a_peer, t), Some(v4(x)));
+
+        let t1 = t + Duration::from_secs(2);
+        let data = b_to_a_data(&mut p, t1);
+        assert_eq!(p.a.recv_one(data.as_slice(), udp(z), t1).decrypted.len(), 1);
+        assert_eq!(p.a.path_for(p.a_peer, t1), Some(v4(z)));
+        assert_eq!(p.a.peer_direct(p.a_peer).unwrap().trust_until, t1 + DIRECT_TRUST);
+    }
+
+    #[test]
+    fn derp_sourced_packets_never_create_or_move_the_direct_path() {
+        let mut p = pair();
+        let t = Instant::now();
+        let x = "192.168.15.70:41641";
+        let to_b = b_derp(&p.a_kp);
+        handshake(&mut p, &udp(x), &to_b, t);
+        let before = p.a.peer_direct(p.a_peer);
+
+        let t1 = t + Duration::from_secs(3);
+        let data = b_to_a_data(&mut p, t1);
+        assert_eq!(p.a.recv_one(data.as_slice(), a_derp(&p.b_kp), t1).decrypted.len(), 1,
+                   "DERP inbound is always accepted");
+        assert_eq!(p.a.peer_direct(p.a_peer), before, "neither moved nor refreshed by DERP");
+
+        // And with no direct path at all, DERP never creates one.
+        let mut q = pair();
+        let (to_a, to_b) = (a_derp(&q.b_kp), b_derp(&q.a_kp));
+        handshake(&mut q, &to_a, &to_b, t);
+        assert_eq!(q.a.peer_direct(q.a_peer), None);
+        assert_eq!(q.b.peer_direct(q.b_peer), None);
+    }
+
+    /// Send-both delivers the same initiation twice (UDP, then DERP). Only
+    /// the first gets a response, so the handshake the peer completes is the
+    /// one we still hold.
+    #[test]
+    fn duplicate_initiation_is_answered_once_and_the_handshake_completes() {
+        let mut p = pair();
+        let t = Instant::now();
+        let init = p.a.initiate(p.a_peer, t, now_unix()).unwrap();
+        let r1 = p.b.recv_one(init.as_slice(), udp("192.168.15.74:41641"), t);
+        assert_eq!(r1.to_peer.len(), 1);
+        let r2 = p.b.recv_one(init.as_slice(), b_derp(&p.a_kp), t);
+        assert_eq!(r2.to_peer.len(), 0, "the duplicate must not replace the pending handshake");
+        let conf = p.a.recv_one(r1.to_peer[0].as_slice(), a_derp(&p.b_kp), t);
+        assert!(conf.handshook);
+        let done = p.b.recv_one(conf.to_peer[0].as_slice(), b_derp(&p.a_kp), t);
+        assert_eq!(done.decrypted.len(), 1, "B decrypts A's confirmation");
+    }
+
+    /// The Step 6 fault: the peer stopped getting our UDP, so its trust
+    /// lapsed and it sends every packet over both UDP and DERP. The UDP copy
+    /// lands first and refreshes our trust; the DERP copy (a replay by then)
+    /// must still keep our sends on DERP for `DERP_HOLDOFF`.
+    #[test]
+    fn wireguard_over_derp_holds_sends_on_derp() {
+        let mut p = pair();
+        let t = Instant::now();
+        let x = "192.168.15.70:41641";
+        let to_b = b_derp(&p.a_kp);
+        handshake(&mut p, &udp(x), &to_b, t);
+        assert_eq!(p.a.path_for(p.a_peer, t), Some(v4(x)));
+
+        // Send-both: the same packet over UDP, then over DERP.
+        let t1 = t + Duration::from_secs(1);
+        let data = b_to_a_data(&mut p, t1);
+        assert_eq!(p.a.recv_one(data.as_slice(), udp(x), t1).decrypted.len(), 1);
+        assert_eq!(p.a.path_for(p.a_peer, t1), Some(v4(x)));
+        assert_eq!(p.a.recv_one(data.as_slice(), a_derp(&p.b_kp), t1).decrypted.len(), 0,
+                   "the DERP copy is a replay");
+        assert_eq!(p.a.path_for(p.a_peer, t1), None, "yet it holds sends on DERP");
+
+        // UDP alone during the hold-off does not lift it.
+        let t2 = t1 + Duration::from_secs(3);
+        let data = b_to_a_data(&mut p, t2);
+        assert_eq!(p.a.recv_one(data.as_slice(), udp(x), t2).decrypted.len(), 1);
+        assert_eq!(p.a.path_for(p.a_peer, t2), None);
+
+        // Once the peer has sent over UDP only for longer than the hold-off
+        // (it trusts the path again), sends go direct again.
+        let t3 = t1 + DERP_HOLDOFF + Duration::from_millis(1);
+        let data = b_to_a_data(&mut p, t3);
+        assert_eq!(p.a.recv_one(data.as_slice(), udp(x), t3).decrypted.len(), 1);
+        assert_eq!(p.a.path_for(p.a_peer, t3), Some(v4(x)));
+
+        // A DERP packet from another node does not hold this peer.
+        let stranger = NodeKeyPair::new();
+        let _ = p.a.recv_one(data.as_slice(), a_derp(&stranger), t3);
+        assert_eq!(p.a.path_for(p.a_peer, t3), Some(v4(x)));
+    }
+
+    #[test]
+    fn direct_path_seen_sets_and_refreshes_trust() {
+        let mut p = pair();
+        let t = Instant::now();
+        let b_key = p.b_kp.public.to_bytes();
+        assert!(p.a.direct_path_seen(&b_key, v4("192.168.15.70:41641"), t));
+        assert_eq!(p.a.path_for(p.a_peer, t), Some(v4("192.168.15.70:41641")));
+        let t1 = t + Duration::from_secs(5);
+        assert!(p.a.direct_path_seen(&b_key, v4("192.168.15.70:41641"), t1));
+        assert!(p.a.path_for(p.a_peer, t + Duration::from_secs(10)).is_some(), "refreshed at t1");
+        assert!(!p.a.direct_path_seen(&[7u8; 32], v4("192.168.15.1:1"), t), "unknown peer");
+    }
+
+    #[test]
+    fn ipv6_udp_source_is_ignored() {
+        let mut p = pair();
+        let t = Instant::now();
+        let to_b = b_derp(&p.a_kp);
+        handshake(&mut p, &udp("[fd00::1]:41641"), &to_b, t);
+        assert_eq!(p.a.peer_direct(p.a_peer), None);
     }
 }

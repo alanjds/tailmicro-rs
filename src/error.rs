@@ -6,6 +6,8 @@ pub enum Error {
     InternalFailure,
     RuntimeDegraded,
     Pin(tm_control::pin::PinError),
+    /// A `Config` setter rejected its argument; the text says why.
+    InvalidConfig(&'static str),
 }
 
 impl std::fmt::Display for Error {

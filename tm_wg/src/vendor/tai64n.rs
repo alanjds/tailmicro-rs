@@ -34,7 +34,11 @@ const WHITEN_INCREMENT: u32 = !WHITEN_MASK + 1;
 impl TAI64N {
     #[inline]
     pub fn now() -> Self {
-        Self::from(SystemTime::now())
+        // Whole seconds only: `tm_time` carries no sub-second wall clock, and
+        // the nanos are whitened to ~16.8 ms anyway. Not used on the device
+        // path (the endpoint feeds `now_from_unix`); 0 while the wall clock
+        // is unset.
+        Self::from_unix(tm_time::unix_secs().unwrap_or(0), 0)
     }
 
     /// Build a timestamp directly from a synced Unix time (seconds since the

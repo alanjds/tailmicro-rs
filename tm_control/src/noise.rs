@@ -94,6 +94,7 @@
 //! For our purposes (ESP32-C3 embedded client), the EarlyNoise payload
 //! is informational only.  We skip it if present.
 
+use embedded_io_async::{Read, Write};
 use snow::Builder as NoiseBuilder;
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag, KeyInit, AeadInPlace};
 use crate::{ControlError, NoiseError};
@@ -214,15 +215,43 @@ pub struct NoiseChannel {
     /// How many decrypted bytes are available in read_buf, starting at read_pos.
     read_avail: usize,
     read_pos:   usize,
+    /// Progress of the record currently being read off the wire, kept in the
+    /// struct (not in `fill_read_buf`'s future) so that future can be dropped
+    /// at any await and resumed by the next call without losing a byte. See
+    /// `wait_readable`.
+    rec_hdr:       [u8; FRAME_HEADER_LEN],
+    rec_hdr_have:  usize,
+    rec_body_have: usize,
 }
 
 impl NoiseChannel {
+    /// Test-only: a connected (client, server) channel pair with fixed keys,
+    /// so host tests can run a mock control server over an in-memory stream
+    /// without a Noise handshake. The server side is the client's mirror
+    /// (its tx key is the client's rx key and vice versa).
+    #[cfg(test)]
+    pub(crate) fn test_pair() -> (NoiseChannel, NoiseChannel) {
+        let (k1, k2) = ([0x11u8; 32], [0x22u8; 32]);
+        let mk = |tx: &[u8; 32], rx: &[u8; 32]| NoiseChannel {
+            tx_cipher:  ChaCha20Poly1305::new(Key::from_slice(tx)),
+            tx_nonce:   0,
+            rx_cipher:  ChaCha20Poly1305::new(Key::from_slice(rx)),
+            rx_nonce:   0,
+            write_buf:  Box::new([0u8; 4114]),
+            read_buf:   Box::new([0u8; 4114]),
+            read_avail: 0,
+            read_pos:   0,
+            rec_hdr: [0; FRAME_HEADER_LEN], rec_hdr_have: 0, rec_body_have: 0,
+        };
+        (mk(&k1, &k2), mk(&k2, &k1))
+    }
+
     /// Read exactly `n` bytes from the Noise channel into `out`.
     ///
     /// Handles message boundaries transparently — a single Noise message
     /// may be read in multiple calls, or a single call may consume multiple
     /// Noise messages (uncommon for our frame sizes).
-    pub async fn read_exact<S: crate::IoStream>(
+    pub async fn read_exact<S: Read + Write>(
         &mut self,
         stream: &mut S,
         out:    &mut [u8],
@@ -247,7 +276,7 @@ impl NoiseChannel {
     ///
     /// Fragments automatically if `data > 65519` bytes (won't happen for
     /// our use case — H/2 frames are ≤ 4096 bytes).
-    pub async fn write_all<S: crate::IoStream>(
+    pub async fn write_all<S: Read + Write>(
         &mut self,
         stream: &mut S,
         data:   &[u8],
@@ -280,30 +309,77 @@ impl NoiseChannel {
             self.write_buf[0] = MSG_TYPE_RECORD;
             self.write_buf[1..3].copy_from_slice(&(ciphertext_len as u16).to_be_bytes());
 
-            stream.write_all(&self.write_buf[..FRAME_HEADER_LEN + ciphertext_len]).await
-                .map_err(|_| ControlError::Io)?;
+            crate::io::write_all(stream, &self.write_buf[..FRAME_HEADER_LEN + ciphertext_len]).await?;
 
             offset += chunk_len;
         }
         Ok(())
     }
 
-    async fn fill_read_buf<S: crate::IoStream>(
+    /// Decrypted bytes buffered and ready for `read_exact` without touching
+    /// the stream.
+    pub fn buffered(&self) -> usize {
+        self.read_avail
+    }
+
+    /// Wait until at least one decrypted byte is buffered. Unlike
+    /// `read_exact`, this is cancel-safe: the future may be dropped at any
+    /// await (typically by a `select!` against a timer or a command) and a
+    /// later call resumes mid-record, because the only awaits are plain
+    /// `stream.read` calls and all progress is stored in `self`. That lets
+    /// the poll loop react to a timer without a read in progress and without
+    /// losing framing.
+    pub async fn wait_readable<S: Read + Write>(
         &mut self,
         stream: &mut S,
     ) -> Result<(), ControlError> {
-        // Read the 3-byte frame header (type + big-endian length).
-        let mut hdr = [0u8; FRAME_HEADER_LEN];
-        stream.read_exact(&mut hdr).await.map_err(|_| ControlError::Io)?;
-        let msg_type = hdr[0];
-        let ciphertext_len = u16::from_be_bytes([hdr[1], hdr[2]]) as usize;
+        if self.read_avail == 0 {
+            self.fill_read_buf(stream).await?;
+        }
+        Ok(())
+    }
+
+    /// One cancel-safe `stream.read`; EOF is an error (a record is never
+    /// legitimately cut short).
+    async fn read_some<S: Read + Write>(stream: &mut S, buf: &mut [u8]) -> Result<usize, ControlError> {
+        match stream.read(buf).await {
+            Ok(0) => {
+                tracing::error!("read failed: unexpected EOF (wanted up to {} bytes)", buf.len());
+                Err(ControlError::Io)
+            }
+            Ok(n) => Ok(n),
+            Err(e) => {
+                tracing::error!("read failed: {:?} (wanted up to {} bytes)", e, buf.len());
+                Err(ControlError::Io)
+            }
+        }
+    }
+
+    /// Read one whole record into `read_buf` and decrypt it. Resumable (see
+    /// `wait_readable`).
+    async fn fill_read_buf<S: Read + Write>(
+        &mut self,
+        stream: &mut S,
+    ) -> Result<(), ControlError> {
+        // Record header: type + big-endian ciphertext length.
+        while self.rec_hdr_have < FRAME_HEADER_LEN {
+            let n = Self::read_some(stream, &mut self.rec_hdr[self.rec_hdr_have..]).await?;
+            self.rec_hdr_have += n;
+        }
+        let msg_type = self.rec_hdr[0];
+        let ciphertext_len = u16::from_be_bytes([self.rec_hdr[1], self.rec_hdr[2]]) as usize;
 
         if ciphertext_len > self.read_buf.len() || ciphertext_len < TAG_LEN {
+            self.rec_hdr_have = 0;
             return Err(ControlError::Noise(NoiseError::Decrypt));
         }
 
-        stream.read_exact(&mut self.read_buf[..ciphertext_len]).await
-            .map_err(|_| ControlError::Io)?;
+        while self.rec_body_have < ciphertext_len {
+            let n = Self::read_some(stream, &mut self.read_buf[self.rec_body_have..ciphertext_len]).await?;
+            self.rec_body_have += n;
+        }
+        self.rec_hdr_have = 0;
+        self.rec_body_have = 0;
 
         match msg_type {
             MSG_TYPE_RECORD => {
@@ -342,7 +418,7 @@ impl NoiseChannel {
     /// sends one as its first Record (see `CHALLENGE_MAGIC`'s doc comment).
     /// If the first bytes aren't the magic, they're left buffered for the
     /// caller's next `read_exact` (this is real H/2 traffic, not a challenge).
-    async fn skip_challenge_packet<S: crate::IoStream>(
+    async fn skip_challenge_packet<S: Read + Write>(
         &mut self,
         stream: &mut S,
     ) -> Result<(), ControlError> {
@@ -395,7 +471,7 @@ fn be_nonce(counter: u64) -> [u8; 12] {
 /// 4. Handle optional EarlyNoise payload
 /// 5. Read and process the Noise response message
 /// 6. Transition to transport mode
-    pub async fn do_noise_handshake<S: crate::IoStream>(
+    pub async fn do_noise_handshake<S: Read + Write>(
         stream:      &mut S,
         machine_key: &MachinePrivateKey,
         server_key:  &[u8; 32],   // from Config::control_pin (verified offline pin, not fetched)
@@ -451,7 +527,7 @@ fn be_nonce(counter: u64) -> [u8; 12] {
 
     let req = build_upgrade_request(host, cap_version, init_payload);
     tracing::debug!("do_noise_handshake() - request ({} bytes, init_payload {} bytes):\n{}", req.len(), init_payload.len(), req.as_str());
-    stream.write_all(req.as_bytes()).await.map_err(|_| ControlError::Io)?;
+    crate::io::write_all(stream, req.as_bytes()).await?;
     tracing::debug!("do_noise_handshake() - request write_all returned Ok");
 
     // ── Step 3: Parse 101 Switching Protocols ─────────────────────────────────
@@ -467,21 +543,29 @@ fn be_nonce(counter: u64) -> [u8; 12] {
     //   fresh byte for the response frame's type field below.
     // - anything else: it's already the response frame's type byte.
 
+    // The control server was measured (on device, with a wrong responder key)
+    // answering 101 and then closing cleanly before any Noise byte. That is
+    // the same verdict as a close before the 101, so it is reported alike.
     let mut first_byte = [0u8; 1];
-    stream.read_exact(&mut first_byte).await.map_err(|_| ControlError::Io)?;
+    match crate::io::read_byte_or_eof(stream).await? {
+        Some(b) => first_byte[0] = b,
+        None => {
+            tracing::error!("ts2021: peer closed after the 101 without a Noise response");
+            return Err(ControlError::Noise(NoiseError::NoResponse));
+        }
+    }
 
     let msg_type = if first_byte[0] == EARLY_PAYLOAD_MAGIC_BYTE {
         // Read remaining 4 bytes of the 5-byte EarlyNoise header
         let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await.map_err(|_| ControlError::Io)?;
+        crate::io::read_exact(stream, &mut len_buf).await?;
         let json_len = u32::from_be_bytes(len_buf) as usize;
 
         // Skip the JSON if it fits in our budget; otherwise drain byte-by-byte
         // to avoid allocating a large buffer
         if json_len <= MAX_EARLY_NOISE_LEN {
             let mut json_buf = [0u8; MAX_EARLY_NOISE_LEN];
-            stream.read_exact(&mut json_buf[..json_len]).await
-                .map_err(|_| ControlError::Io)?;
+            crate::io::read_exact(stream, &mut json_buf[..json_len]).await?;
             // Could parse server node key from EarlyNoise here for future use
         } else {
             // Drain without buffering
@@ -489,15 +573,14 @@ fn be_nonce(counter: u64) -> [u8; 12] {
             let mut remaining = json_len;
             while remaining > 0 {
                 let take = remaining.min(drain.len());
-                stream.read_exact(&mut drain[..take]).await
-                    .map_err(|_| ControlError::Io)?;
+                crate::io::read_exact(stream, &mut drain[..take]).await?;
                 remaining -= take;
             }
         }
 
         // The response frame follows; read its type byte fresh.
         let mut type_byte = [0u8; 1];
-        stream.read_exact(&mut type_byte).await.map_err(|_| ControlError::Io)?;
+        crate::io::read_exact(stream, &mut type_byte).await?;
         type_byte[0]
     } else {
         first_byte[0]
@@ -506,7 +589,7 @@ fn be_nonce(counter: u64) -> [u8; 12] {
     // Read the remaining 2 bytes of the 3-byte response frame header
     // (message type already consumed above; this is the big-endian length).
     let mut resp_len_buf = [0u8; 2];
-    stream.read_exact(&mut resp_len_buf).await.map_err(|_| ControlError::Io)?;
+    crate::io::read_exact(stream, &mut resp_len_buf).await?;
     let resp_frame_len = u16::from_be_bytes(resp_len_buf) as usize;
 
     let mut noise_resp_buf = [0u8; NOISE_RESP_MSG_LEN];
@@ -516,14 +599,14 @@ fn be_nonce(counter: u64) -> [u8; 12] {
                 tracing::error!("ts2021 response frame: unexpected length {} (want {})", resp_frame_len, NOISE_RESP_MSG_LEN);
                 return Err(ControlError::Noise(NoiseError::Handshake));
             }
-            stream.read_exact(&mut noise_resp_buf).await.map_err(|_| ControlError::Io)?;
+            crate::io::read_exact(stream, &mut noise_resp_buf).await?;
         }
         MSG_TYPE_ERROR => {
             // msgTypeError: unauthenticated human-readable text, per the
             // real protocol - not encrypted/authenticated, hint only.
             let mut err_buf = [0u8; MAX_EARLY_NOISE_LEN];
             let take = resp_frame_len.min(err_buf.len());
-            stream.read_exact(&mut err_buf[..take]).await.map_err(|_| ControlError::Io)?;
+            crate::io::read_exact(stream, &mut err_buf[..take]).await?;
             tracing::error!("ts2021 server rejected handshake: {}", core::str::from_utf8(&err_buf[..take]).unwrap_or("<invalid utf8>"));
             return Err(ControlError::Noise(NoiseError::Handshake));
         }
@@ -565,6 +648,7 @@ fn be_nonce(counter: u64) -> [u8; 12] {
         read_buf:   Box::new([0u8; 4114]),
         read_avail: 0,
         read_pos:   0,
+        rec_hdr: [0; FRAME_HEADER_LEN], rec_hdr_have: 0, rec_body_have: 0,
     };
 
     // The server may send an optional post-handshake "challenge packet" as
@@ -625,7 +709,7 @@ fn build_upgrade_request(host: &str, cap_version: u16, init_payload: &[u8]) -> h
 // the HTTP/1.1 response headers.  The response body does NOT exist — the
 // connection is immediately "hijacked" to the Noise stream.
 
-async fn read_101_response<S: crate::IoStream>(
+async fn read_101_response<S: Read + Write>(
     stream: &mut S,
 ) -> Result<(), ControlError> {
     // Read until \r\n\r\n (end of HTTP response headers).
@@ -637,15 +721,23 @@ async fn read_101_response<S: crate::IoStream>(
         if total >= buf.len() {
             return Err(ControlError::Noise(NoiseError::Handshake));
         }
-        let n = {
-            // Read one byte at a time to avoid consuming Noise bytes
-            // that immediately follow the \r\n\r\n boundary.
-            let single = &mut [0u8; 1];
-            stream.read_exact(single).await.map_err(|_| ControlError::Io)?;
-            buf[total] = single[0];
-            1
-        };
-        total += n;
+        // Read one byte at a time to avoid consuming Noise bytes
+        // that immediately follow the \r\n\r\n boundary.
+        match crate::io::read_byte_or_eof(stream).await? {
+            Some(b) => { buf[total] = b; total += 1; }
+            // A clean close before the first response byte is what the real
+            // control server does (measured against controlplane.tailscale.com)
+            // when the Noise initiation does not decrypt, i.e. the pinned
+            // responder key is wrong. A healthy server always answers an
+            // upgrade with a status line, so this is told apart from a network
+            // failure (reset, timeout, connect error) which never reaches here
+            // as a clean EOF. Mid-header EOF stays a plain Io error.
+            None if total == 0 => {
+                tracing::error!("ts2021: peer closed without any HTTP response to the upgrade");
+                return Err(ControlError::Noise(NoiseError::NoResponse));
+            }
+            None => return Err(ControlError::Io),
+        }
 
         // Check for end-of-headers sentinel
         if total >= 4 && &buf[total-4..total] == b"\r\n\r\n" {

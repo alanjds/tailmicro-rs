@@ -7,26 +7,21 @@
 //! ## Quick start (identical to tailscale-rs)
 //!
 //! ```no_run
-//! # use std::{time::Duration, net::Ipv4Addr, error::Error};
+//! # use std::error::Error;
 //! # #[tokio::main(flavor = "current_thread")]   // <— current_thread on ESP32!
 //! # async fn main() -> Result<(), Box<dyn Error>> {
 //! let config = tailmicro::Config::new("tskey-auth-...")
 //!     .with_control_pin_hex("<hex pin blob from tools/gen_fingerprint.py>")?;
 //!
-//! let dev = tailmicro::Device::new(
+//! let (dev, driver) = tailmicro::Device::connect(
 //!     &config,
 //!     Some("tskey-auth-...".to_owned()),
 //! ).await?;
+//! println!("tailnet address: {}", dev.ipv4_addr());
 //!
-//! let sock = dev.udp_bind((dev.ipv4_addr().await?, 1234).into()).await?;
-//!
-//! loop {
-//!     sock.send_to(
-//!         (Ipv4Addr::new(100, 64, 0, 1), 5678).into(),
-//!         b"hello, world!",
-//!     ).await?;
-//!     tokio::time::sleep(Duration::from_secs(1)).await;
-//! }
+//! // `driver` runs the data plane: keep polling it alongside your own work.
+//! tokio::join!(driver, async { /* your application */ });
+//! # Ok(())
 //! # }
 //! ```
 //!
@@ -39,7 +34,7 @@
 //! let rt = tokio::runtime::Builder::new_current_thread()
 //!     .enable_all()
 //!     .build()?;
-//! rt.block_on(async { tailmicro::Device::new(...).await });
+//! rt.block_on(async { tailmicro::Device::connect(...).await });
 //! ```
 //!
 //! The `#[tokio::main]` macro defaults to `multi_thread` which spawns a
@@ -51,44 +46,33 @@
 //! The bridge is initialized by `EspLogger::initialize_default()` which is called
 //! in the main application before any tailmicro code runs.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 pub use config::Config;
 pub use error::Error;
+pub use tm_netstack::names::{MagicDns, Resolution, Resolver};
+pub use tm_control::{Service, ServiceProto, MAX_SERVICES, MAX_SERVICE_DESC};
+pub use tm_control::login::{control_key_rejected, login_url, refusal, LoginUrl, Refusal, LOGIN_URL_MAX};
 pub use tm_keys::NodeState;
 pub use tm_runtime::{tokio_freertos_yield, OurIpReceiver, OurIpSender};
+
+/// The data-plane future returned by [`Device::connect`]; the same type as
+/// `tm_runtime::Driver`, re-exported so apps need not depend on `tm_runtime`
+/// just to name it.
+pub use tm_runtime::Driver;
 
 pub mod config;
 mod error;
 
-/// Build the `Runtime::join` future and move it onto the heap, off-frame.
+/// Build the `Runtime::connect` future and move it onto the heap, off-frame.
 ///
 /// `#[inline(never)]`: at this crate's `dev` profile (`opt-level = "z"`,
-/// `lto = true` — see tasmolike-rs/Cargo.toml), the compiler MIR-inlines
-/// async fns aggressively across crate boundaries. Without this boundary,
-/// `Runtime::join`'s state machine (channels, actor structs, boxed-future
-/// pointers) got folded straight into `Device::new`'s own state machine,
-/// and the combined frame was observed at ~55 KB in
-/// `<Timeout<Device::new::{closure#0}> as Future>::poll` — still enough to
-/// blow the 32 KB main-task stack with a Guru Meditation "Stack protection
-/// fault" even after `Runtime::join` itself was slimmed down (see
-/// docs/wg-dataplane-notes.md). `Box::pin` behind a non-inlinable function
-/// forces a real (non-inlined) call boundary: `Device::new` only ever holds
-/// the 16-byte `Pin<Box<dyn Future>>` across the `.await`, and `join`'s
-/// state machine is built in its own frame that is freed once the pointer
-/// is returned.
-#[cfg(target_os = "espidf")]
-#[inline(never)]
-fn spawn_runtime_join(
-    rt_config: tm_runtime::RuntimeConfig,
-) -> core::pin::Pin<Box<dyn core::future::Future<Output = tm_runtime::Runtime>>> {
-    Box::pin(tm_runtime::Runtime::join(rt_config))
-}
-
-/// Same off-frame-boxing rationale as `spawn_runtime_join` above, for
-/// `Runtime::connect`'s (larger still — it awaits the same actor/channel
-/// construction as `join` internally) state machine.
+/// `lto = true`) the compiler MIR-inlines async fns across crate boundaries,
+/// which folded `Runtime::connect`'s state machine (channels, actor structs,
+/// boxed-future pointers) into the caller's and overflowed the 32 KB main
+/// task stack (see docs/wg-dataplane-notes.md). A non-inlinable `Box::pin`
+/// boundary leaves the caller holding only a 16-byte `Pin<Box<dyn Future>>`.
 #[cfg(target_os = "espidf")]
 #[inline(never)]
 fn spawn_runtime_connect(
@@ -129,13 +113,29 @@ impl Device {
     /// # Arguments
     /// * `config` - Tailscale configuration (must carry a verified control
     ///   pin — see `Config::with_control_pin_hex`)
-    /// * `auth_key` - Auth key for Tailscale control plane
+    /// * `auth_key` - Auth key for Tailscale control plane. `None` or empty
+    ///   selects interactive login: control answers with a URL, readable with
+    ///   [`login_url`] from another task while this call stays pending (no
+    ///   `connect_timeout` applies while it waits for the user), and the call
+    ///   returns once the user has approved the device. An already-authorized
+    ///   node needs neither a key nor a login.
+    ///
+    /// Fails with `Error::Control(ControlError::ControlKeyRejected)` when the
+    /// pinned control key does not match the server, with
+    /// `Error::Control(ControlError::LoginRequired)` when control wants a login
+    /// and `Config::with_login_allowed(false)` forbids waiting for it, and with
+    /// `Error::Control(ControlError::NodeKeyExpired)` when control says the node
+    /// key expired and offers no login (renew it with `with_node_rotation` and
+    /// `with_previous_node_rotation`, login allowed).
     pub async fn connect(
         config: &Config,
         auth_key: Option<String>,
-    ) -> Result<(Self, tm_runtime::Driver), Error> {
+    ) -> Result<(Self, Driver), Error> {
         tracing::debug!("Device::connect() - starting device initialization");
 
+        tm_netstack::names::set_mode(config.magicdns);
+        tm_netstack::names::set_resolver(config.dns_resolver);
+        tm_buf::link::set_check(config.link_check);
         let node_state = config.load_or_generate_keys().await?;
         tracing::debug!("Device::connect() - keys loaded, node_state generated");
 
@@ -160,48 +160,20 @@ impl Device {
         #[cfg(not(target_os = "espidf"))]
         let result = tm_runtime::Runtime::connect(rt_config).await;
 
-        let (runtime, our_ip, driver) = result.map_err(|_| Error::NotConnected)?;
+        let (runtime, our_ip, driver) = result.map_err(|_| {
+            // The runtime only reports that bring-up failed; the control actor
+            // leaves the reason of a key mismatch in `tm_control::login`.
+            if control_key_rejected() {
+                Error::Control(tm_control::ControlError::ControlKeyRejected)
+            } else {
+                match refusal() {
+                    Some(Refusal::LoginRequired) => Error::Control(tm_control::ControlError::LoginRequired),
+                    Some(Refusal::NodeKeyExpired) => Error::Control(tm_control::ControlError::NodeKeyExpired),
+                    None => Error::NotConnected,
+                }
+            }
+        })?;
         Ok((Self { runtime, our_ip }, driver))
-    }
-
-    /// Deprecated: on ESP32-C3 this blocks forever once connected (the
-    /// streaming keepalive poll it awaits internally is deliberately
-    /// unbounded, so the node stays marked online) — this is exactly the
-    /// "wrapper races a droppable future against the data plane" failure
-    /// mode fixed by `Device::connect` (card t_0d32f11d). Kept only so
-    /// existing callers keep building; new code should call
-    /// `Device::connect` and fold the returned `Driver` into its own
-    /// `tokio::join!`.
-    #[deprecated(note = "use Device::connect, which returns promptly and hands back a Driver future to fold into your own tokio::join!")]
-    pub async fn new(config: &Config, auth_key: Option<String>) -> Result<Self, Error> {
-        tracing::debug!("Device::new() - starting device initialization");
-
-        let node_state = config.load_or_generate_keys().await?;
-        tracing::debug!("Device::new() - keys loaded, node_state generated");
-
-        let rt_config = tm_runtime::RuntimeConfig {
-            control:       config.control_config(),
-            auth_key:      auth_key
-                .as_deref()
-                .and_then(|s| heapless::String::try_from(s).ok())
-                .unwrap_or_default(),
-            node_state,
-            priority_peer: None,
-            our_ip_tx: None,
-            connect_timeout: config.connect_timeout,
-        };
-
-        #[cfg(target_os = "espidf")]
-        let runtime = spawn_runtime_join(rt_config).await;
-
-        #[cfg(not(target_os = "espidf"))]
-        let runtime = tm_runtime::Runtime::spawn(rt_config).await;
-
-        // The legacy contract never had a working way to learn our_ip
-        // without racing the (now nonexistent, on this path) readiness
-        // channel against a completed `Runtime` — `ipv4_addr()` below just
-        // reports `NotConnected` unconditionally on this deprecated path.
-        Ok(Self { runtime, our_ip: Ipv4Addr::UNSPECIFIED })
     }
 
     /// Get this device's IPv4 tailnet address.
@@ -212,6 +184,35 @@ impl Device {
         self.our_ip
     }
 
+    /// Resolve a tailnet name (`bospill` or `bospill.<tailnet>.ts.net`) to
+    /// its tailnet IPv4, from the netmap snapshot taken at the last control
+    /// connect. `None` means the name is not a known tailnet name under the
+    /// configured [`MagicDns`] mode; use your normal resolver for it. On the
+    /// ESP32 the same table is consulted by lwIP's `getaddrinfo`, so
+    /// `TcpStream::connect("bospill:8080")` needs no call to this.
+    pub fn resolve(&self, name: &str) -> Option<Ipv4Addr> {
+        tm_netstack::names::resolve(name)
+    }
+
+    /// When this node's key expires, in unix seconds, as of the last netmap.
+    /// `None` means it never expires (key expiry disabled for the node), or
+    /// no netmap has been seen yet. The key is renewed by logging in again;
+    /// the value follows later netmaps, so renewing in the admin console
+    /// shows up without reconnecting.
+    pub fn node_key_expiry(&self) -> Option<i64> {
+        tm_control::selfnode::key_expiry()
+    }
+
+    /// The tailnet suffix of this node's name (`tailnet-xyz.ts.net`, no dots at
+    /// the ends, case as control sent it), so an app can show the FQDN as
+    /// `<label>.<suffix>`. A copy of the one stored by tailmicro, from the
+    /// last netmap; empty when not yet known, when control names nodes with a
+    /// bare label, or when it is longer than `MAX_NAME_SUFFIX` (48 bytes), as a
+    /// longer suffix is dropped whole rather than truncated.
+    pub fn tailnet_suffix(&self) -> heapless::String<{ tm_control::MAX_NAME_SUFFIX }> {
+        tm_netstack::names::suffix()
+    }
+
     /// Whether this device is connected to the tailnet.
     ///
     /// Always `true` for a `Device` obtained from `Device::connect` — its
@@ -220,23 +221,6 @@ impl Device {
     /// still polling the paired `Driver` future.
     pub fn is_connected(&self) -> bool {
         self.our_ip != Ipv4Addr::UNSPECIFIED
-    }
-
-    /// Bind a UDP socket to `addr` on the tailnet.
-    pub async fn udp_bind(&self, addr: SocketAddr) -> Result<netstack::UdpSocket, Error> {
-        // Delegates to tm_netstack which wraps lwIP on ESP32-C3
-        // or tokio::net::UdpSocket on the host.
-        todo!("platform netstack bind")
-    }
-
-    /// Listen for TCP connections on the tailnet.
-    pub async fn tcp_listen(&self, addr: SocketAddr) -> Result<netstack::TcpListener, Error> {
-        todo!("platform netstack listen")
-    }
-
-    /// Connect a TCP stream to a peer on the tailnet.
-    pub async fn tcp_connect(&self, remote: SocketAddr) -> Result<netstack::TcpStream, Error> {
-        todo!("platform netstack connect")
     }
 
     /// Gracefully shut down all actors.
@@ -258,4 +242,17 @@ pub mod keys {
         NodePrivateKey, NodePublicKey,
         NodeState,
     };
+}
+
+#[cfg(test)]
+mod driver_reexport {
+    /// `tailmicro::Driver` is the very type `Device::connect` hands back, so
+    /// apps can swap `tm_runtime::Driver` for it with no other change.
+    #[test]
+    fn driver_is_the_runtime_driver() {
+        fn same(d: tm_runtime::Driver) -> crate::Driver {
+            d
+        }
+        let _ = same;
+    }
 }

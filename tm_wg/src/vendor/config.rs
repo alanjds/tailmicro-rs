@@ -2,8 +2,7 @@
 //! `Distribution<Psk>` impl (which needed rand 0.10's `RngExt`/`StandardUniform`)
 //! is replaced by explicit `Psk::zero()` / `Psk::random()` constructors.
 
-use rand::rngs::OsRng;
-use rand_core::RngCore;
+use rand_core::{OsRng, RngCore};
 
 use super::keys::NodePublicKey;
 

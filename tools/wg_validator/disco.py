@@ -20,6 +20,8 @@ Rust reference and the Go source (flagged in the validator report).
 
 from __future__ import annotations
 
+import socket
+
 from nacl.public import PrivateKey, PublicKey, Box
 from nacl.utils import random as nacl_random
 
@@ -50,6 +52,22 @@ def build_pong(my_disco_priv: bytes, my_disco_pub: bytes, peer_disco_pub: bytes,
     assert len(tx_id) == 12
     plaintext = bytes([MSG_PONG, VERSION]) + tx_id + src_endpoint
     return _seal(my_disco_priv, my_disco_pub, peer_disco_pub, plaintext)
+
+
+def pack_endpoint(ip: str, port: int) -> bytes:
+    """Encode an 18-byte `src_ipport` for a PONG's body: an IPv4-mapped IPv6
+    address (10 zero bytes + 0xffff + the 4 IPv4 octets) + a 2-byte
+    big-endian port. This is the *real, literal* endpoint form -- as opposed
+    to `tm_disco::encode_derp_relay_src_ipport`'s `127.3.3.40:<region>`
+    DERP-relay convention, which is only used when a PING arrived over DERP,
+    not real UDP.
+
+    Matches `tm_disco`'s planned `encode_src_ipport(SocketAddrV4)` (Step 1)
+    and `ts_disco_protocol::endpoint::Endpoint`'s wire layout (8 big-endian
+    u16 words with the last two carrying the IPv4 octets, then the port).
+    """
+    octets = socket.inet_aton(ip)  # 4 bytes, raises for a non-IPv4 literal
+    return b"\x00" * 10 + b"\xff\xff" + octets + port.to_bytes(2, "big")
 
 
 def is_disco(packet: bytes) -> bool:

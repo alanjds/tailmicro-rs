@@ -286,6 +286,18 @@ mod tests {
         assert_eq!(decode_pin_hex(&bad2), Err(PinError::BadHex));
     }
 
+    // Blob produced by tools/pin_signer.html (WebCrypto Ed25519, throwaway
+    // seed 01..20, pubkey 0x01 x32, not_after 1794026096). It must verify
+    // here, and equals what gen_fingerprint.py emits for the same inputs.
+    const WEB_PIN_HEX: &str = "544d504e01010101010101010101010101010101010101010101010101010101010101010170aaee6a000000007de8919f9309adf391ef876896d4a9544c86e22073a3cf1c28e7677057c9d7d0d103b904dd92902fc04f5f3229df1f3b9e3b56ee707165ab3f3ce05dec38a205";
+    const WEB_VERIFY_KEY: [u8; 32] = [0x79, 0xb5, 0x56, 0x2e, 0x8f, 0xe6, 0x54, 0xf9, 0x40, 0x78, 0xb1, 0x12, 0xe8, 0xa9, 0x8b, 0xa7, 0x90, 0x1f, 0x85, 0x3a, 0xe6, 0x95, 0xbe, 0xd7, 0xe0, 0xe3, 0x91, 0x0b, 0xad, 0x04, 0x96, 0x64];
+
+    #[test]
+    fn web_signer_blob_verifies() {
+        let result = verify_pin_hex(WEB_PIN_HEX, &WEB_VERIFY_KEY, Some(1_794_026_095));
+        assert_eq!(result, Ok(PUBKEY));
+    }
+
     fn alloc_string(base: &str, suffix: &str) -> String {
         let mut s = String::from(base);
         s.push_str(suffix);

@@ -12,6 +12,7 @@
 //! transport endpoint as a Rust [`Endpoint`] enum (no 127.3.3.40 fake-IP hack).
 
 pub mod endpoint;
+pub mod heapdiag;
 // `pub` so the vendored types that appear in `endpoint`'s public signatures
 // (Packet, PeerId, PeerConfig, NodePublicKey, ...) are reachable. These are
 // vendored library types; exposing them is harmless.
@@ -19,18 +20,43 @@ pub mod vendor;
 
 use tm_control::{MapState, PeerInfo};
 
-pub use endpoint::{Endpoint, MAX_PEERS, WgEndpoint};
-use endpoint::RecvOut;
+pub use endpoint::{DIRECT_TRUST, DirectPath, Endpoint, MAX_PEERS, WgEndpoint};
+use endpoint::{DispatchOut, RecvOut};
 use vendor::config::{PeerConfig, PeerId, Psk};
 use vendor::keys::{NodeKeyPair, NodePrivateKey, NodePublicKey};
 use vendor::packet::Packet;
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::net::SocketAddrV4;
+use std::time::Duration;
+use tm_time::Instant;
 
 /// Actor tick period. Mirrors MicroLink's `wireguardif_periodic()` ~400ms
 /// discipline; drives handshake retry, rekey, and keepalive off the latency
 /// path.
 const TICK: Duration = Duration::from_millis(400);
+
+// Heap probe bracketing recv_one_into/drain_recv (round 6 of the
+// tailmicro-rs heap-fragmentation investigation, ALLOCATIONS.md Step 5:
+// root-causing the 20480-vs-8192 mismatch). Same pattern as
+// `tm_disco::heap_probe_blocks` (not reused directly to avoid a cross-crate
+// dependency for a temporary debug aid). Device-only; no-op on host builds.
+// Remove once Step 5 is resolved.
+#[inline(never)]
+fn heap_probe_blocks(tag: &str) {
+    #[cfg(target_os = "espidf")]
+    unsafe {
+        let mut info: esp_idf_sys::multi_heap_info_t = core::mem::zeroed();
+        esp_idf_sys::heap_caps_get_info(&mut info, esp_idf_sys::MALLOC_CAP_INTERNAL);
+        tracing::info!(
+            "WgActor heap-blocks [{}]: total_free={} largest_free={} \
+             free_blocks={} allocated_blocks={} total_blocks={}",
+            tag, info.total_free_bytes, info.largest_free_block,
+            info.free_blocks, info.allocated_blocks, info.total_blocks,
+        );
+    }
+    #[cfg(not(target_os = "espidf"))]
+    tracing::info!("WgActor heap-blocks [{}]: (host build; probe is device-only)", tag);
+}
 
 // ── Message types ─────────────────────────────────────────────────────────────
 
@@ -42,10 +68,20 @@ pub enum WgCmd {
     /// balloons the caller's stack frame. See the tailmicro-rs commit fixing
     /// the ESP32-C3 stack overflow at `Runtime::join()`'s `tokio::join!` entry.
     ApplyMap(Box<MapState<MAX_PEERS, 4>>),
-    /// Route an incoming WireGuard packet received from DERP.
+    /// Route an incoming WireGuard packet, tagged with how it arrived.
+    ///
+    /// `payload` is the shared channel packet buffer (`tm_buf`): the event
+    /// router forwards the very buffer `tm_derp` filled, without copying.
     InboundPacket {
-        src_key: [u8; 32],
-        payload: Box<heapless::Vec<u8, 1500>>,
+        via: Via,
+        payload: tm_buf::PktBuf,
+    },
+    /// tm_disco opened a UDP disco PING from `addr` under `node_key`'s
+    /// allowlisted disco key: authenticated evidence that `addr` reaches the
+    /// peer, so it sets or refreshes the direct path (plan D3).
+    DirectPathSeen {
+        node_key: [u8; 32],
+        addr: SocketAddrV4,
     },
     /// Encrypt and send an outbound transport (app-data) IP packet to a peer.
     ///
@@ -55,48 +91,79 @@ pub enum WgCmd {
     /// stack-frame reason as the other multi-KB variants above.
     SendData {
         dst_key: [u8; 32],
-        payload: Box<heapless::Vec<u8, 1500>>,
+        payload: tm_buf::PktBuf,
     },
     Shutdown,
 }
 
 pub enum WgEvent {
-    /// An outbound WireGuard packet to send via DERP.
+    /// An outbound WireGuard packet. `via` is the trusted direct path to use
+    /// (`WgEndpoint::path_for`), or `None` for DERP to `dst_key`.
     OutboundPacket {
         dst_key: [u8; 32],
-        payload: Box<heapless::Vec<u8, 1500>>,
+        payload: tm_buf::PktBuf,
+        via: Option<SocketAddrV4>,
     },
     /// A decrypted inbound payload, destined for the local netstack.
     InboundDecrypted {
         src_key: [u8; 32],
-        payload: Box<heapless::Vec<u8, 1500>>,
+        payload: tm_buf::PktBuf,
     },
     /// A WireGuard handshake completed with the given peer node key.
     PeerHandshook([u8; 32]),
 }
 
+/// The transport an inbound WireGuard packet arrived on. Over DERP the relay
+/// vouches for the sender's node key; over UDP there is only the source
+/// address, and the peer is identified from the packet itself (static key or
+/// session id).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Via {
+    Derp { src_key: [u8; 32] },
+    Udp(SocketAddrV4),
+}
+
 // ── WgActor ───────────────────────────────────────────────────────────────────
 
 pub struct WgActor {
-    // Boxed: `WgEndpoint` is ~28 KB (fixed peer table + session state). Kept
-    // by value it was embedded — and duplicated — inside the `run()` async
-    // state machine, ballooning that future to ~90 KB. `Box::pin`-ing the
-    // future at spawn time then tried to build all ~90 KB on the ESP32-C3's
-    // 32 KB main-task stack, hitting a Guru Meditation stack-protection fault
-    // in Runtime::join. Boxing the endpoint keeps only an 8-byte pointer in
-    // the future. See docs/wg-dataplane-notes.md.
+    // STATIC, not boxed (Step 5, ALLOCATIONS.md "Fix plan: DERP TLS
+    // handshake heap collapse"): `WgEndpoint` is ~28 KB (fixed peer table +
+    // session state). It used to be embedded by value inside the `run()`
+    // async state machine, ballooning that future to ~90 KB; `Box::pin`-ing
+    // the future at spawn time then tried to build all ~90 KB on the
+    // ESP32-C3's 32 KB main-task stack, hitting a Guru Meditation
+    // stack-protection fault in Runtime::join. Boxing the endpoint (heap)
+    // fixed the stack problem by keeping only an 8-byte pointer in the
+    // future; `WgEndpoint::new_static` (now, `.bss`) keeps the same
+    // 8-byte-reference shape in the future *and* removes this ~6 KB
+    // allocation from the heap entirely, closing its contribution to
+    // fragmentation (same "fixed-size, single instance, held forever" shape
+    // already applied to `tm_buf::PktBuf`). See docs/wg-dataplane-notes.md.
     //
-    // LAZY (`Option`): the ~28 KB endpoint is not allocated at construction but
-    // on first use (the first `ApplyMap`/inbound packet). Runtime::join builds
-    // all actors up front, so an eager endpoint took ~28 KB out of the heap
-    // BEFORE the control plane even connected — dropping the largest contiguous
-    // block to ~69 KB, too small to also buffer the live ~40 KB netmap during
-    // the control read (confirmed live: a concurrent "12100 bytes failed" OOM
-    // abort while our map buffer held the last big block). Deferring the
-    // allocation until `apply_map` — which runs only AFTER the control plane
-    // has parsed the netmap and freed its buffer — keeps that ~28 KB free
-    // exactly when the map read needs it. See docs/wg-dataplane-notes.md.
-    endpoint: Option<Box<WgEndpoint>>,
+    // LAZY (`Option`): the endpoint's *static storage* is reserved at link
+    // time regardless, but the reference is only taken on first use (the
+    // first `ApplyMap`/inbound packet), preserving the original ordering
+    // reasoning below for the heap-backed version -- it no longer matters
+    // for the endpoint itself (no heap competes with the netmap buffer now),
+    // but the `Option` is kept as-is rather than restructured, since
+    // `WgEndpoint::new_static` panics if called twice and `endpoint()`
+    // already guards that via this `Option`.
+    endpoint: Option<&'static mut WgEndpoint>,
+    /// Reusable scratch buffer for `RecvOut` (~6 KB). STATIC, not boxed
+    /// (Step 5): was `Box::new`'d fresh on first use and refilled in place
+    /// thereafter; that per-call churn (before the refill-in-place fix) was
+    /// the exact ~6 KB block behind the `memory allocation of 6052 bytes
+    /// failed` heap fragmentation aborts. `endpoint::recv_out_static` now
+    /// hands out a `.bss`-backed reference instead of a heap `Box`, removing
+    /// even its one-time allocation from the heap. See ALLOCATIONS.md.
+    recv_scratch: Option<&'static mut RecvOut>,
+    /// Reusable scratch buffer for `dispatch()`'s output (~6 KB). STATIC,
+    /// not boxed (Step 5), same rationale and mechanism as `recv_scratch`
+    /// above, via `endpoint::dispatch_out_static`. Same fragmentation shape
+    /// as `recv_scratch`, but on a periodic timer rather than per-packet, so
+    /// it fires independently of (and can coincide with) any HTTP/data-plane
+    /// traffic. See ALLOCATIONS.md.
+    dispatch_scratch: Option<&'static mut DispatchOut>,
     /// Node keypair, retained so the endpoint can be built lazily on first use.
     kp: NodeKeyPair,
     /// Never-evicted peer (MicroLink: priority_peer). Retained for API
@@ -112,21 +179,59 @@ impl WgActor {
         let kp = NodeKeyPair::from_private(NodePrivateKey(node_priv));
         Self {
             endpoint: None,
+            recv_scratch: None,
+            dispatch_scratch: None,
             kp,
             priority_peer,
         }
     }
 
-    /// Get the endpoint, allocating (and boxing) it on first use. `new_boxed`
-    /// builds+boxes in its own `#[inline(never)]` frame to keep it off this
-    /// caller's stack. Size is ~6 KB since QUEUE_DEPTH = 0 dropped the inline
-    /// per-peer packet queues (was ~28 KB, which OOM-aborted here on device).
+    /// Get the endpoint, binding its static (`.bss`) storage on first use.
+    /// `new_static` builds it in its own `#[inline(never)]` frame to keep it
+    /// off this caller's stack. Size is ~6 KB since QUEUE_DEPTH = 0 dropped
+    /// the inline per-peer packet queues (was ~28 KB, which OOM-aborted here
+    /// on device, back when this was heap-`Box`-allocated).
     fn endpoint(&mut self) -> &mut WgEndpoint {
         if self.endpoint.is_none() {
-            tracing::info!("WgActor: allocating WgEndpoint (~6 KB) on first use");
-            self.endpoint = Some(WgEndpoint::new_boxed(self.kp));
+            tracing::info!("WgActor: binding static WgEndpoint (~6 KB, .bss) on first use");
+            self.endpoint = Some(WgEndpoint::new_static(self.kp));
         }
-        self.endpoint.as_mut().unwrap()
+        self.endpoint.as_deref_mut().unwrap()
+    }
+
+    /// Take the persistent `RecvOut` scratch buffer, binding its static
+    /// (`.bss`) storage on first use. Pair with [`Self::return_scratch`]
+    /// once done so the reference is handed back (not left dangling in a
+    /// local) for the next call.
+    fn take_scratch(&mut self) -> &'static mut RecvOut {
+        self.recv_scratch.take().unwrap_or_else(|| {
+            tracing::info!("WgActor: binding static RecvOut scratch (~6 KB, .bss) on first use");
+            endpoint::recv_out_static()
+        })
+    }
+
+    /// Clear and return the scratch buffer taken via [`Self::take_scratch`].
+    fn return_scratch(&mut self, out: &'static mut RecvOut) {
+        out.reset();
+        self.recv_scratch = Some(out);
+    }
+
+    /// Take the persistent `dispatch()` output scratch buffer, binding its
+    /// static (`.bss`) storage on first use. Pair with
+    /// [`Self::return_dispatch_scratch`] once done so the reference is
+    /// handed back for the next tick.
+    fn take_dispatch_scratch(&mut self) -> &'static mut DispatchOut {
+        self.dispatch_scratch.take().unwrap_or_else(|| {
+            tracing::info!("WgActor: binding static dispatch scratch (~6 KB, .bss) on first use");
+            endpoint::dispatch_out_static()
+        })
+    }
+
+    /// Clear and return the scratch buffer taken via
+    /// [`Self::take_dispatch_scratch`].
+    fn return_dispatch_scratch(&mut self, out: &'static mut DispatchOut) {
+        out.clear();
+        self.dispatch_scratch = Some(out);
     }
 
     pub async fn run(
@@ -134,12 +239,13 @@ impl WgActor {
         cmds: async_channel::Receiver<WgCmd>,
         events: async_channel::Sender<WgEvent>,
     ) {
+        let mut cmds = core::pin::pin!(cmds);
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
-                cmd = cmds.recv() => {
+                cmd = tm_buf::chan::recv_next(cmds.as_mut()) => {
                     match cmd {
                         // Box::pin the per-command handlers so their (multi-KB)
                         // futures are heap-allocated on demand instead of being
@@ -148,8 +254,15 @@ impl WgActor {
                         // by value (~90 KB total) and building it on the 32 KB
                         // main-task stack faults. See docs/wg-dataplane-notes.md.
                         Ok(WgCmd::ApplyMap(map)) => Box::pin(self.apply_map(&map, &events)).await,
-                        Ok(WgCmd::InboundPacket { src_key, payload }) => {
-                            Box::pin(self.on_inbound(src_key, &payload, &events)).await;
+                        Ok(WgCmd::InboundPacket { via, payload }) => {
+                            Box::pin(self.on_inbound(via, &payload, &events)).await;
+                        }
+                        Ok(WgCmd::DirectPathSeen { node_key, addr }) => {
+                            // No endpoint yet means no peers to attach it to;
+                            // do not force the lazy endpoint for it.
+                            if let Some(ep) = self.endpoint.as_deref_mut() {
+                                ep.direct_path_seen(&node_key, addr, Instant::now());
+                            }
                         }
                         Ok(WgCmd::SendData { dst_key, payload }) => {
                             Box::pin(self.on_send_data(dst_key, &payload, &events)).await;
@@ -169,118 +282,110 @@ impl WgActor {
         // allocation deferred from construction; it runs only after the control
         // plane has already parsed and freed its netmap buffer.
         self.endpoint();
-
-        // Remove peers no longer present.
-        let mut to_remove: heapless::Vec<PeerId, MAX_PEERS> = heapless::Vec::new();
-        for i in 0..MAX_PEERS {
-            // Walk current peers by re-querying; collect ids absent from map.
-            if let Some(id) = self.endpoint_peer_ids().get(i).copied() {
-                let key = self.endpoint().peer_key(id).map(|k| k.to_bytes());
-                if let Some(key) = key {
-                    if !map.peers.iter().any(|p| p.node_key == key) {
-                        let _ = to_remove.push(id);
-                    }
-                }
-            }
-        }
-        for id in to_remove {
-            self.endpoint().remove_peer(id);
+        // Hand the channel packet-buffer pool (tm_buf) its static buffers
+        // before per-packet traffic starts. They live in .bss, so this
+        // allocates nothing; the first `acquire` would do it anyway -- this
+        // just makes it explicit and logged. See ALLOCATIONS.md.
+        let n = tm_buf::prewarm();
+        if n > 0 {
+            tracing::info!("WgActor: packet-buffer pool ready: {} static buffers ({} B each)", n, tm_buf::PKT_CAP);
         }
 
-        // Add new peers and proactively initiate a handshake to each.
-        for peer in &map.peers {
-            if self.endpoint().peer_id_by_key(&peer.node_key).is_some() {
-                continue;
-            }
-            let cfg = PeerConfig {
-                key: NodePublicKey::from_bytes(peer.node_key),
-                // Tailscale's PSK is 32 zero bytes.
-                psk: Psk::zero(),
-            };
-            let ep = Self::endpoint_for(peer);
-            if let Some(id) = self.endpoint().add_peer(cfg, ep) {
-                let now = Instant::now();
-                if let Some(pkt) = self.endpoint().initiate(id, now, now_unix()) {
-                    self.emit_to_peer(id, pkt, events).await;
-                }
-            } else {
-                tracing::warn!(hostname = %peer.hostname, "peer table full; not adding peer");
+        // Diff the snapshot against the live peer table: drop absent peers,
+        // re-route moved ones, add new ones.
+        let sync = sync_peers(self.endpoint(), &map.peers);
+        if sync.removed + sync.rerouted + sync.added.len() > 0 {
+            tracing::info!("WgActor: peers synced: {} added, {} removed, {} re-routed", sync.added.len(), sync.removed, sync.rerouted);
+        }
+        for hostname in sync.dropped.iter() {
+            tracing::warn!(hostname = %hostname, "peer table full; not adding peer");
+        }
+        // Proactively initiate a handshake to each new peer.
+        for id in sync.added {
+            let now = Instant::now();
+            if let Some(pkt) = self.endpoint().initiate(id, now, now_unix()) {
+                self.emit_to_peer(id, pkt, events).await;
             }
         }
     }
 
-    fn endpoint_peer_ids(&self) -> heapless::Vec<PeerId, MAX_PEERS> {
-        // Reconstruct ids by scanning known node keys via public accessors.
-        // (Kept simple; the endpoint owns the authoritative table.)
-        let mut ids: heapless::Vec<PeerId, MAX_PEERS> = heapless::Vec::new();
-        let Some(endpoint) = self.endpoint.as_deref() else {
-            return ids; // no endpoint yet -> no peers
-        };
-        for id in 1..=(MAX_PEERS as u32 * 4) {
-            let pid = PeerId(id);
-            if endpoint.peer_key(pid).is_some() {
-                let _ = ids.push(pid);
-            }
-            if ids.is_full() {
-                break;
-            }
-        }
-        ids
-    }
-
-    fn endpoint_for(peer: &PeerInfo) -> Endpoint {
-        Endpoint::Derp {
-            region_id: peer.derp_region,
-            node_key: peer.node_key,
-        }
-    }
 
     async fn on_inbound(
         &mut self,
-        src_key: [u8; 32],
-        payload: &heapless::Vec<u8, 1500>,
+        via: Via,
+        payload: &[u8],
         events: &async_channel::Sender<WgEvent>,
     ) {
+        // The channel buffer is PKT_CAP (1532) wide, but the vendored
+        // `Packet::from_wire` panics on anything over its 1500-byte capacity.
+        // A real WireGuard message never exceeds that; drop anything larger.
+        if payload.len() > vendor::packet::CAPACITY {
+            tracing::debug!("WgActor: dropping oversize inbound packet ({} bytes)", payload.len());
+            return;
+        }
         // Primary disco demux happens at the runtime edge; recv_one also
         // sniffs the WireGuard type byte defensively.
-        let from = Endpoint::Derp {
-            region_id: 0,
-            node_key: src_key,
+        let (from, src_key) = match via {
+            Via::Derp { src_key } => (Endpoint::Derp { region_id: 0, node_key: src_key }, Some(src_key)),
+            Via::Udp(addr) => (Endpoint::Udp(addr.into()), None),
         };
-        // Allocate the RecvOut (~12 KB of inline packet buffers) on the heap
-        // FIRST, then fill it in place via `recv_one_into`. The earlier
-        // `Box::new(recv_one(...))` still built the 12 KB RecvOut on the stack
-        // (inside recv_one, then again as the Box::new argument) before moving
-        // it to the heap; stacked on the tokio/actor poll chain that overflowed
-        // the ESP32-C3 main task stack the first time DERP delivered a real
-        // inbound WG handshake response. Filling a pre-boxed RecvOut keeps those
-        // 12 KB off the stack entirely.
-        let mut out = Box::new(crate::endpoint::RecvOut::default());
+        // Reuse the persistent RecvOut scratch buffer (~6 KB of inline packet
+        // buffers) instead of `Box::new`-ing a fresh one per packet: that
+        // per-call alloc/free churn on the hottest data-plane path was
+        // fragmenting the heap (see `recv_scratch` doc comment and
+        // ALLOCATIONS.md). Filling a heap-resident RecvOut still keeps those
+        // 6 KB off the stack, same as before.
+        if matches!(via, Via::Udp(_)) && payload.first() == Some(&4) {
+            tm_buf::lat::stamp(tm_buf::lat::Hop::WgIn);
+        }
+        let mut out = self.take_scratch();
+        if heapdiag::ENABLED {
+            heap_probe_blocks("on_inbound: before recv_one_into");
+        }
         self.endpoint().recv_one_into(payload, from, Instant::now(), &mut out);
-        self.drain_recv(src_key, out, events).await;
+        let w = heapdiag::trace_begin("on_inbound: before drain_recv");
+        self.drain_recv(src_key, &out, events).await;
+        heapdiag::trace_end(w, "on_inbound: after drain_recv");
+        self.return_scratch(out);
     }
 
     async fn on_send_data(
         &mut self,
         dst_key: [u8; 32],
-        payload: &heapless::Vec<u8, 1500>,
+        payload: &[u8],
         events: &async_channel::Sender<WgEvent>,
     ) {
+        // `Packet::from_plaintext` panics past MAX_INNER (1500 - header -
+        // tag). The netif MTU (1380) keeps real traffic well under it; guard
+        // anyway now that the channel buffer is PKT_CAP (1532) wide.
+        if payload.len() > vendor::packet::MAX_INNER {
+            tracing::warn!("WgActor: dropping oversize outbound packet ({} bytes)", payload.len());
+            return;
+        }
         // No endpoint means no sessions; nothing to send (and we must not force
         // the ~28 KB lazy allocation for a stray send).
         if self.endpoint.is_none() {
             return;
         }
-        // Same stack discipline as on_inbound: fill a pre-boxed RecvOut so its
-        // ~12 KB of inline packet buffers never lands on the main-task stack.
-        let mut out = Box::new(crate::endpoint::RecvOut::default());
+        // Same reuse discipline as on_inbound: the persistent scratch buffer
+        // keeps its ~6 KB of inline packet buffers off the stack without
+        // re-allocating on every send.
+        let echo_reply = tm_buf::lat::ENABLED && tm_buf::lat::is_icmp_echo(payload, 0);
+        if echo_reply {
+            tm_buf::lat::stamp(tm_buf::lat::Hop::WgSendIn);
+        }
+        let mut out = self.take_scratch();
         let sent = self
             .endpoint()
             .send_data(&dst_key, payload, Instant::now(), &mut out);
+        if echo_reply {
+            tm_buf::lat::stamp(tm_buf::lat::Hop::WgEncrypted);
+        }
         if !sent {
             tracing::debug!("send_data queued (no active session yet) or dropped");
         }
-        self.drain_recv(dst_key, out, events).await;
+        self.drain_recv(Some(dst_key), &out, events).await;
+        self.return_scratch(out);
     }
 
     async fn on_tick(&mut self, events: &async_channel::Sender<WgEvent>) {
@@ -292,39 +397,55 @@ impl WgActor {
         }
         let now = Instant::now();
         // next_event is advisory; we always tick, and only act on due timers.
-        // Box the dispatch output (ArrayVec of (PeerId, Packet), ~12 KB) so it
-        // does not live as an owning iterator on the stack across the
-        // emit_to_peer awaits; iterate by reference and clone each packet.
-        let outbound = Box::new(self.endpoint().dispatch(now, now_unix()));
+        // Reuse the persistent dispatch scratch buffer instead of `Box::new`-ing
+        // a fresh one every tick (see `dispatch_scratch` doc comment): keeps the
+        // ~6 KB block off the stack (writing into the boxed slot in place) and,
+        // once allocated, off the heap-churn path entirely. Iterate by
+        // reference and clone each packet, same as before.
+        let outbound = self.take_dispatch_scratch();
+        *outbound = self.endpoint().dispatch(now, now_unix());
         for (id, pkt) in outbound.iter() {
             self.emit_to_peer(*id, pkt.clone(), events).await;
         }
+        self.return_dispatch_scratch(outbound);
     }
 
-    async fn drain_recv(&self, src_key: [u8; 32], out: Box<RecvOut>, events: &async_channel::Sender<WgEvent>) {
-        let dst_key = out
+    /// `fallback_key` is used only when the packet named no known peer.
+    /// Over UDP there is none, and nothing can be attributed, so nothing is
+    /// emitted.
+    async fn drain_recv(&self, fallback_key: Option<[u8; 32]>, out: &RecvOut, events: &async_channel::Sender<WgEvent>) {
+        let ep = self.endpoint.as_deref();
+        let Some(dst_key) = out
             .peer
-            .and_then(|id| self.endpoint.as_deref().and_then(|ep| ep.peer_key(id)))
+            .and_then(|id| ep.and_then(|ep| ep.peer_key(id)))
             .map(|k| k.to_bytes())
-            .unwrap_or(src_key);
+            .or(fallback_key)
+        else {
+            return;
+        };
+        // Computed after recv_one_into, so a packet that just proved a UDP
+        // path gets its reply (handshake response, confirmation) sent back
+        // the same way.
+        let via = out.peer.zip(ep).and_then(|(id, ep)| ep.path_for(id, Instant::now()));
 
         // Iterate by reference: moving the ArrayVecs out would reintroduce the
         // multi-KB owning iterator on the stack that boxing `out` removed.
         for pkt in out.to_peer.iter() {
-            let _ = events
-                .send(WgEvent::OutboundPacket {
-                    dst_key,
-                    payload: pkt_to_box(pkt),
-                })
-                .await;
+            send_diag(events, WgEvent::OutboundPacket {
+                dst_key,
+                payload: pkt_to_buf(pkt),
+                via,
+            }, "OutboundPacket").await;
         }
         for pkt in out.decrypted.iter() {
-            let _ = events
-                .send(WgEvent::InboundDecrypted {
-                    src_key: dst_key,
-                    payload: pkt_to_box(pkt),
-                })
-                .await;
+            let payload = pkt_to_buf(pkt);
+            if tm_buf::lat::ENABLED && tm_buf::lat::is_icmp_echo(payload.as_slice(), 8) {
+                tm_buf::lat::stamp(tm_buf::lat::Hop::WgDecrypted);
+            }
+            send_diag(events, WgEvent::InboundDecrypted {
+                src_key: dst_key,
+                payload,
+            }, "InboundDecrypted").await;
         }
         if out.handshook {
             let _ = events.send(WgEvent::PeerHandshook(dst_key)).await;
@@ -332,11 +453,13 @@ impl WgActor {
     }
 
     async fn emit_to_peer(&self, id: PeerId, pkt: Packet, events: &async_channel::Sender<WgEvent>) {
-        if let Some(key) = self.endpoint.as_deref().and_then(|ep| ep.peer_key(id)) {
+        let Some(ep) = self.endpoint.as_deref() else { return };
+        if let Some(key) = ep.peer_key(id) {
             let _ = events
                 .send(WgEvent::OutboundPacket {
                     dst_key: key.to_bytes(),
-                    payload: pkt_to_box(&pkt),
+                    payload: pkt_to_buf(&pkt),
+                    via: ep.path_for(id, Instant::now()),
                 })
                 .await;
         }
@@ -348,19 +471,285 @@ impl WgActor {
     }
 }
 
-fn pkt_to_box(pkt: &Packet) -> Box<heapless::Vec<u8, 1500>> {
-    let mut v: heapless::Vec<u8, 1500> = heapless::Vec::new();
+/// TEMPORARY (ALLOCATIONS.md Step 7): `events.send(ev).await`, but logs
+/// whether the channel was full and how many times the send future returned
+/// `Pending` (i.e. actually yielded to the executor, letting every other
+/// task on this current-thread runtime run before the send completed).
+async fn send_diag(events: &async_channel::Sender<WgEvent>, ev: WgEvent, what: &str) {
+    if !heapdiag::ENABLED {
+        let _ = events.send(ev).await;
+        return;
+    }
+    let full_before = events.is_full();
+    let len_before = events.len();
+    let mut pendings = 0u32;
+    let mut fut = core::pin::pin!(events.send(ev));
+    let _ = core::future::poll_fn(|cx| match core::future::Future::poll(fut.as_mut(), cx) {
+        core::task::Poll::Pending => {
+            pendings += 1;
+            core::task::Poll::Pending
+        }
+        r => r,
+    })
+    .await;
+    tracing::info!(
+        "WgActor send_diag {}: chan_len_before={} full_before={} pendings={}",
+        what, len_before, full_before, pendings
+    );
+}
+
+/// Copy a WireGuard `Packet` (1500-byte capacity) into a pooled channel
+/// buffer (`tm_buf::PKT_CAP` = 1532, so it always fits). Once the pool is
+/// warm this is a memcpy with no heap traffic; the buffer returns to the
+/// pool when the event router is done with it.
+fn pkt_to_buf(pkt: &Packet) -> tm_buf::PktBuf {
+    let mut v = tm_buf::PktBuf::acquire();
     let _ = v.extend_from_slice(pkt.as_slice());
-    Box::new(v)
+    v
 }
 
 /// Current Unix time in seconds, but only if the clock looks synced
 /// (> 1_700_000_000 == pre-SNTP boot clock filtered out), matching the
 /// control-key-pinning discipline in `src/config.rs`.
 fn now_unix() -> Option<u64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs())
-        .filter(|&s| s > 1_700_000_000)
+    tm_time::unix_secs().filter(|&s| s > 1_700_000_000)
+}
+
+fn endpoint_for(peer: &PeerInfo) -> Endpoint {
+    Endpoint::Derp {
+        region_id: peer.derp_region,
+        node_key: peer.node_key,
+    }
+}
+
+/// What [`sync_peers`] changed.
+struct PeerSync {
+    /// Newly added peers (they still need a handshake).
+    added: heapless::Vec<PeerId, MAX_PEERS>,
+    removed: usize,
+    /// Existing peers whose DERP route changed.
+    rerouted: usize,
+    /// Hostnames of peers that did not fit the table.
+    dropped: heapless::Vec<heapless::String<32>, MAX_PEERS>,
+}
+
+/// Make the endpoint's peer table equal to `peers` (the whole current
+/// snapshot). Existing peers keep their sessions; only their DERP route is
+/// refreshed, so a later snapshot can move a peer's home region.
+fn sync_peers(ep: &mut WgEndpoint, peers: &[PeerInfo]) -> PeerSync {
+    let mut out = PeerSync {
+        added: heapless::Vec::new(), removed: 0, rerouted: 0, dropped: heapless::Vec::new(),
+    };
+    for id in ep.peer_ids() {
+        let Some(key) = ep.peer_key(id).map(|k| k.to_bytes()) else { continue };
+        if !peers.iter().any(|p| p.node_key == key) {
+            ep.remove_peer(id);
+            out.removed += 1;
+        }
+    }
+    for peer in peers {
+        let want = endpoint_for(peer);
+        if let Some(id) = ep.peer_id_by_key(&peer.node_key) {
+            if ep.peer_endpoint(id).as_ref() != Some(&want) && ep.set_derp(id, want) {
+                out.rerouted += 1;
+            }
+            continue;
+        }
+        let cfg = PeerConfig {
+            key: NodePublicKey::from_bytes(peer.node_key),
+            // Tailscale's PSK is 32 zero bytes.
+            psk: Psk::zero(),
+        };
+        match ep.add_peer(cfg, want) {
+            Some(id) => { let _ = out.added.push(id); }
+            None => {
+                let mut h = heapless::String::new();
+                for c in peer.hostname.chars() { if h.push(c).is_err() { break; } }
+                let _ = out.dropped.push(h);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tm_control::TailnetIp;
+
+    async fn next_event(ev: &async_channel::Receiver<WgEvent>) -> WgEvent {
+        tokio::time::timeout(Duration::from_secs(2), ev.recv())
+            .await
+            .expect("WgActor emitted nothing")
+            .unwrap()
+    }
+
+    /// Plan Step 4, at the event level: a handshake response that arrives
+    /// over UDP from `x` makes the actor send its confirmation back to `x`
+    /// (`OutboundPacket.via == Some(x)`), while the initiation it sent before
+    /// any path was proven goes to DERP (`via == None`). A UDP datagram that
+    /// names no peer emits nothing. This is the only test in the crate that
+    /// runs a WgActor, because its endpoint lives in once-only static storage.
+    #[tokio::test(flavor = "current_thread")]
+    async fn replies_to_udp_inbound_are_tagged_with_the_udp_path() {
+        let a_priv = [0x11u8; 32];
+        let a_kp = NodeKeyPair::from_private(NodePrivateKey(a_priv));
+        let b_kp = NodeKeyPair::new();
+        let b_key = b_kp.public.to_bytes();
+        let mut b = WgEndpoint::new(b_kp);
+        b.add_peer(
+            PeerConfig { key: a_kp.public, psk: Psk::zero() },
+            Endpoint::Derp { region_id: 1, node_key: a_kp.public.to_bytes() },
+        )
+        .unwrap();
+
+        let (cmd_tx, cmd_rx) = async_channel::bounded(8);
+        let (ev_tx, ev_rx) = async_channel::bounded(8);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let actor = tokio::task::spawn_local(WgActor::new(a_priv, None).run(cmd_rx, ev_tx));
+
+                let mut map: MapState<MAX_PEERS, 4> = MapState {
+                    our_ip: TailnetIp([100, 64, 0, 1]),
+                    peers: Default::default(),
+                    derp_regions: Default::default(),
+                    names: Default::default(),
+                };
+                map.peers.push(PeerInfo {
+                    node_key: b_key,
+                    disco_key: [0; 32],
+                    tailnet_ip: TailnetIp([100, 64, 0, 2]),
+                    prefix_len: 32,
+                    hostname: heapless::String::new(),
+                    name: Default::default(),
+                    derp_region: 1,
+                    is_online: true,
+                });
+                cmd_tx.send(WgCmd::ApplyMap(Box::new(map))).await.unwrap();
+
+                let WgEvent::OutboundPacket { dst_key, payload: init, via } = next_event(&ev_rx).await else {
+                    panic!("expected the proactive initiation");
+                };
+                assert_eq!((dst_key, via), (b_key, None), "no path proven yet -> DERP");
+
+                let now = Instant::now();
+                let resp = b.recv_one(&init, Endpoint::Derp { region_id: 1, node_key: a_kp.public.to_bytes() }, now);
+                drop(init);
+                let x: SocketAddrV4 = "192.168.15.70:41641".parse().unwrap();
+                cmd_tx
+                    .send(WgCmd::InboundPacket {
+                        via: Via::Udp(x),
+                        payload: tm_buf::PktBuf::from_slice(resp.to_peer[0].as_slice()).unwrap(),
+                    })
+                    .await
+                    .unwrap();
+
+                let WgEvent::OutboundPacket { dst_key, payload: conf, via } = next_event(&ev_rx).await else {
+                    panic!("expected the session confirmation");
+                };
+                assert_eq!((dst_key, via), (b_key, Some(x)), "reply goes back over the proven UDP path");
+                let done = b.recv_one(&conf, Endpoint::Udp(std::net::SocketAddr::V4("192.168.15.74:41641".parse().unwrap())), now);
+                assert_eq!(done.decrypted.len(), 1, "B accepts the confirmation");
+                drop(conf);
+                assert!(matches!(next_event(&ev_rx).await, WgEvent::PeerHandshook(k) if k == b_key));
+
+                // Junk over UDP has no peer to attribute anything to.
+                let y: SocketAddrV4 = "192.168.15.66:41641".parse().unwrap();
+                cmd_tx
+                    .send(WgCmd::InboundPacket {
+                        via: Via::Udp(y),
+                        payload: tm_buf::PktBuf::from_slice(&[4, 0, 0, 0, 9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap(),
+                    })
+                    .await
+                    .unwrap();
+                cmd_tx.send(WgCmd::Shutdown).await.unwrap();
+                actor.await.unwrap();
+                assert!(ev_rx.try_recv().is_err(), "nothing emitted for an unattributable UDP datagram");
+            })
+            .await;
+    }
+
+    fn peer(seed: u8, region: u16) -> PeerInfo {
+        PeerInfo {
+            node_key: NodeKeyPair::from_private(NodePrivateKey([seed; 32])).public.to_bytes(),
+            disco_key: [seed; 32],
+            tailnet_ip: TailnetIp([100, 64, 0, seed]),
+            prefix_len: 32,
+            hostname: heapless::String::new(),
+            name: Default::default(),
+            derp_region: region,
+            is_online: true,
+        }
+    }
+
+    fn table() -> WgEndpoint {
+        WgEndpoint::new(NodeKeyPair::new())
+    }
+
+    fn keys(ep: &WgEndpoint) -> Vec<[u8; 32]> {
+        ep.peer_ids().into_iter().map(|id| ep.peer_key(id).unwrap().to_bytes()).collect()
+    }
+
+    /// A later snapshot adds the new peer, removes the missing one, and keeps
+    /// the survivor's id (and so its session).
+    #[test]
+    fn sync_adds_removes_and_keeps_survivors() {
+        let mut ep = table();
+        let (a, b, c) = (peer(1, 1), peer(2, 1), peer(3, 1));
+        let s = sync_peers(&mut ep, &[a.clone(), b.clone()]);
+        assert_eq!((s.added.len(), s.removed), (2, 0));
+        let a_id = ep.peer_id_by_key(&a.node_key).unwrap();
+
+        let s = sync_peers(&mut ep, &[a.clone(), c.clone()]);
+        assert_eq!((s.added.len(), s.removed, s.rerouted), (1, 1, 0));
+        assert_eq!(ep.peer_id_by_key(&a.node_key), Some(a_id), "survivor keeps its id");
+        assert!(ep.peer_id_by_key(&b.node_key).is_none(), "removed peer is gone");
+        assert!(ep.peer_id_by_key(&c.node_key).is_some(), "new peer is in");
+        assert_eq!(keys(&ep).len(), 2);
+    }
+
+    /// An existing peer whose home region changed gets the new route, which
+    /// the old code skipped because the key was already present.
+    #[test]
+    fn sync_applies_a_changed_derp_home() {
+        let mut ep = table();
+        let a = peer(1, 1);
+        sync_peers(&mut ep, &[a.clone()]);
+        let id = ep.peer_id_by_key(&a.node_key).unwrap();
+        let moved = peer(1, 9);
+        let s = sync_peers(&mut ep, &[moved.clone()]);
+        assert_eq!((s.added.len(), s.removed, s.rerouted), (0, 0, 1));
+        assert_eq!(ep.peer_endpoint(id), Some(Endpoint::Derp { region_id: 9, node_key: a.node_key }));
+        // Same snapshot again: nothing to do.
+        let s = sync_peers(&mut ep, &[moved]);
+        assert_eq!((s.added.len(), s.removed, s.rerouted), (0, 0, 0));
+    }
+
+    /// Peer ids only grow, so after enough churn live ids are far above the
+    /// range the old removal scan probed (1..=32) and it silently stopped
+    /// removing peers.
+    #[test]
+    fn removal_still_works_after_many_ids_were_issued() {
+        let mut ep = table();
+        for round in 0..40u8 {
+            let p = peer(round + 1, 1);
+            sync_peers(&mut ep, &[p]);
+            assert_eq!(keys(&ep).len(), 1, "round {round}: previous peer must have been removed");
+        }
+        let s = sync_peers(&mut ep, &[]);
+        assert_eq!(s.removed, 1);
+        assert!(keys(&ep).is_empty());
+    }
+
+    /// More peers than the table holds: the first MAX_PEERS win (control's
+    /// order) and the rest are reported, not silently lost.
+    #[test]
+    fn sync_reports_peers_that_do_not_fit() {
+        let mut ep = table();
+        let many: Vec<PeerInfo> = (1..=MAX_PEERS as u8 + 2).map(|i| peer(i, 1)).collect();
+        let s = sync_peers(&mut ep, &many);
+        assert_eq!(s.added.len(), MAX_PEERS);
+        assert_eq!(s.dropped.len(), 2);
+    }
 }

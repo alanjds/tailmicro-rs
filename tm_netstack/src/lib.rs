@@ -14,51 +14,107 @@
 
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
+/// The tailnet point-to-point lwIP netif (plan (a) --
+/// `docs/tailnet-http-lwip-netif-plan.md`): gives the on-device lwIP stack a
+/// netif for the node's tailnet IP so the existing `0.0.0.0:80` HTTP server
+/// becomes reachable there with no application change.
+pub mod tailnet;
+
+/// MagicDNS name table and the lwIP resolver hook.
+pub mod names;
+
 // ── Error ─────────────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetError {
     Io,
     AddrInUse,
     NotConnected,
+    /// A non-blocking send found the socket's buffer full. For UDP this is
+    /// a dropped datagram, not a failure of the socket.
+    WouldBlock,
+}
+
+impl From<std::io::Error> for NetError {
+    fn from(e: std::io::Error) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::AddrInUse => NetError::AddrInUse,
+            std::io::ErrorKind::WouldBlock => NetError::WouldBlock,
+            std::io::ErrorKind::NotConnected => NetError::NotConnected,
+            _ => NetError::Io,
+        }
+    }
 }
 
 // ── UdpSocket ─────────────────────────────────────────────────────────────────
 
-/// A UDP socket bound to a tailnet address.
+/// A UDP socket: a thin wrapper over `tokio::net::UdpSocket` on both targets.
 ///
-/// API mirrors `tailscale::netstack::UdpSocket` exactly so examples compile
-/// against both tailmicro and tailscale-rs unchanged.
+/// On ESP-IDF tokio's UDP goes through mio's `target_os = "espidf"` socket
+/// path onto lwIP BSD sockets, exactly like the `TcpStream`s the control
+/// plane and DERP already use (LAN-direct-path plan, Step 2).
 pub struct UdpSocket {
-    inner: Inner,
-}
-
-#[cfg(not(target_os = "espidf"))]
-struct Inner { sock: tokio::net::UdpSocket }
-
-#[cfg(target_os = "espidf")]
-struct Inner {
-    // esp-idf-svc async UDP socket handle
-    // Placeholder — concrete type from esp-idf-svc::io::asynch
-    _marker: core::marker::PhantomData<()>,
+    sock: tokio::net::UdpSocket,
 }
 
 impl UdpSocket {
+    /// Bind synchronously and register with the current tokio reactor.
+    ///
+    /// Synchronous (std bind + `from_std`) rather than `tokio::net::UdpSocket::
+    /// bind(..).await` so a caller can do it from an `#[inline(never)]` plain
+    /// function at a chosen moment (before the DERP TLS handshake, per the
+    /// plan's heap-ordering rule) without growing its own async frame. Must
+    /// be called from inside a tokio runtime.
+    pub fn bind_sync(addr: SocketAddr) -> Result<Self, NetError> {
+        let std_sock = std::net::UdpSocket::bind(addr)?;
+        std_sock.set_nonblocking(true)?;
+        let sock = tokio::net::UdpSocket::from_std(std_sock)?;
+        Ok(Self { sock })
+    }
+
+    /// Async bind (host convenience; same semantics as [`Self::bind_sync`]).
+    pub async fn bind(addr: SocketAddr) -> Result<Self, NetError> {
+        let sock = tokio::net::UdpSocket::bind(addr).await?;
+        Ok(Self { sock })
+    }
+
+    pub fn local_addr(&self) -> Result<SocketAddr, NetError> {
+        Ok(self.sock.local_addr()?)
+    }
+
     /// Send `buf` to `target`.
     pub async fn send_to(&self, target: SocketAddr, buf: &[u8]) -> Result<(), NetError> {
-        #[cfg(not(target_os = "espidf"))]
-        self.inner.sock.send_to(buf, target).await.map(|_| ()).map_err(|_| NetError::Io)?;
+        self.sock.send_to(buf, target).await?;
+        Ok(())
+    }
+
+    /// Wait until the socket is writable. tokio's `try_*` calls consult the
+    /// reactor's cached readiness, which is unknown (so `WouldBlock`) until
+    /// the reactor has reported the socket writable at least once; awaiting
+    /// this once after bind primes it.
+    pub async fn writable(&self) -> Result<(), NetError> {
+        self.sock.writable().await?;
+        Ok(())
+    }
+
+    /// Send without ever awaiting. UDP is best-effort: a full socket buffer
+    /// is `Err(NetError::WouldBlock)`, i.e. a dropped datagram, and the
+    /// caller decides whether to fall back (e.g. to DERP). Also
+    /// `WouldBlock` before the reactor first reports the socket writable
+    /// (see [`Self::writable`]).
+    pub fn try_send_to(&self, target: SocketAddr, buf: &[u8]) -> Result<(), NetError> {
+        self.sock.try_send_to(buf, target)?;
         Ok(())
     }
 
     /// Receive a datagram into `buf`.  Returns `(bytes_read, sender_addr)`.
     pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), NetError> {
-        #[cfg(not(target_os = "espidf"))]
-        return self.inner.sock.recv_from(buf).await.map_err(|_| NetError::Io);
-        #[cfg(target_os = "espidf")]
-        Err(NetError::Io)
+        Ok(self.sock.recv_from(buf).await?)
     }
 }
+
+/// Underlay-LAN direct UDP path support (LAN-direct-path plan, Step 2).
+pub mod lan_udp;
 
 // ── TcpStream ─────────────────────────────────────────────────────────────────
 

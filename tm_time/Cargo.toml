@@ -1,0 +1,11 @@
+[package]
+name = "tm_time"
+version.workspace = true
+edition.workspace = true
+description = "Runtime-agnostic monotonic and wall clock for tailmicro (Instant in microseconds, installable clock)"
+
+[features]
+default = ["std"]
+# Default clock backed by std::time (today's behaviour on ESP-IDF and on hosts).
+# Without it the binary must call `set_clock` before the first `Instant::now()`.
+std = []

@@ -58,23 +58,15 @@ incorporating the best strategies from
 
 ---
 
-## Memory budget (ESP32-C3)
+## Measured footprint (ESP32-C3)
 
-```
-ESP-IDF + WiFi stack:          ~180 KB
-Tokio current_thread executor:   ~8 KB
-Actor stacks (Tokio tasks):     ~16 KB
-mbedTLS (TLS 1.2, no bundle):   ~40 KB
-H/2 frame buffer (stack):        ~4 KB
-JSON parser state (stack):       ~1 KB
-WireGuard state (8 peers):       ~2 KB
-DERP connection:                  ~6 KB
-Channels (4 × 4 × ~1.5 KB):    ~24 KB
-Application + misc:             ~20 KB
-──────────────────────────────────────
-Total:                         ~301 KB
-Free:                           ~99 KB  ← comfortable margin
-```
+Measured on a real ESP32-C3 with the `tasmolike-rs` firmware (ESP-IDF 5.5, debug
+build, WiFi up, a small HTTP server and mDNS running), comparing the same image
+with and without `tailmicro-rs` linked in. `tailmicro-rs` currently sits at
+~ 32 KB `.bss` and ~ 63 KB of heap while connected to a tailnet, plus ~ 390 KB
+of flash code.
+
+The rest of the SRAM is left for ESP-IDF, the WiFi stack and the application.
 
 ---
 

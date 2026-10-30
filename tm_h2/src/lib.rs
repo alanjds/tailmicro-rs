@@ -242,25 +242,42 @@ pub fn write_map_request_headers(
 // ── H/2 connection state ──────────────────────────────────────────────────────
 
 /// Tiny connection bookkeeper.  Fits in < 64 bytes.
+///
+/// Flow-control credit is tracked per stream because the control connection
+/// carries several streams at once (the long poll plus a re-poll): a single
+/// shared counter would send the stream-level WINDOW_UPDATE for the wrong
+/// stream and stall the other one at its 4096-byte window.
 pub struct H2State {
-    /// Bytes we have consumed from the server's stream-level window.
-    /// We send WINDOW_UPDATE when this exceeds half the initial window.
-    stream_consumed: u32,
+    /// `(stream id, bytes consumed since the last stream WINDOW_UPDATE)`.
+    /// Id 0 marks a free slot. Three slots cover the poll, one re-poll and
+    /// the bring-up request in flight; a fourth concurrent stream evicts the
+    /// oldest slot, which at worst delays one WINDOW_UPDATE.
+    streams: [(u32, u32); 3],
     /// Bytes consumed at connection level.
-    conn_consumed:   u32,
+    conn_consumed: u32,
 }
 
 impl H2State {
     pub fn new() -> Self {
-        Self { stream_consumed: 0, conn_consumed: 0 }
+        Self { streams: [(0, 0); 3], conn_consumed: 0 }
     }
 
-    /// Record that we consumed `n` bytes of DATA payload.
-    /// Returns `(send_conn_wu, send_stream_wu)` — the increments to send back,
-    /// or 0 if no WINDOW_UPDATE is needed yet.
-    pub fn consumed(&mut self, n: u32) -> (u32, u32) {
-        self.stream_consumed += n;
-        self.conn_consumed   += n;
+    /// Record that we consumed `n` bytes of DATA payload on `stream_id`.
+    /// Returns `(send_conn_wu, send_stream_wu)`: the increments to send back
+    /// (the second one for `stream_id`), or 0 if no WINDOW_UPDATE is needed
+    /// yet. The caller must invoke this exactly once per DATA frame;
+    /// `parse_frame` does not.
+    pub fn consumed(&mut self, stream_id: u32, n: u32) -> (u32, u32) {
+        let slot = match self.streams.iter().position(|s| s.0 == stream_id) {
+            Some(i) => i,
+            None => {
+                let i = self.streams.iter().position(|s| s.0 == 0).unwrap_or(0);
+                self.streams[i] = (stream_id, 0);
+                i
+            }
+        };
+        self.streams[slot].1 += n;
+        self.conn_consumed += n;
 
         let conn_wu = if self.conn_consumed >= CONN_WINDOW / 2 {
             let inc = self.conn_consumed;
@@ -268,13 +285,20 @@ impl H2State {
             inc
         } else { 0 };
 
-        let stream_wu = if self.stream_consumed >= INITIAL_WINDOW / 2 {
-            let inc = self.stream_consumed;
-            self.stream_consumed = 0;
+        let stream_wu = if self.streams[slot].1 >= INITIAL_WINDOW / 2 {
+            let inc = self.streams[slot].1;
+            self.streams[slot].1 = 0;
             inc
         } else { 0 };
 
         (conn_wu, stream_wu)
+    }
+
+    /// The stream ended: free its credit slot.
+    pub fn stream_done(&mut self, stream_id: u32) {
+        for s in self.streams.iter_mut().filter(|s| s.0 == stream_id) {
+            *s = (0, 0);
+        }
     }
 }
 
@@ -309,7 +333,7 @@ pub fn parse_frame<'a>(
     hdr:   &FrameHeader,
     body:  &'a [u8],
     expected_stream: u32,
-    state: &mut H2State,
+    _state: &mut H2State,
 ) -> Result<FrameAction<'a>, H2Error> {
     match hdr.frame_type {
         FRAME_DATA => {
@@ -323,7 +347,6 @@ pub fn parse_frame<'a>(
             } else {
                 body
             };
-            let _ = state.consumed(payload.len() as u32);
             Ok(FrameAction::Data { payload, end_stream: hdr.is_end_stream() })
         }
 
@@ -351,5 +374,45 @@ pub fn parse_frame<'a>(
 
         // HEADERS (response headers), WINDOW_UPDATE, SETTINGS ACK, unknown
         _ => Ok(FrameAction::Ignore),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Credit is per stream: bytes read on stream 7 must not make stream 9 send
+    /// (or skip) its WINDOW_UPDATE, and each update names the stream whose
+    /// bytes it replenishes.
+    #[test]
+    fn stream_credit_is_tracked_per_stream() {
+        let mut h = H2State::new();
+        let half = INITIAL_WINDOW / 2;
+        assert_eq!(h.consumed(7, half - 1), (0, 0));
+        // 9 has consumed nothing yet, so it must not release 7's credit.
+        assert_eq!(h.consumed(9, 1), (0, 0));
+        assert_eq!(h.consumed(7, 1), (0, half));
+        assert_eq!(h.consumed(9, half - 1), (0, half));
+    }
+
+    /// The connection window is shared, so its update is driven by the sum.
+    #[test]
+    fn connection_credit_is_shared_across_streams() {
+        let mut h = H2State::new();
+        let mut conn_total = 0;
+        for i in 0..40u32 {
+            let (c, _) = h.consumed(7 + 2 * (i % 2), 1000);
+            conn_total += c;
+        }
+        assert!(conn_total >= CONN_WINDOW / 2, "conn credit was never returned");
+    }
+
+    #[test]
+    fn stream_done_frees_the_slot() {
+        let mut h = H2State::new();
+        h.consumed(9, 10);
+        h.stream_done(9);
+        // A new stream reusing the slot starts from zero.
+        assert_eq!(h.consumed(11, INITIAL_WINDOW / 2 - 1), (0, 0));
     }
 }

@@ -10,7 +10,8 @@ members = [
     "tm_wg",
     "tm_runtime",
     "tm_netstack",
-    "tm_tls",
+    "tm_buf",
+    "tm_time",
 ]
 
 [workspace.package]
@@ -36,7 +37,8 @@ chacha20poly1305 = { version = "0.10", default-features = false }
 blake2   = { version = "0.10", default-features = false }
 hkdf     = { version = "0.12", default-features = false }
 sha2     = { version = "0.10", default-features = false }
-rand     = { version = "0.8", default-features = false }
+# OsRng: getrandom-backed (on ESP32-C3 served by esp_fill_random)
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 # Noise IK (control plane)
 snow = { version = "0.9", default-features = false, features = ["default-resolver"] }
 # Ed25519 control-key pin verification (verify-only, no signing/serde needed)
@@ -48,13 +50,10 @@ serde_json = { version = "1", default-features = false, features = ["alloc"] }
 
 # Fixed-capacity collections — no heap surprises
 arrayvec  = { version = "0.7", default-features = false }
-heapless  = { version = "0.8", default-features = false }
+heapless  = { version = "0.9", default-features = false, features = ["portable-atomic-critical-section"] }
 
 # Minimal HTTP parsing (no full http crate needed)
 httparse = { version = "1", default-features = false }
-
-# Error handling
-thiserror = { version = "1", default-features = false }
 
 # Tracing — same interface as tailscale-rs
 # Use 'std' and 'log' features to enable log compatibility and stdlib support
@@ -71,6 +70,9 @@ esp-idf-hal   = { version = "0.45", git = "https://github.com/esp-rs/esp-idf-hal
 esp-idf-sys   = { version = "0.36", git = "https://github.com/esp-rs/esp-idf-sys", rev = "2749423ff0", default-features = false }
 embedded-svc  = { version = "0.28.0", default-features = false }
 async-channel = { version = "2" }
+embedded-io-async = { version = "0.7" }
+embedded-io-adapters = { version = "0.7", features = ["tokio-1"] }
+futures-core = { version = "0.3", default-features = false }
 
 # Local crates
 tailmicro    = { path = "." }
@@ -82,7 +84,8 @@ tm_disco     = { path = "tm_disco" }
 tm_wg        = { path = "tm_wg" }
 tm_runtime   = { path = "tm_runtime" }
 tm_netstack  = { path = "tm_netstack" }
-tm_tls       = { path = "tm_tls" }
+tm_buf       = { path = "tm_buf" }
+tm_time      = { path = "tm_time" }
 
 # ── Root crate (mirrors tailscale crate in tailscale-rs) ──────────────────────
 [package]
@@ -92,35 +95,24 @@ edition.workspace = true
 license.workspace = true
 description = "Tailscale client optimised for ESP32-C3 (400KB SRAM, no PSRAM)"
 
+[features]
+# Pass-through for tm_runtime's LAN-only direct UDP path. Now on by default
+# in tm_runtime itself, so this only matters to a build that disables
+# tm_runtime's default features.
+lan-direct = ["tm_runtime/lan-direct"]
+
 [dependencies]
 tm_runtime.workspace   = true
+tm_buf.workspace       = true
 tm_keys.workspace      = true
 tm_netstack.workspace  = true
 tm_control.workspace   = true
-thiserror.workspace    = true
-tokio   = { workspace = true, features = ["sync", "rt"] }
+tm_time.workspace      = true
 tracing.workspace      = true
-log.workspace          = true
-serde.workspace        = true
-serde_json.workspace   = true
 heapless.workspace     = true
-esp-idf-svc = { workspace = true }
-esp-idf-hal = { workspace = true }
-embedded-svc = { workspace = true }
-async-channel = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time", "net"] }
-tracing-subscriber = "0.3"
-
-[[example]]
-name = "peer_ping"
-
-[[example]]
-name = "tcp_echo"
-
-[[example]]
-name = "udp_echo"
 
 # ── Build profiles ────────────────────────────────────────────────────────────
 [profile.release]
